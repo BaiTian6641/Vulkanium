@@ -4,6 +4,7 @@ import com.google.gson.FieldNamingPolicy;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.annotations.SerializedName;
+import net.fabricmc.loader.api.FabricLoader;
 import net.vulkanium.gui.options.TextProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -307,8 +308,7 @@ public class VulkaniumGameOptions {
     }
 
     private static Path getConfigPath() {
-        // Use Fabric's config directory
-        return Path.of("config", DEFAULT_FILE_NAME);
+        return FabricLoader.getInstance().getConfigDir().resolve(DEFAULT_FILE_NAME);
     }
 
     public boolean isReadOnly() { return this.readOnly; }

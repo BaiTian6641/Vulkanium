@@ -22,6 +22,7 @@ import org.lwjgl.vulkan.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 import java.nio.file.Path;
@@ -36,8 +37,10 @@ import static org.lwjgl.vulkan.VK10.*;
 /**
  * Vulkanium — Next-generation Vulkan rendering engine for Minecraft.
  *
- * <p>Entry point for the Fabric mod. Initializes the Vulkan subsystem and replaces
- * Minecraft's OpenGL rendering pipeline with a high-performance Vulkan backend.</p>
+ * <p>
+ * Entry point for the Fabric mod. Initializes the Vulkan subsystem and replaces
+ * Minecraft's OpenGL rendering pipeline with a high-performance Vulkan backend.
+ * </p>
  */
 public class Vulkanium implements ClientModInitializer {
     public static final String MOD_ID = "vulkanium";
@@ -82,26 +85,29 @@ public class Vulkanium implements ClientModInitializer {
     // ─── RT Chunk Mesh Tracking ────────────────────────────────────────
     // When terrain chunk VertexBuffers are uploaded, track them so the RT pipeline
     // can build BLASes for ray-traced shadows and reflections.
-    private static final java.util.List<ChunkMeshUpload> pendingChunkMeshes =
-            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    private static final java.util.List<ChunkMeshUpload> pendingChunkMeshes = java.util.Collections
+            .synchronizedList(new java.util.ArrayList<>());
 
     /**
      * Records a newly uploaded terrain chunk mesh for RT processing.
-     * Called from MixinVertexBuffer.onUpload() when a terrain-format buffer is uploaded.
+     * Called from MixinVertexBuffer.onUpload() when a terrain-format buffer is
+     * uploaded.
      *
-     * @param vkBuffer     The VkBuffer handle of the uploaded mesh
-     * @param vertexCount  Number of vertices
-     * @param vertexSize   Stride in bytes
-     * @param bufferSize   Total buffer size in bytes
+     * @param vkBuffer    The VkBuffer handle of the uploaded mesh
+     * @param vertexCount Number of vertices
+     * @param vertexSize  Stride in bytes
+     * @param bufferSize  Total buffer size in bytes
      */
     public static void notifyChunkMeshUploaded(long vkBuffer, int vertexCount,
-                                                int vertexSize, int bufferSize) {
-        if (rtRenderer == null || !rtRenderer.isEnabled()) return;
+            int vertexSize, int bufferSize) {
+        if (rtRenderer == null || !rtRenderer.isEnabled())
+            return;
         pendingChunkMeshes.add(new ChunkMeshUpload(vkBuffer, vertexCount, vertexSize, bufferSize, frameCounter));
     }
 
     private record ChunkMeshUpload(long vkBuffer, int vertexCount, int vertexSize,
-                                    int bufferSize, long uploadedAtFrame) {}
+            int bufferSize, long uploadedAtFrame) {
+    }
 
     // Placeholder 1x1 white texture
     private static long placeholderImageView = VK_NULL_HANDLE;
@@ -116,13 +122,15 @@ public class Vulkanium implements ClientModInitializer {
     private static int lastScX = -1, lastScY = -1, lastScW = -1, lastScH = -1;
 
     // ─── Deferred Buffer Destruction ───────────────────────────────────
-    // Buffers freed during upload() may still be in use by in-flight command buffers.
+    // Buffers freed during upload() may still be in use by in-flight command
+    // buffers.
     // Queue them for deferred deletion after MAX_FRAMES_IN_FLIGHT frames.
     private static final int MAX_FRAMES_IN_FLIGHT = 3;
-    private static final java.util.List<DeferredBufferFree> deferredBufferFrees =
-            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+    private static final java.util.List<DeferredBufferFree> deferredBufferFrees = java.util.Collections
+            .synchronizedList(new java.util.ArrayList<>());
 
-    private record DeferredBufferFree(long buffer, long allocation, int size, long queuedAtFrame) {}
+    private record DeferredBufferFree(long buffer, long allocation, int size, long queuedAtFrame) {
+    }
 
     /**
      * Queue a buffer for deferred destruction (safe for frame-in-flight).
@@ -130,13 +138,14 @@ public class Vulkanium implements ClientModInitializer {
      * but may still be referenced by an in-flight command buffer.
      * Buffers are returned to the pool after the delay, not destroyed.
      *
-     * @param buffer    VkBuffer handle
+     * @param buffer     VkBuffer handle
      * @param allocation VMA allocation handle
-     * @param size      Buffer capacity in bytes
-     * @param mappedPtr Persistently mapped pointer (0 for non-pool buffers)
+     * @param size       Buffer capacity in bytes
+     * @param mappedPtr  Persistently mapped pointer (0 for non-pool buffers)
      */
     public static void deferBufferFree(long buffer, long allocation, int size, long mappedPtr) {
-        if (buffer == VK_NULL_HANDLE) return;
+        if (buffer == VK_NULL_HANDLE)
+            return;
         if (chunkBufferPool != null && chunkBufferPool.isInitialized()) {
             // Route through pool — buffer will be reused after in-flight frames complete
             chunkBufferPool.deferRelease(buffer, allocation, size, mappedPtr);
@@ -191,7 +200,8 @@ public class Vulkanium implements ClientModInitializer {
      * Called from MixinWindow after GLFW window creation.
      */
     public static void onWindowCreated(long windowHandle) {
-        if (!initialized || vulkanReady) return;
+        if (!initialized || vulkanReady)
+            return;
 
         VulkaniumCapabilities.CompatibilityResult compat = VulkaniumCapabilities.checkSystemCompatibility();
         if (!compat.compatible()) {
@@ -286,6 +296,84 @@ public class Vulkanium implements ClientModInitializer {
                 LOGGER.info("Cleared {} failed shader source dumps at startup", clearedFailedDumps);
             }
             shaderpackManager.scanForPacks(gameDir.resolve("shaderpacks"));
+
+            VulkaniumGameOptions gameOptions = VulkaniumGameOptions.loadFromDisk();
+            String configSelected = config.selectedShaderpack == null ? "" : config.selectedShaderpack.trim();
+            String optionsSelected = gameOptions.shader.selectedShaderpack == null ? ""
+                    : gameOptions.shader.selectedShaderpack.trim();
+            boolean configEnabled = config.shaderpackEnabled && !configSelected.isBlank();
+            boolean optionsEnabled = gameOptions.shader.enableShaderpack && !optionsSelected.isBlank();
+
+            String resolvedSelected = "";
+            boolean wantsShaderpack = false;
+            if (configEnabled && optionsEnabled) {
+                if (!configSelected.equals(optionsSelected)) {
+                    LOGGER.warn(
+                            "Shaderpack selection mismatch at startup (config='{}', options='{}'); using options selection",
+                            configSelected, optionsSelected);
+                }
+                resolvedSelected = optionsSelected;
+                wantsShaderpack = true;
+            } else if (optionsEnabled) {
+                resolvedSelected = optionsSelected;
+                wantsShaderpack = true;
+            } else if (configEnabled) {
+                resolvedSelected = configSelected;
+                wantsShaderpack = true;
+            }
+
+            LOGGER.info(
+                    "Startup shaderpack state: config(enabled={}, selected='{}'), options(enabled={}, selected='{}'), resolved(enabled={}, selected='{}')",
+                    config.shaderpackEnabled,
+                    configSelected,
+                    gameOptions.shader.enableShaderpack,
+                    optionsSelected,
+                    wantsShaderpack,
+                    resolvedSelected);
+
+            // Reconcile persisted shaderpack selection with runtime state.
+            // This prevents SHADERPACK mode without an active pipeline, which can
+            // break non-shaderpack draw assumptions (e.g., chunk offset handling).
+            if (wantsShaderpack) {
+                boolean loaded = shaderpackManager.loadPack(resolvedSelected);
+                if (loaded) {
+                    config.setRenderMode(net.vulkanium.render.RenderMode.SHADERPACK);
+                    config.shaderpackEnabled = true;
+                    config.selectedShaderpack = resolvedSelected;
+                    gameOptions.shader.enableShaderpack = true;
+                    gameOptions.shader.selectedShaderpack = resolvedSelected;
+                    LOGGER.info("Startup shaderpack active: '{}'", resolvedSelected);
+                } else {
+                    LOGGER.warn("Startup shaderpack '{}' failed to load; falling back to VANILLA mode",
+                            resolvedSelected);
+                    config.shaderpackEnabled = false;
+                    config.selectedShaderpack = "";
+                    config.setRenderMode(net.vulkanium.render.RenderMode.VANILLA);
+                    gameOptions.shader.enableShaderpack = false;
+                    gameOptions.shader.selectedShaderpack = "";
+                }
+                config.save();
+                try {
+                    VulkaniumGameOptions.writeToDisk(gameOptions);
+                } catch (IOException e) {
+                    LOGGER.warn("Failed to save Vulkanium game options after startup reconciliation: {}",
+                            e.getMessage());
+                }
+            } else if (config.getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK) {
+                shaderpackManager.unloadPack();
+                config.setRenderMode(net.vulkanium.render.RenderMode.VANILLA);
+                config.shaderpackEnabled = false;
+                config.selectedShaderpack = "";
+                gameOptions.shader.enableShaderpack = false;
+                gameOptions.shader.selectedShaderpack = "";
+                config.save();
+                try {
+                    VulkaniumGameOptions.writeToDisk(gameOptions);
+                } catch (IOException e) {
+                    LOGGER.warn("Failed to save Vulkanium game options after startup fallback: {}", e.getMessage());
+                }
+            }
+
             LOGGER.info("Render mode: {}", config.getRenderMode().getDisplayName());
 
         } catch (Exception e) {
@@ -295,7 +383,8 @@ public class Vulkanium implements ClientModInitializer {
     }
 
     /**
-     * Initializes the render pass, pipeline registry, draw batcher, and placeholder texture.
+     * Initializes the render pass, pipeline registry, draw batcher, and placeholder
+     * texture.
      */
     private static void initRenderPipeline(VkDevice device, int framesInFlight) {
         // 1. Render pass
@@ -480,7 +569,8 @@ public class Vulkanium implements ClientModInitializer {
      * Acquires swapchain image, begins command buffer, begins render pass.
      */
     public static void onFrameBegin(float partialTick) {
-        if (!vulkanReady) return;
+        if (!vulkanReady)
+            return;
 
         stagingRing.resetForFrame(frameOrchestrator.getCurrentFrame());
 
@@ -504,9 +594,15 @@ public class Vulkanium implements ClientModInitializer {
                 VRenderSystem.getClearB(), VRenderSystem.getClearA());
 
         // Reset viewport tracking so the first draw will issue viewport commands
-        lastVpX = -1; lastVpY = -1; lastVpW = -1; lastVpH = -1;
+        lastVpX = -1;
+        lastVpY = -1;
+        lastVpW = -1;
+        lastVpH = -1;
         lastScissorEnabled = false;
-        lastScX = -1; lastScY = -1; lastScW = -1; lastScH = -1;
+        lastScX = -1;
+        lastScY = -1;
+        lastScW = -1;
+        lastScH = -1;
         diagFrameDrawCount = 0;
         frameHadWorldRender = false;
 
@@ -524,7 +620,7 @@ public class Vulkanium implements ClientModInitializer {
         // Descriptor sets are now updated per-draw in recordDraw()
 
         if (frameHadWorldRender
-            && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
                 && shaderpackManager != null
                 && shaderpackManager.getActivePipeline() != null
                 && shaderpackManager.getActivePipeline().isLoaded()) {
@@ -537,21 +633,29 @@ public class Vulkanium implements ClientModInitializer {
      * Ends render pass, ends command buffer, submits, presents.
      */
     private static long frameCounter = 0;
+
     public static void onFrameEnd() {
-        if (!vulkanReady || !frameStarted) return;
+        if (!vulkanReady || !frameStarted)
+            return;
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
 
         // End render pass
         mainRenderPass.end(cmd);
 
-        if (getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+        if (frameHadWorldRender
+                && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
                 && shaderpackManager != null
                 && shaderpackManager.getActivePipeline() != null
                 && shaderpackManager.getActivePipeline().isLoaded()) {
             int imageIndex = frameOrchestrator.getCurrentImageIndex();
             int width = vulkanSwapchain.getWidth();
             int height = vulkanSwapchain.getHeight();
+
+            if (shaderpackManager
+                    .getActivePipeline() instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline) {
+                vkPipeline.prepareFullscreenInputs(cmd, frameOrchestrator.getCurrentFrame());
+            }
 
             mainRenderPass.beginPreserve(cmd, imageIndex, width, height);
             shaderpackManager.getActivePipeline().onFrameEnd(cmd, frameOrchestrator.getCurrentFrame());
@@ -631,6 +735,10 @@ public class Vulkanium implements ClientModInitializer {
     private static final Set<String> loggedShaderpackMappingMisses = new HashSet<>();
     private static volatile boolean worldRenderActive = false;
     private static volatile boolean frameHadWorldRender = false;
+    private static volatile String activeTerrainLayerName = "";
+    private static volatile boolean activeTerrainLayerTranslucent = false;
+    private static final boolean DEBUG_TRANSLUCENT = Boolean.getBoolean("vulkanium.debug.translucent");
+    private static final boolean DEBUG_WATER = Boolean.getBoolean("vulkanium.debug.water");
 
     private static org.joml.Matrix4f toVulkanClipProjection(org.joml.Matrix4f glProjection) {
         return new org.joml.Matrix4f(glProjection);
@@ -645,24 +753,41 @@ public class Vulkanium implements ClientModInitializer {
         worldRenderActive = false;
     }
 
-        private static BasicPipeline resolvePipelineForDraw(
+    public static void onTerrainLayerStart(String renderTypeName) {
+        String name = renderTypeName == null ? "" : renderTypeName.toLowerCase(Locale.ROOT);
+        activeTerrainLayerName = name;
+        activeTerrainLayerTranslucent = name.contains("translucent") || name.contains("tripwire")
+                || name.contains("water");
+    }
+
+    public static void onTerrainLayerEnd() {
+        activeTerrainLayerName = "";
+        activeTerrainLayerTranslucent = false;
+    }
+
+    public static boolean isActiveTerrainLayerTranslucent() {
+        return activeTerrainLayerTranslucent;
+    }
+
+    private static BasicPipeline resolvePipelineForDraw(
             com.mojang.blaze3d.vertex.VertexFormat format,
             int vertexCount,
-            com.mojang.blaze3d.vertex.VertexFormat.Mode mode
-        ) {
+            com.mojang.blaze3d.vertex.VertexFormat.Mode mode) {
         BasicPipeline fallback = pipelineRegistry.getPipeline(format);
-        if (fallback == null) return null;
+        if (fallback == null)
+            return null;
 
         if (getRenderMode() != net.vulkanium.render.RenderMode.SHADERPACK) {
             return fallback;
         }
 
-        if (shaderpackManager == null || !(shaderpackManager.getActivePipeline() instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline shaderpackPipeline)) {
+        if (shaderpackManager == null || !(shaderpackManager
+                .getActivePipeline() instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline shaderpackPipeline)) {
             return fallback;
         }
 
         net.vulkanium.shaderpack.ProgramId requested = mapShaderNameToProgramId(
-            VRenderSystem.getCurrentShaderName(), format, vertexCount, mode);
+                VRenderSystem.getCurrentShaderName(), format, vertexCount, mode);
         if (requested == null) {
             String shaderName = VRenderSystem.getCurrentShaderName();
             String key = (shaderName != null ? shaderName : "") + "::" + format;
@@ -687,23 +812,22 @@ public class Vulkanium implements ClientModInitializer {
         return fallback;
     }
 
-        private static net.vulkanium.shaderpack.ProgramId mapShaderNameToProgramId(
+    private static net.vulkanium.shaderpack.ProgramId mapShaderNameToProgramId(
             String shaderName,
             com.mojang.blaze3d.vertex.VertexFormat format,
             int vertexCount,
-            com.mojang.blaze3d.vertex.VertexFormat.Mode mode
-        ) {
+            com.mojang.blaze3d.vertex.VertexFormat.Mode mode) {
         String name = shaderName != null ? shaderName.toLowerCase(Locale.ROOT) : "";
 
-            boolean activeWorldContext = worldRenderActive
-                    || (frameHadWorldRender && (isExplicitWorldShaderName(name)
-                    || (name.isEmpty() && isTerrainLikeFormat(format))));
+        boolean activeWorldContext = worldRenderActive
+                || (frameHadWorldRender && (isExplicitWorldShaderName(name)
+                        || (name.isEmpty() && isTerrainLikeFormat(format))));
 
-            // Never route GUI/HUD/menu draws through shaderpack compatibility pipelines.
-            // Shaderpack phase mapping is only valid during active world rendering.
-                if (!activeWorldContext) {
-                return null;
-            }
+        // Never route GUI/HUD/menu draws through shaderpack compatibility pipelines.
+        // Shaderpack phase mapping is only valid during active world rendering.
+        if (!activeWorldContext) {
+            return null;
+        }
 
         if (name.contains("cloud")) {
             return net.vulkanium.shaderpack.ProgramId.GBUFFERS_CLOUDS;
@@ -719,7 +843,8 @@ public class Vulkanium implements ClientModInitializer {
 
         if (activeWorldContext && !hasUV2(format) && hasUV0(format)
                 && ("position_tex".equals(name) || "position_tex_color".equals(name))) {
-            // In vanilla 1.20.x, both sky-textured and cloud draws frequently use position_tex.
+            // In vanilla 1.20.x, both sky-textured and cloud draws frequently use
+            // position_tex.
             // Cloud passes are typically much larger than sun/moon quad draws.
             if (mode == com.mojang.blaze3d.vertex.VertexFormat.Mode.QUADS && vertexCount > 64) {
                 return net.vulkanium.shaderpack.ProgramId.GBUFFERS_CLOUDS;
@@ -733,19 +858,35 @@ public class Vulkanium implements ClientModInitializer {
                     : net.vulkanium.shaderpack.ProgramId.GBUFFERS_SKYBASIC;
         }
 
-        if (name.startsWith("rendertype_entity_translucent")
-                || name.startsWith("rendertype_entity_cutout")
-                || name.startsWith("rendertype_entity_cutout_no_cull")
-                || name.startsWith("rendertype_entity_solid")) {
-            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES;
-        }
-
-        if (name.startsWith("rendertype_glint") || name.contains("armor_glint")) {
-            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ARMOR_GLINT;
+        if (name.startsWith("rendertype_entity")
+                || name.startsWith("rendertype_eyes")
+                || name.startsWith("rendertype_glint")
+                || name.contains("armor_glint")) {
+            // Keep entities/glint on the stable fallback path for now.
+            // iterationRP entity compatibility requires tighter parity for overlays,
+            // lightmaps and material conventions than this bridge currently provides.
+            return null;
         }
 
         if (!isTerrainLikeFormat(format)) {
             return null;
+        }
+
+        if (!activeTerrainLayerName.isEmpty()) {
+            if (activeTerrainLayerName.contains("cutout_mipped")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_TERRAIN_CUTOUT_MIPPED;
+            }
+            if (activeTerrainLayerName.contains("cutout")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_TERRAIN_CUTOUT;
+            }
+            if (activeTerrainLayerName.contains("translucent")
+                    || activeTerrainLayerName.contains("tripwire")
+                    || activeTerrainLayerName.contains("water")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER;
+            }
+            if (activeTerrainLayerName.contains("solid")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_TERRAIN_SOLID;
+            }
         }
 
         if (name.isEmpty()) {
@@ -856,6 +997,18 @@ public class Vulkanium implements ClientModInitializer {
                 || name.contains("water");
     }
 
+    private static boolean isWaterShaderName(String shaderName) {
+        if (shaderName == null || shaderName.isEmpty()) {
+            return false;
+        }
+        String name = shaderName.toLowerCase(Locale.ROOT);
+        return name.contains("water")
+                || name.contains("translucent")
+                || name.contains("tripwire")
+                || name.contains("gbuffers_water")
+                || name.contains("hand_water");
+    }
+
     private static boolean isTerrainLikeFormat(com.mojang.blaze3d.vertex.VertexFormat format) {
         boolean hasUV0 = false;
         boolean hasUV1 = false;
@@ -866,9 +1019,12 @@ public class Vulkanium implements ClientModInitializer {
         for (com.mojang.blaze3d.vertex.VertexFormatElement element : format.getElements()) {
             switch (element.getUsage()) {
                 case UV -> {
-                    if (element.getIndex() == 0) hasUV0 = true;
-                    if (element.getIndex() == 1) hasUV1 = true;
-                    if (element.getIndex() == 2) hasUV2 = true;
+                    if (element.getIndex() == 0)
+                        hasUV0 = true;
+                    if (element.getIndex() == 1)
+                        hasUV1 = true;
+                    if (element.getIndex() == 2)
+                        hasUV2 = true;
                 }
                 case COLOR -> hasColor = true;
                 case NORMAL -> hasNormal = true;
@@ -886,7 +1042,8 @@ public class Vulkanium implements ClientModInitializer {
             drawTextureSamplers[i] = placeholderSampler;
 
             int boundTexId = VRenderSystem.getBoundTextureId(i);
-            if (boundTexId <= 0) continue;
+            if (boundTexId <= 0)
+                continue;
 
             VulkanTexture vt = GlStateInterceptor.getVulkanTexture(boundTexId);
             if (vt != null && vt.isAllocated()) {
@@ -897,13 +1054,15 @@ public class Vulkanium implements ClientModInitializer {
     }
 
     public static void recordDraw(ByteBuffer vertexData, int vertexCount,
-                                   com.mojang.blaze3d.vertex.VertexFormat.Mode mode, int vertexSize,
-                                   com.mojang.blaze3d.vertex.VertexFormat format) {
-        if (!frameStarted || !frameOrchestrator.isRecording()) return;
+            com.mojang.blaze3d.vertex.VertexFormat.Mode mode, int vertexSize,
+            com.mojang.blaze3d.vertex.VertexFormat format) {
+        if (!frameStarted || !frameOrchestrator.isRecording())
+            return;
 
         // Resolve default or shaderpack compatibility pipeline for this draw
         BasicPipeline pipeline = resolvePipelineForDraw(format, vertexCount, mode);
-        if (pipeline == null) return;
+        if (pipeline == null)
+            return;
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
         int frameIndex = frameOrchestrator.getCurrentFrame();
@@ -912,10 +1071,10 @@ public class Vulkanium implements ClientModInitializer {
         float[] mvp = new float[16];
         net.vulkanium.compat.VRenderSystem.getMVPMatrix().get(mvp);
         float[] colorMod = {
-            net.vulkanium.compat.VRenderSystem.getShaderColorR(),
-            net.vulkanium.compat.VRenderSystem.getShaderColorG(),
-            net.vulkanium.compat.VRenderSystem.getShaderColorB(),
-            net.vulkanium.compat.VRenderSystem.getShaderColorA()
+                net.vulkanium.compat.VRenderSystem.getShaderColorR(),
+                net.vulkanium.compat.VRenderSystem.getShaderColorG(),
+                net.vulkanium.compat.VRenderSystem.getShaderColorB(),
+                net.vulkanium.compat.VRenderSystem.getShaderColorA()
         };
 
         totalDraws++;
@@ -923,7 +1082,7 @@ public class Vulkanium implements ClientModInitializer {
 
         // ─── DIAGNOSTIC: Log detailed per-draw state for early frames ───
         boolean diagLog = isDebugLogging() && ((frameCounter < 3) ||
-                          (frameCounter >= 295 && frameCounter <= 297));
+                (frameCounter >= 295 && frameCounter <= 297));
         if (diagLog) {
             boolean blend = net.vulkanium.compat.VRenderSystem.isBlendEnabled();
             boolean depthD = net.vulkanium.compat.VRenderSystem.isDepthTestEnabled();
@@ -944,10 +1103,10 @@ public class Vulkanium implements ClientModInitializer {
             }
 
             LOGGER.info("[DIAG] F#{} D#{} pipe={} shader='{}' verts={} mode={} vtxSize={} " +
-                        "blend={} depth={} cull={} " +
-                        "color=({},{},{},{}) " +
-                        "tex={} vp={}x{} " +
-                        "mvp[0,5,10,12,13,14,15]=({},{},{},{},{},{},{}) {}",
+                    "blend={} depth={} cull={} " +
+                    "color=({},{},{},{}) " +
+                    "tex={} vp={}x{} " +
+                    "mvp[0,5,10,12,13,14,15]=({},{},{},{},{},{},{}) {}",
                     frameCounter, diagFrameDrawCount, pipeline.getName(), shader,
                     vertexCount, mode, vertexSize,
                     blend, depthD, cullD,
@@ -964,12 +1123,12 @@ public class Vulkanium implements ClientModInitializer {
 
         // Build fog params for shader UBO
         float[] fogParams = {
-            net.vulkanium.compat.VRenderSystem.getFogColorR(),
-            net.vulkanium.compat.VRenderSystem.getFogColorG(),
-            net.vulkanium.compat.VRenderSystem.getFogColorB(),
-            net.vulkanium.compat.VRenderSystem.getFogColorA(),
-            net.vulkanium.compat.VRenderSystem.getFogStart(),
-            net.vulkanium.compat.VRenderSystem.getFogEnd()
+                net.vulkanium.compat.VRenderSystem.getFogColorR(),
+                net.vulkanium.compat.VRenderSystem.getFogColorG(),
+                net.vulkanium.compat.VRenderSystem.getFogColorB(),
+                net.vulkanium.compat.VRenderSystem.getFogColorA(),
+                net.vulkanium.compat.VRenderSystem.getFogStart(),
+                net.vulkanium.compat.VRenderSystem.getFogEnd()
         };
 
         // Get texture matrix for glint/scroll UV animation
@@ -977,7 +1136,7 @@ public class Vulkanium implements ClientModInitializer {
         net.vulkanium.compat.VRenderSystem.getTextureMatrix().get(texMat);
 
         boolean shaderpackCompat = getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-            && pipeline.getName().startsWith("shaderpack_");
+                && pipeline.getName().startsWith("shaderpack_");
 
         int uboOffset;
         if (shaderpackCompat) {
@@ -986,35 +1145,49 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
             boolean hasChunkOffset = chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f;
 
-            org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+            org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(
+                    net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
             if (hasChunkOffset) {
-            // Stabilize terrain compatibility path: apply section translation in CPU model-view
-            // and zero the explicit chunk offset uniform to avoid double application.
-            modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-            chunkOffsetX = 0.0f;
-            chunkOffsetY = 0.0f;
-            chunkOffsetZ = 0.0f;
+                // Stabilize terrain compatibility path: apply section translation in CPU
+                // model-view
+                // and zero the explicit chunk offset uniform to avoid double application.
+                modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
+                chunkOffsetX = 0.0f;
+                chunkOffsetY = 0.0f;
+                chunkOffsetZ = 0.0f;
             }
 
             float[] modelView = new float[16];
             modelViewMat.get(modelView);
             float[] projection = new float[16];
-            org.joml.Matrix4f glProjection = new org.joml.Matrix4f(net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
+            org.joml.Matrix4f glProjection = new org.joml.Matrix4f(
+                    net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
             glProjection.get(projection);
             float[] modelViewInv = new float[16];
             new org.joml.Matrix4f(modelViewMat).invert().get(modelViewInv);
             float[] projectionInv = new float[16];
             new org.joml.Matrix4f(glProjection).invert().get(projectionInv);
             float[] chunkOffset = {
-                chunkOffsetX,
-                chunkOffsetY,
-                chunkOffsetZ
+                    chunkOffsetX,
+                    chunkOffsetY,
+                    chunkOffsetZ
             };
             uboOffset = drawBatcher.uploadUniformsShaderpack(frameIndex,
                     modelView, modelViewInv,
                     projection, projectionInv,
                     colorMod, fogParams, texMat, chunkOffset);
         } else {
+            if (net.vulkanium.compat.VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {
+                org.joml.Matrix4f modelViewWithOffset = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getModelViewMatrix())
+                        .translate(
+                                net.vulkanium.compat.VRenderSystem.getChunkOffsetX(),
+                                net.vulkanium.compat.VRenderSystem.getChunkOffsetY(),
+                                net.vulkanium.compat.VRenderSystem.getChunkOffsetZ());
+                org.joml.Matrix4f projection = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
+                projection.mul(modelViewWithOffset).get(mvp);
+            }
             uboOffset = drawBatcher.uploadUniformsLegacy(frameIndex, mvp, colorMod, fogParams, texMat);
         }
 
@@ -1028,6 +1201,9 @@ public class Vulkanium implements ClientModInitializer {
         boolean depth = net.vulkanium.compat.VRenderSystem.isDepthTestEnabled();
         boolean depthWrite = net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled();
         boolean cull = net.vulkanium.compat.VRenderSystem.isCullEnabled();
+        if (blend && isTerrainLikeFormat(format) && isActiveTerrainLayerTranslucent()) {
+            depthWrite = false;
+        }
         int topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // Quads use indexed triangles
 
         int srcColorVk = net.vulkanium.compat.VRenderSystem.glToVkBlendFactor(
@@ -1059,8 +1235,9 @@ public class Vulkanium implements ClientModInitializer {
 
         // Update dynamic viewport/scissor if MC changed them since last draw.
         // Two-lane split:
-        // 1) Shaderpack compatibility draws: shader transform already handles clip-space conversion,
-        //    so avoid extra viewport Y flip.
+        // 1) Shaderpack compatibility draws: shader transform already handles
+        // clip-space conversion,
+        // so avoid extra viewport Y flip.
         // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
         updateViewportScissor(cmd, !shaderpackCompat);
 
@@ -1077,20 +1254,29 @@ public class Vulkanium implements ClientModInitializer {
     /**
      * Records a draw command using an externally-owned persistent VkBuffer.
      *
-     * <p>Unlike {@link #recordDraw}, this does NOT copy vertex data into the
+     * <p>
+     * Unlike {@link #recordDraw}, this does NOT copy vertex data into the
      * streaming DrawBatcher vertex buffer. The buffer was already uploaded
      * in {@code VertexBuffer.upload()} and remains GPU-resident until the
-     * chunk section is rebuilt or freed.</p>
+     * chunk section is rebuilt or freed.
+     * </p>
      */
     public static void recordDrawPersistent(long vkBuffer, int vertexCount,
-                                             com.mojang.blaze3d.vertex.VertexFormat.Mode mode,
-                                             int vertexSize,
-                                             com.mojang.blaze3d.vertex.VertexFormat format) {
-        if (!frameStarted || !frameOrchestrator.isRecording()) return;
-        if (vkBuffer == 0 || vertexCount <= 0) return;
+            com.mojang.blaze3d.vertex.VertexFormat.Mode mode,
+            int vertexSize,
+            com.mojang.blaze3d.vertex.VertexFormat format,
+            long indexBuffer,
+            int persistentIndexCount,
+            int persistentIndexVkType,
+            boolean sequentialIndex) {
+        if (!frameStarted || !frameOrchestrator.isRecording())
+            return;
+        if (vkBuffer == 0 || vertexCount <= 0)
+            return;
 
         BasicPipeline pipeline = resolvePipelineForDraw(format, vertexCount, mode);
-        if (pipeline == null) return;
+        if (pipeline == null)
+            return;
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
         int frameIndex = frameOrchestrator.getCurrentFrame();
@@ -1099,23 +1285,25 @@ public class Vulkanium implements ClientModInitializer {
         float[] mvp = new float[16];
         VRenderSystem.getMVPMatrix().get(mvp);
         float[] colorMod = {
-            VRenderSystem.getShaderColorR(),
-            VRenderSystem.getShaderColorG(),
-            VRenderSystem.getShaderColorB(),
-            VRenderSystem.getShaderColorA()
+                VRenderSystem.getShaderColorR(),
+                VRenderSystem.getShaderColorG(),
+                VRenderSystem.getShaderColorB(),
+                VRenderSystem.getShaderColorA()
         };
 
         totalDraws++;
         diagFrameDrawCount++;
 
-        // ─── DIAGNOSTIC: Log first few persistent draws per frame at specific frame numbers
-        boolean diagPersist = isDebugLogging() && (frameCounter >= 500 && frameCounter <= 502 && diagFrameDrawCount <= 5);
+        // ─── DIAGNOSTIC: Log first few persistent draws per frame at specific frame
+        // numbers
+        boolean diagPersist = isDebugLogging()
+                && (frameCounter >= 500 && frameCounter <= 502 && diagFrameDrawCount <= 5);
 
         // Build fog params for shader UBO
         float[] fogParams = {
-            VRenderSystem.getFogColorR(), VRenderSystem.getFogColorG(),
-            VRenderSystem.getFogColorB(), VRenderSystem.getFogColorA(),
-            VRenderSystem.getFogStart(),  VRenderSystem.getFogEnd()
+                VRenderSystem.getFogColorR(), VRenderSystem.getFogColorG(),
+                VRenderSystem.getFogColorB(), VRenderSystem.getFogColorA(),
+                VRenderSystem.getFogStart(), VRenderSystem.getFogEnd()
         };
 
         // Get texture matrix for glint/scroll UV animation
@@ -1123,7 +1311,7 @@ public class Vulkanium implements ClientModInitializer {
         VRenderSystem.getTextureMatrix().get(texMat);
 
         boolean shaderpackCompat = getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-            && pipeline.getName().startsWith("shaderpack_");
+                && pipeline.getName().startsWith("shaderpack_");
 
         int uboOffset;
         if (shaderpackCompat) {
@@ -1134,7 +1322,8 @@ public class Vulkanium implements ClientModInitializer {
 
             org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix());
             if (hasChunkOffset) {
-                // Stabilize terrain compatibility path: apply section translation in CPU model-view
+                // Stabilize terrain compatibility path: apply section translation in CPU
+                // model-view
                 // and zero the explicit chunk offset uniform to avoid double application.
                 modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
                 chunkOffsetX = 0.0f;
@@ -1152,15 +1341,24 @@ public class Vulkanium implements ClientModInitializer {
             float[] projectionInv = new float[16];
             new org.joml.Matrix4f(glProjection).invert().get(projectionInv);
             float[] chunkOffset = {
-                chunkOffsetX,
-                chunkOffsetY,
-                chunkOffsetZ
+                    chunkOffsetX,
+                    chunkOffsetY,
+                    chunkOffsetZ
             };
             uboOffset = drawBatcher.uploadUniformsShaderpack(frameIndex,
-                modelView, modelViewInv,
-                projection, projectionInv,
-                colorMod, fogParams, texMat, chunkOffset);
+                    modelView, modelViewInv,
+                    projection, projectionInv,
+                    colorMod, fogParams, texMat, chunkOffset);
         } else {
+            if (VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {
+                org.joml.Matrix4f modelViewWithOffset = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix())
+                        .translate(
+                                VRenderSystem.getChunkOffsetX(),
+                                VRenderSystem.getChunkOffsetY(),
+                                VRenderSystem.getChunkOffsetZ());
+                org.joml.Matrix4f projection = new org.joml.Matrix4f(VRenderSystem.getProjectionMatrix());
+                projection.mul(modelViewWithOffset).get(mvp);
+            }
             uboOffset = drawBatcher.uploadUniformsLegacy(frameIndex, mvp, colorMod, fogParams, texMat);
         }
 
@@ -1168,8 +1366,8 @@ public class Vulkanium implements ClientModInitializer {
 
         if (diagPersist) {
             LOGGER.info("[PERSIST-DIAG] F#{} D#{} pipe={} verts={} stride={} colorMod=({},{},{},{}) " +
-                        "blend={} depth={} depthWrite={} cull={} " +
-                        "mvp[0,5,10,15]=({},{},{},{})",
+                    "blend={} depth={} depthWrite={} cull={} " +
+                    "mvp[0,5,10,15]=({},{},{},{})",
                     frameCounter, diagFrameDrawCount, pipeline.getName(),
                     vertexCount, vertexSize,
                     String.format("%.2f", colorMod[0]), String.format("%.2f", colorMod[1]),
@@ -1188,12 +1386,21 @@ public class Vulkanium implements ClientModInitializer {
         boolean depth = VRenderSystem.isDepthTestEnabled();
         boolean depthWrite = VRenderSystem.isDepthWriteEnabled();
         boolean cull = VRenderSystem.isCullEnabled();
+        if (blend && isTerrainLikeFormat(format) && isActiveTerrainLayerTranslucent()) {
+            depthWrite = false;
+        }
+        String currentShaderName = VRenderSystem.getCurrentShaderName();
+        boolean isWaterDraw = isTerrainLikeFormat(format)
+                && (isActiveTerrainLayerTranslucent()
+                        || isWaterShaderName(currentShaderName)
+                        || (pipeline.getName() != null
+                                && pipeline.getName().toLowerCase(Locale.ROOT).contains("water")));
 
         int srcColorVk = VRenderSystem.glToVkBlendFactor(VRenderSystem.getBlendSrcRGB());
         int dstColorVk = VRenderSystem.glToVkBlendFactor(VRenderSystem.getBlendDstRGB());
         int srcAlphaVk = VRenderSystem.glToVkBlendFactor(VRenderSystem.getBlendSrcAlpha());
         int dstAlphaVk = VRenderSystem.glToVkBlendFactor(VRenderSystem.getBlendDstAlpha());
-        int depthOpVk  = VRenderSystem.glToVkDepthFunc(VRenderSystem.getDepthFunc());
+        int depthOpVk = VRenderSystem.glToVkDepthFunc(VRenderSystem.getDepthFunc());
 
         long vkPipeline = pipeline.getOrCreatePipeline(blend, depth, depthWrite, cull,
                 org.lwjgl.vulkan.VK10.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
@@ -1213,45 +1420,98 @@ public class Vulkanium implements ClientModInitializer {
 
         // Update viewport/scissor.
         // Two-lane split:
-        // 1) Shaderpack compatibility draws: shader transform already handles clip-space conversion,
-        //    so avoid extra viewport Y flip.
+        // 1) Shaderpack compatibility draws: shader transform already handles
+        // clip-space conversion,
+        // so avoid extra viewport Y flip.
         // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
         updateViewportScissor(cmd, !shaderpackCompat);
 
         // Bind descriptor set
         drawBatcher.bindDescriptorSet(cmd, pipeline.getPipelineLayout(), setIdx, uboOffset);
 
-        // Bind the persistent vertex buffer directly (not from DrawBatcher's streaming buffer)
+        // Bind the persistent vertex buffer directly (not from DrawBatcher's streaming
+        // buffer)
         try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
             org.lwjgl.vulkan.VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vkBuffer), stack.longs(0));
         }
 
-        // Issue draw command based on primitive mode.
-        // QUADS, TRIANGLE_FAN, and TRIANGLE_STRIP use index buffers
-        // to convert to TRIANGLE_LIST draws.
-        switch (mode) {
-            case QUADS -> {
-                int quadCount = vertexCount / 4;
-                int indexCount = quadCount * 6;
-                org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd,
-                        drawBatcher.getQuadIndexBuffer(), 0, org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32);
-                org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+        // === Index buffer selection (VulkanMod-inspired 2-tier approach) ===
+        // Tier 1: Per-section uploaded index buffer (vanilla sorted OR CPU-sorted).
+        //         For translucent terrain, MixinVertexBuffer now ALWAYS generates
+        //         sorted indices (either from vanilla re-sorts or our CPU sort).
+        // Tier 2: Global auto-index buffer (quad/fan/strip pattern).
+        //         Used for opaque terrain and non-terrain draws.
+
+        if (indexBuffer != 0 && persistentIndexCount > 0) {
+            // Use per-section uploaded index buffer (sorted for translucent)
+            org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd, indexBuffer, 0,
+                    persistentIndexVkType == org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32
+                            ? org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32
+                            : org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT16);
+            org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, persistentIndexCount, 1, 0, 0, 0);
+            if (DEBUG_TRANSLUCENT && isTerrainLikeFormat(format)
+                    && (mode == com.mojang.blaze3d.vertex.VertexFormat.Mode.QUADS
+                            || mode == com.mojang.blaze3d.vertex.VertexFormat.Mode.TRIANGLE_STRIP
+                            || mode == com.mojang.blaze3d.vertex.VertexFormat.Mode.TRIANGLE_FAN)) {
+                LOGGER.info(
+                        "[TRANS-DRAW] indexed mode={} vtxCount={} idxCount={} idxType={} seq={} pipe={} shader='{}'",
+                        mode, vertexCount, persistentIndexCount,
+                        (persistentIndexVkType == org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
+                        sequentialIndex, pipeline.getName(), currentShaderName);
             }
-            case TRIANGLE_FAN -> {
-                int indexCount = (vertexCount - 2) * 3;
-                org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd,
-                        drawBatcher.getFanIndexBuffer(), 0, org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT16);
-                org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+            if ((DEBUG_TRANSLUCENT || DEBUG_WATER) && isWaterDraw) {
+                LOGGER.info(
+                        "[WATER-DRAW] source=uploaded-index mode={} vtxCount={} idxCount={} idxType={} pipe={} shader='{}' blend={} depth={} depthWrite={} cull={} chunkOffset=({},{},{})",
+                        mode,
+                        vertexCount,
+                        persistentIndexCount,
+                        (persistentIndexVkType == org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
+                        pipeline.getName(),
+                        currentShaderName,
+                        blend,
+                        depth,
+                        depthWrite,
+                        cull,
+                        VRenderSystem.getChunkOffsetX(),
+                        VRenderSystem.getChunkOffsetY(),
+                        VRenderSystem.getChunkOffsetZ());
             }
-            case TRIANGLE_STRIP -> {
-                int indexCount = (vertexCount - 2) * 3;
-                org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd,
-                        drawBatcher.getStripIndexBuffer(), 0, org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT16);
-                org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
-            }
-            default -> {
-                // TRIANGLES, LINE_STRIP, lines, etc. — direct draw
-                org.lwjgl.vulkan.VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+        } else {
+            // Auto-index fallback: use global shared index buffers
+            // (like VulkanMod's AutoIndexBuffer bound before ChunkArea loop)
+            switch (mode) {
+                case QUADS -> {
+                    int quadCount = vertexCount / 4;
+                    int indexCount = quadCount * 6;
+                    org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd,
+                            drawBatcher.getQuadIndexBuffer(), 0, org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32);
+                    org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+                    if ((DEBUG_TRANSLUCENT || DEBUG_WATER) && isWaterDraw) {
+                        LOGGER.warn(
+                                "[WATER-DRAW] source=auto-quad mode={} vtxCount={} idxCount={} pipe={} shader='{}' blend={} depth={} depthWrite={} cull={} chunkOffset=({},{},{})",
+                                mode, vertexCount, indexCount,
+                                pipeline.getName(), currentShaderName,
+                                blend, depth, depthWrite, cull,
+                                VRenderSystem.getChunkOffsetX(),
+                                VRenderSystem.getChunkOffsetY(),
+                                VRenderSystem.getChunkOffsetZ());
+                    }
+                }
+                case TRIANGLE_FAN -> {
+                    int indexCount = (vertexCount - 2) * 3;
+                    org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd,
+                            drawBatcher.getFanIndexBuffer(), 0, org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT16);
+                    org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+                }
+                case TRIANGLE_STRIP -> {
+                    int indexCount = (vertexCount - 2) * 3;
+                    org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd,
+                            drawBatcher.getStripIndexBuffer(), 0, org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT16);
+                    org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
+                }
+                default -> {
+                    org.lwjgl.vulkan.VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+                }
             }
         }
 
@@ -1259,12 +1519,14 @@ public class Vulkanium implements ClientModInitializer {
     }
 
     /**
-     * Updates the dynamic viewport and scissor commands if MC changed them since last draw.
+     * Updates the dynamic viewport and scissor commands if MC changed them since
+     * last draw.
      * MC changes viewport for GUI vs 3D rendering within the same frame.
      * Respects VRenderSystem.isScissorEnabled() for scroll area clipping.
      */
     private static void updateViewportScissor(VkCommandBuffer cmd, boolean flipViewportY) {
-        // Read current viewport from VRenderSystem (set by MixinGlStateManager._viewport)
+        // Read current viewport from VRenderSystem (set by
+        // MixinGlStateManager._viewport)
         int vpX = VRenderSystem.getViewportX();
         int vpY = VRenderSystem.getViewportY();
         int vpW = VRenderSystem.getViewportWidth();
@@ -1287,9 +1549,10 @@ public class Vulkanium implements ClientModInitializer {
         }
 
         boolean vpChanged = vpW > 0 && vpH > 0
-            && (vpX != lastVpX || vpY != lastVpY || vpW != lastVpW || vpH != lastVpH
-            || lastVpFlipY == null || lastVpFlipY.booleanValue() != flipViewportY);
-        boolean scChanged = (scissorEnabled != lastScissorEnabled || scX != lastScX || scY != lastScY || scW != lastScW || scH != lastScH);
+                && (vpX != lastVpX || vpY != lastVpY || vpW != lastVpW || vpH != lastVpH
+                        || lastVpFlipY == null || lastVpFlipY.booleanValue() != flipViewportY);
+        boolean scChanged = (scissorEnabled != lastScissorEnabled || scX != lastScX || scY != lastScY || scW != lastScW
+                || scH != lastScH);
 
         if (vpChanged || scChanged) {
             int fbHeight = vulkanSwapchain.getHeight();
@@ -1309,7 +1572,10 @@ public class Vulkanium implements ClientModInitializer {
                         viewport.y(fbHeight - (vpY + vpH)).height(vpH);
                     }
                     vkCmdSetViewport(cmd, 0, viewport);
-                    lastVpX = vpX; lastVpY = vpY; lastVpW = vpW; lastVpH = vpH;
+                    lastVpX = vpX;
+                    lastVpY = vpY;
+                    lastVpW = vpW;
+                    lastVpH = vpH;
                     lastVpFlipY = flipViewportY;
                 }
 
@@ -1329,7 +1595,10 @@ public class Vulkanium implements ClientModInitializer {
                     vkCmdSetScissor(cmd, 0, scissor);
 
                     lastScissorEnabled = scissorEnabled;
-                    lastScX = scX; lastScY = scY; lastScW = scW; lastScH = scH;
+                    lastScX = scX;
+                    lastScY = scY;
+                    lastScW = scW;
+                    lastScH = scH;
                 }
             }
         }
@@ -1337,12 +1606,12 @@ public class Vulkanium implements ClientModInitializer {
 
     private static int glModeToVkTopology(int glMode) {
         return switch (glMode) {
-            case 4 -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;      // GL_TRIANGLES
-            case 5 -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;     // GL_TRIANGLE_STRIP
-            case 6 -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;       // GL_TRIANGLE_FAN
-            case 1 -> VK_PRIMITIVE_TOPOLOGY_LINE_LIST;          // GL_LINES
-            case 3 -> VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;         // GL_LINE_STRIP
-            case 0 -> VK_PRIMITIVE_TOPOLOGY_POINT_LIST;         // GL_POINTS
+            case 4 -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // GL_TRIANGLES
+            case 5 -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; // GL_TRIANGLE_STRIP
+            case 6 -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; // GL_TRIANGLE_FAN
+            case 1 -> VK_PRIMITIVE_TOPOLOGY_LINE_LIST; // GL_LINES
+            case 3 -> VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; // GL_LINE_STRIP
+            case 0 -> VK_PRIMITIVE_TOPOLOGY_POINT_LIST; // GL_POINTS
             default -> VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         };
     }
@@ -1352,30 +1621,48 @@ public class Vulkanium implements ClientModInitializer {
     public static void destroy() {
         LOGGER.info("Shutting down Vulkanium...");
 
-        if (frameOrchestrator != null) frameOrchestrator.waitIdle();
+        if (frameOrchestrator != null)
+            frameOrchestrator.waitIdle();
 
-        if (drawBatcher != null) drawBatcher.destroy();
-        if (rtRenderer != null) rtRenderer.destroy();
-        if (chunkBufferPool != null) chunkBufferPool.destroy();
-        if (pipelineRegistry != null) pipelineRegistry.destroy();
-        if (mainRenderPass != null) mainRenderPass.destroy();
+        if (drawBatcher != null)
+            drawBatcher.destroy();
+        if (rtRenderer != null)
+            rtRenderer.destroy();
+        if (chunkBufferPool != null)
+            chunkBufferPool.destroy();
+        if (pipelineRegistry != null)
+            pipelineRegistry.destroy();
+        if (mainRenderPass != null)
+            mainRenderPass.destroy();
 
         VkDevice device = vulkanDevice != null ? vulkanDevice.getLogicalDevice() : null;
         if (device != null) {
-            if (placeholderImageView != VK_NULL_HANDLE) vkDestroyImageView(device, placeholderImageView, null);
-            if (placeholderSampler != VK_NULL_HANDLE) vkDestroySampler(device, placeholderSampler, null);
+            if (placeholderImageView != VK_NULL_HANDLE)
+                vkDestroyImageView(device, placeholderImageView, null);
+            if (placeholderSampler != VK_NULL_HANDLE)
+                vkDestroySampler(device, placeholderSampler, null);
         }
 
-        if (stagingRing != null) stagingRing.destroy();
-        if (descriptorSetManager != null) descriptorSetManager.destroy();
-        if (spirvCompiler != null) spirvCompiler.destroy();
-        if (vulkanSync != null) vulkanSync.destroy();
-        if (vulkanCommand != null) vulkanCommand.destroy();
-        if (vulkanSwapchain != null) vulkanSwapchain.destroy();
-        if (vulkanMemory != null) vulkanMemory.destroy();
-        if (vulkanQueues != null) vulkanQueues.destroy();
-        if (vulkanDevice != null) vulkanDevice.destroy();
-        if (vulkanInstance != null) vulkanInstance.destroy();
+        if (stagingRing != null)
+            stagingRing.destroy();
+        if (descriptorSetManager != null)
+            descriptorSetManager.destroy();
+        if (spirvCompiler != null)
+            spirvCompiler.destroy();
+        if (vulkanSync != null)
+            vulkanSync.destroy();
+        if (vulkanCommand != null)
+            vulkanCommand.destroy();
+        if (vulkanSwapchain != null)
+            vulkanSwapchain.destroy();
+        if (vulkanMemory != null)
+            vulkanMemory.destroy();
+        if (vulkanQueues != null)
+            vulkanQueues.destroy();
+        if (vulkanDevice != null)
+            vulkanDevice.destroy();
+        if (vulkanInstance != null)
+            vulkanInstance.destroy();
 
         vulkanReady = false;
         LOGGER.info("Vulkanium shutdown complete.");
@@ -1384,24 +1671,29 @@ public class Vulkanium implements ClientModInitializer {
     // ─── VSync / Resize ────────────────────────────────────────────────
 
     /**
-     * Clears color and/or depth attachments mid-render-pass using vkCmdClearAttachments.
+     * Clears color and/or depth attachments mid-render-pass using
+     * vkCmdClearAttachments.
      * 
-     * <p>MC calls {@code RenderSystem.clear(GL_DEPTH_BUFFER_BIT)} between world
+     * <p>
+     * MC calls {@code RenderSystem.clear(GL_DEPTH_BUFFER_BIT)} between world
      * and GUI rendering. Without this, the depth buffer retains world geometry
      * and GUI draws using LEQUAL depth test (RenderType.gui()) fail against
-     * close objects (their depth 0.5 fails ≤ test vs world depth ~0.0–0.4).</p>
+     * close objects (their depth 0.5 fails ≤ test vs world depth ~0.0–0.4).
+     * </p>
      *
      * @param mask    GL clear mask bits (0x4000 = COLOR, 0x100 = DEPTH)
      * @param r,g,b,a clear color (used when COLOR bit is set)
      * @param depth   clear depth value (used when DEPTH bit is set)
      */
     public static void clearAttachments(int mask, float r, float g, float b, float a, float depth) {
-        if (!frameStarted || !frameOrchestrator.isRecording()) return;
+        if (!frameStarted || !frameOrchestrator.isRecording())
+            return;
 
-        boolean clearColor = (mask & 0x4000) != 0;  // GL_COLOR_BUFFER_BIT
-        boolean clearDepth = (mask & 0x0100) != 0;   // GL_DEPTH_BUFFER_BIT
+        boolean clearColor = (mask & 0x4000) != 0; // GL_COLOR_BUFFER_BIT
+        boolean clearDepth = (mask & 0x0100) != 0; // GL_DEPTH_BUFFER_BIT
 
-        if (!clearColor && !clearDepth) return;
+        if (!clearColor && !clearDepth)
+            return;
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
 
@@ -1436,14 +1728,16 @@ public class Vulkanium implements ClientModInitializer {
     }
 
     public static void setVsync(boolean vsync) {
-        if (!vulkanReady || vulkanSwapchain == null) return;
+        if (!vulkanReady || vulkanSwapchain == null)
+            return;
         int pm = vsync ? 2 : 1; // FIFO vs MAILBOX
         LOGGER.info("Vsync {} — present mode {}", vsync ? "enabled" : "disabled", pm);
         vulkanSwapchain.setPresentMode(pm);
     }
 
     public static void scheduleSwapchainRecreation(int width, int height) {
-        if (!vulkanReady || vulkanSwapchain == null) return;
+        if (!vulkanReady || vulkanSwapchain == null)
+            return;
         LOGGER.info("Scheduling swapchain recreation: {}x{}", width, height);
         vulkanSwapchain.setNeedsRecreation(true);
         if (rtRenderer != null && rtRenderer.isInitialized()) {
@@ -1453,12 +1747,29 @@ public class Vulkanium implements ClientModInitializer {
 
     // ─── Getters ───────────────────────────────────────────────────────
 
-    public static boolean isInitialized() { return initialized; }
-    public static boolean isVulkanReady() { return vulkanReady; }
-    public static boolean wasVulkanUsed() { return vulkanWasUsed; }
-    public static boolean isFrameStarted() { return frameStarted; }
-    public static String getVersion() { return version; }
-    public static VulkaniumConfig getConfig() { return config; }
+    public static boolean isInitialized() {
+        return initialized;
+    }
+
+    public static boolean isVulkanReady() {
+        return vulkanReady;
+    }
+
+    public static boolean wasVulkanUsed() {
+        return vulkanWasUsed;
+    }
+
+    public static boolean isFrameStarted() {
+        return frameStarted;
+    }
+
+    public static String getVersion() {
+        return version;
+    }
+
+    public static VulkaniumConfig getConfig() {
+        return config;
+    }
 
     /** Returns true if verbose debug logging is enabled in config. */
     public static boolean isDebugLogging() {
@@ -1470,6 +1781,17 @@ public class Vulkanium implements ClientModInitializer {
         return config != null ? config.getRenderMode() : net.vulkanium.render.RenderMode.VANILLA;
     }
 
+    /**
+     * Returns true only when shaderpack mode is selected AND a shaderpack pipeline
+     * is loaded.
+     */
+    public static boolean isShaderpackPipelineActive() {
+        return getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                && shaderpackManager != null
+                && shaderpackManager.getActivePipeline() != null
+                && shaderpackManager.getActivePipeline().isLoaded();
+    }
+
     /** Set the current rendering mode and save config. */
     public static void setRenderMode(net.vulkanium.render.RenderMode mode) {
         if (config != null) {
@@ -1479,29 +1801,92 @@ public class Vulkanium implements ClientModInitializer {
         }
     }
 
-    public static VulkaniumInstance getVulkanInstance() { return vulkanInstance; }
-    public static VulkaniumDevice getVulkanDevice() { return vulkanDevice; }
-    public static VulkaniumQueues getVulkanQueues() { return vulkanQueues; }
-    public static VulkaniumMemory getVulkanMemory() { return vulkanMemory; }
-    public static VulkaniumSwapchain getVulkanSwapchain() { return vulkanSwapchain; }
-    public static VulkaniumCommand getVulkanCommand() { return vulkanCommand; }
-    public static VulkaniumSync getVulkanSync() { return vulkanSync; }
-    public static FrameOrchestrator getFrameOrchestrator() { return frameOrchestrator; }
-    public static DescriptorSetManager getDescriptorSetManager() { return descriptorSetManager; }
+    public static VulkaniumInstance getVulkanInstance() {
+        return vulkanInstance;
+    }
 
-    public static long getPlaceholderImageView() { return placeholderImageView; }
+    public static VulkaniumDevice getVulkanDevice() {
+        return vulkanDevice;
+    }
 
-    public static long getPlaceholderSampler() { return placeholderSampler; }
-    public static SPIRVCompiler getSpirvCompiler() { return spirvCompiler; }
-    public static StagingRing getStagingRing() { return stagingRing; }
-    public static BasicRenderPass getMainRenderPass() { return mainRenderPass; }
-    public static PipelineRegistry getPipelineRegistry() { return pipelineRegistry; }
-    public static DrawBatcher getDrawBatcher() { return drawBatcher; }
-    public static RayTracingRenderer getRTRenderer() { return rtRenderer; }
-    public static RTCapabilities getRTCapabilities() { return rtCapabilities; }
-    public static net.vulkanium.shaderpack.ShaderpackManager getShaderpackManager() { return shaderpackManager; }
-    public static net.vulkanium.core.ChunkBufferPool getChunkBufferPool() { return chunkBufferPool; }
-    public static long getFrameCounter() { return frameCounter; }
-    public static boolean didFrameRenderWorld() { return frameHadWorldRender; }
+    public static VulkaniumQueues getVulkanQueues() {
+        return vulkanQueues;
+    }
+
+    public static VulkaniumMemory getVulkanMemory() {
+        return vulkanMemory;
+    }
+
+    public static VulkaniumSwapchain getVulkanSwapchain() {
+        return vulkanSwapchain;
+    }
+
+    public static VulkaniumCommand getVulkanCommand() {
+        return vulkanCommand;
+    }
+
+    public static VulkaniumSync getVulkanSync() {
+        return vulkanSync;
+    }
+
+    public static FrameOrchestrator getFrameOrchestrator() {
+        return frameOrchestrator;
+    }
+
+    public static DescriptorSetManager getDescriptorSetManager() {
+        return descriptorSetManager;
+    }
+
+    public static long getPlaceholderImageView() {
+        return placeholderImageView;
+    }
+
+    public static long getPlaceholderSampler() {
+        return placeholderSampler;
+    }
+
+    public static SPIRVCompiler getSpirvCompiler() {
+        return spirvCompiler;
+    }
+
+    public static StagingRing getStagingRing() {
+        return stagingRing;
+    }
+
+    public static BasicRenderPass getMainRenderPass() {
+        return mainRenderPass;
+    }
+
+    public static PipelineRegistry getPipelineRegistry() {
+        return pipelineRegistry;
+    }
+
+    public static DrawBatcher getDrawBatcher() {
+        return drawBatcher;
+    }
+
+    public static RayTracingRenderer getRTRenderer() {
+        return rtRenderer;
+    }
+
+    public static RTCapabilities getRTCapabilities() {
+        return rtCapabilities;
+    }
+
+    public static net.vulkanium.shaderpack.ShaderpackManager getShaderpackManager() {
+        return shaderpackManager;
+    }
+
+    public static net.vulkanium.core.ChunkBufferPool getChunkBufferPool() {
+        return chunkBufferPool;
+    }
+
+    public static long getFrameCounter() {
+        return frameCounter;
+    }
+
+    public static boolean didFrameRenderWorld() {
+        return frameHadWorldRender;
+    }
 
 }

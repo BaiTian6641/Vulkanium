@@ -93,6 +93,8 @@ public abstract class MixinLevelRenderer {
                                        Matrix4f projectionMatrix, CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
 
+        Vulkanium.onTerrainLayerStart(renderType.toString());
+
         // Save the current matrices BEFORE we set the camera matrices for this layer.
         // At RETURN we restore these so non-terrain draws (entities, particles) don't
         // get double-rotated. Previously we reset to identity which broke the TRANSLUCENT
@@ -125,6 +127,7 @@ public abstract class MixinLevelRenderer {
                                           double camX, double camY, double camZ,
                                           Matrix4f projectionMatrix, CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
+        Vulkanium.onTerrainLayerEnd();
         net.vulkanium.compat.VRenderSystem.setChunkOffset(0.0f, 0.0f, 0.0f);
         // Restore the matrices that were active before this layer started
         if (vulkanium$savedModelView != null) {

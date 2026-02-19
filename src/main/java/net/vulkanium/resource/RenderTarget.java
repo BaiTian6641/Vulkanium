@@ -73,7 +73,10 @@ public class RenderTarget {
     private void createImage() {
         int aspectMask = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
         int usage = isDepth
-                ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                    | VK_IMAGE_USAGE_SAMPLED_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                 : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                     | VK_IMAGE_USAGE_SAMPLED_BIT
                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -131,8 +134,8 @@ public class RenderTarget {
                     .mipLodBias(0.0f)
                     .anisotropyEnable(false)
                     .maxAnisotropy(1.0f)
-                    .compareEnable(isDepth)
-                    .compareOp(isDepth ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_ALWAYS)
+                    .compareEnable(false)
+                    .compareOp(VK_COMPARE_OP_ALWAYS)
                     .minLod(0.0f)
                     .maxLod((float) mipLevels)
                     .borderColor(VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE)

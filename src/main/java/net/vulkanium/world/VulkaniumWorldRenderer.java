@@ -3,6 +3,7 @@ package net.vulkanium.world;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.vulkanium.Vulkanium;
+import net.vulkanium.compat.VRenderSystem;
 import net.vulkanium.render.terrain.ChunkRenderer;
 import net.vulkanium.render.terrain.pass.TerrainPassType;
 import org.joml.Matrix4f;
@@ -157,6 +158,12 @@ public class VulkaniumWorldRenderer {
         // 2. Determine visible sections via BFS/occlusion from camera section
         // 3. Schedule dirty section rebuilds on builder threads
         // 4. Upload completed section meshes
+
+        // Keep chunk frustum culling in sync with the actual render matrices.
+        // A stale/identity PV matrix causes grid-aligned false culling artifacts.
+        projectionViewModel
+            .set(VRenderSystem.getProjectionMatrix())
+            .mul(VRenderSystem.getModelViewMatrix());
 
         if (cameraMoved) {
             // Trigger section visibility recalculation via BFS graph traversal

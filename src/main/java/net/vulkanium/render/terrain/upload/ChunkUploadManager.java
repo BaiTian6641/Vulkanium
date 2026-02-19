@@ -112,8 +112,11 @@ public class ChunkUploadManager {
 
         RenderRegion region = section.getRegion();
         if (region == null) {
-            LOGGER.warn("Section [{}, {}, {}] has no region during upload",
-                    section.getSectionX(), section.getSectionY(), section.getSectionZ());
+            if (section.getBuildState() != RenderSection.SectionBuildState.DISCARDED) {
+                LOGGER.warn("Section [{}, {}, {}] has no region during upload; rescheduling rebuild",
+                        section.getSectionX(), section.getSectionY(), section.getSectionZ());
+                section.markDirty();
+            }
             data.free();
             return;
         }

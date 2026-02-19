@@ -209,6 +209,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     private boolean loggedSafeModeBlocked = false;
     private Boolean safeFullscreenExecutionAllowed = null;
     private RenderTarget fullscreenSceneCapture;
+    private RenderTarget fullscreenDepthCapture;
 
     private enum FullscreenCompatMode {
         OFF,
@@ -269,7 +270,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             return FullscreenCompatMode.FULL;
         }
 
-        return FullscreenCompatMode.SAFE;
+        // Default to OFF for stability.
+        // Complex deferred/composite/final chains can black-screen without full
+        // MRT/compute parity in the compatibility bridge.
+        return FullscreenCompatMode.OFF;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -881,6 +885,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             fullscreenSceneCapture = null;
         }
 
+        if (fullscreenDepthCapture != null) {
+            fullscreenDepthCapture.destroy();
+            fullscreenDepthCapture = null;
+        }
+
         LOGGER.info("Shaderpack pipeline unloaded: {}", packName);
     }
 
@@ -1016,6 +1025,16 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         runFullscreenPasses(cmd, frameIndex);
     }
 
+    /**
+     * Captures the current color + depth scene inputs for fullscreen shaderpack passes.
+     * Must be called outside any active render pass.
+     */
+    public void prepareFullscreenInputs(VkCommandBuffer cmd, int frameIndex) {
+        if (!loaded) return;
+        captureSceneColorForFullscreen(cmd, frameIndex);
+        captureSceneDepthForFullscreen(cmd);
+    }
+
     private void runFullscreenPasses(VkCommandBuffer cmd, int frameIndex) {
         if (FULLSCREEN_COMPAT_MODE == FullscreenCompatMode.OFF) {
             if (!loggedFullscreenSkipped) {
@@ -1045,8 +1064,6 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         long placeholderView = Vulkanium.getPlaceholderImageView();
         long placeholderSampler = Vulkanium.getPlaceholderSampler();
         if (placeholderView == VK_NULL_HANDLE || placeholderSampler == VK_NULL_HANDLE) return;
-
-        captureSceneColorForFullscreen(cmd, frameIndex);
 
         int executed = 0;
         int skipped = 0;
@@ -1249,6 +1266,39 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
             bindSamplerAlias(views, samplers, "composite",
                 fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+
+            // Compatibility fallback: many packs sample multiple colortex/gaux inputs
+            // during deferred/composite/final passes. Until full MRT wiring is complete,
+            // provide scene capture for these aliases instead of placeholder textures.
+            for (int i = 1; i <= 15; i++) {
+            bindSamplerAlias(views, samplers, "colortex" + i,
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+            }
+            bindSamplerAlias(views, samplers, "gdepth",
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+            bindSamplerAlias(views, samplers, "gnormal",
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+            bindSamplerAlias(views, samplers, "gaux1",
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+            bindSamplerAlias(views, samplers, "gaux2",
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+            bindSamplerAlias(views, samplers, "gaux3",
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+            bindSamplerAlias(views, samplers, "gaux4",
+                fullscreenSceneCapture.getImageView(), fullscreenSceneCapture.getSampler());
+        }
+
+        if (fullscreenDepthCapture != null
+            && fullscreenDepthCapture.getImageView() != VK_NULL_HANDLE
+            && fullscreenDepthCapture.getSampler() != VK_NULL_HANDLE) {
+            bindSamplerAlias(views, samplers, "depthtex0",
+                fullscreenDepthCapture.getImageView(), fullscreenDepthCapture.getSampler());
+            bindSamplerAlias(views, samplers, "gdepthtex",
+                fullscreenDepthCapture.getImageView(), fullscreenDepthCapture.getSampler());
+            bindSamplerAlias(views, samplers, "depthtex1",
+                fullscreenDepthCapture.getImageView(), fullscreenDepthCapture.getSampler());
+            bindSamplerAlias(views, samplers, "depthtex2",
+                fullscreenDepthCapture.getImageView(), fullscreenDepthCapture.getSampler());
         }
 
         int maxUnits = Math.min(views.length, BasicPipeline.getMaxTextureBindings());
@@ -1306,6 +1356,40 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 height,
                 swapchainFormat,
                 false
+        );
+    }
+
+    private void ensureFullscreenDepthCapture(int width, int height) {
+        if (width <= 0 || height <= 0 || Vulkanium.getVulkanSwapchain() == null) {
+            return;
+        }
+
+        int swapchainDepthFormat = Vulkanium.getVulkanSwapchain().getDepthFormat();
+        if (fullscreenDepthCapture != null
+                && fullscreenDepthCapture.getWidth() == width
+                && fullscreenDepthCapture.getHeight() == height
+                && fullscreenDepthCapture.getFormat() == swapchainDepthFormat) {
+            return;
+        }
+
+        if (fullscreenDepthCapture != null) {
+            fullscreenDepthCapture.destroy();
+            fullscreenDepthCapture = null;
+        }
+
+        if (Vulkanium.getVulkanDevice() == null || Vulkanium.getVulkanMemory() == null) {
+            return;
+        }
+
+        fullscreenDepthCapture = new RenderTarget();
+        fullscreenDepthCapture.initialize(
+                Vulkanium.getVulkanDevice().getLogicalDevice(),
+                Vulkanium.getVulkanMemory(),
+                "shaderpack_depth_capture",
+                width,
+                height,
+                swapchainDepthFormat,
+                true
         );
     }
 
@@ -1405,6 +1489,99 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         );
     }
 
+            private void captureSceneDepthForFullscreen(VkCommandBuffer cmd) {
+            if (Vulkanium.getVulkanSwapchain() == null) {
+                return;
+            }
+
+            int width = Vulkanium.getVulkanSwapchain().getWidth();
+            int height = Vulkanium.getVulkanSwapchain().getHeight();
+            ensureFullscreenDepthCapture(width, height);
+            if (fullscreenDepthCapture == null || fullscreenDepthCapture.getImage() == VK_NULL_HANDLE) {
+                return;
+            }
+
+            long srcDepthImage = Vulkanium.getVulkanSwapchain().getDepthImage();
+            long dstDepthImage = fullscreenDepthCapture.getImage();
+            if (srcDepthImage == VK_NULL_HANDLE || dstDepthImage == VK_NULL_HANDLE) {
+                return;
+            }
+
+            VulkaniumCommand.transitionImageLayout(
+                cmd,
+                srcDepthImage,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT
+            );
+            VulkaniumCommand.transitionImageLayout(
+                cmd,
+                dstDepthImage,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT
+            );
+
+            try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
+                VkImageCopy.Buffer copyRegion = VkImageCopy.calloc(1, stack);
+                copyRegion.srcSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0)
+                    .baseArrayLayer(0)
+                    .layerCount(1);
+                copyRegion.srcOffset().set(0, 0, 0);
+
+                copyRegion.dstSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0)
+                    .baseArrayLayer(0)
+                    .layerCount(1);
+                copyRegion.dstOffset().set(0, 0, 0);
+
+                copyRegion.extent().set(width, height, 1);
+
+                vkCmdCopyImage(
+                    cmd,
+                    srcDepthImage,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dstDepthImage,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    copyRegion
+                );
+            }
+
+            VulkaniumCommand.transitionImageLayout(
+                cmd,
+                dstDepthImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT
+            );
+            VulkaniumCommand.transitionImageLayout(
+                cmd,
+                srcDepthImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT
+            );
+            }
+
     private BasicPipeline getOrCreateFullscreenPipeline(ProgramId id, CompiledProgram program) {
         BasicPipeline existing = fullscreenPipelines.get(id);
         if (existing != null) return existing;
@@ -1438,8 +1615,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (pipeline == null || pipeline == 0) return false;
 
         currentPhase = phase;
-        // TODO: Bind the shaderpack's VkPipeline for this phase
-        // vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
         return true;
     }

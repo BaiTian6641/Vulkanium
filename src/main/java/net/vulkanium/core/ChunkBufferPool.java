@@ -48,8 +48,11 @@ public class ChunkBufferPool {
     /** Maximum buffers per bucket (prevents unbounded memory use) */
     private static final int MAX_PER_BUCKET = 128;
 
-    /** Deferred release delay (number of frames before a buffer can be reused) */
-    private static final int RELEASE_DELAY_FRAMES = 3;
+    /** Deferred release delay (number of frames before a buffer can be reused).
+     *  Set to framesInFlight + 1 safety margin to prevent GPU accessing
+     *  a buffer that was returned to the pool too early (VulkanMod avoids this
+     *  entirely by using sub-allocated AreaBuffers that are never freed). */
+    private static final int RELEASE_DELAY_FRAMES = 4;
 
     /**
      * Bucket key → free buffer stack.
