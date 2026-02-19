@@ -1,0 +1,82 @@
+#version 450
+
+// Vulkanium GPU Frustum Culling Compute Shader
+// Culls chunks against the view frustum on the GPU.
+// Input:  chunk AABB buffer + frustum planes
+// Output: indirect draw command buffer (filtered)
+
+layout(local_size_x = 64) in;
+
+// Frustum planes (6 planes, each a vec4: normal.xyz + distance.w)
+layout(set = 0, binding = 2) uniform FrustumUBO {
+    vec4 planes[6];
+    uint totalChunks;
+} frustum;
+
+// Input: per-chunk bounding box (min.xyz, max.xyz) + draw info
+struct ChunkInfo {
+    vec4 boundsMin; // xyz = min world pos, w = indexCount
+    vec4 boundsMax; // xyz = max world pos, w = firstIndex
+    uint vertexOffset;
+    uint instanceId;
+    uint padding0;
+    uint padding1;
+};
+
+layout(std430, set = 2, binding = 0) readonly buffer ChunkBuffer {
+    ChunkInfo chunks[];
+};
+
+// Output: VkDrawIndexedIndirectCommand
+struct DrawCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+layout(std430, set = 2, binding = 1) writeonly buffer DrawBuffer {
+    DrawCommand draws[];
+};
+
+// Atomic counter for visible chunk count
+layout(std430, set = 2, binding = 2) buffer CounterBuffer {
+    uint visibleCount;
+};
+
+bool isAABBInFrustum(vec3 bmin, vec3 bmax) {
+    for (int i = 0; i < 6; i++) {
+        vec4 plane = frustum.planes[i];
+
+        // Find the corner closest to the plane (positive vertex)
+        vec3 positiveVertex = vec3(
+            plane.x >= 0.0 ? bmax.x : bmin.x,
+            plane.y >= 0.0 ? bmax.y : bmin.y,
+            plane.z >= 0.0 ? bmax.z : bmin.z
+        );
+
+        // If the positive vertex is behind the plane, the AABB is fully outside
+        if (dot(plane.xyz, positiveVertex) + plane.w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= frustum.totalChunks) return;
+
+    ChunkInfo chunk = chunks[idx];
+
+    if (isAABBInFrustum(chunk.boundsMin.xyz, chunk.boundsMax.xyz)) {
+        uint drawIdx = atomicAdd(visibleCount, 1);
+
+        draws[drawIdx].indexCount = uint(chunk.boundsMin.w);
+        draws[drawIdx].instanceCount = 1;
+        draws[drawIdx].firstIndex = uint(chunk.boundsMax.w);
+        draws[drawIdx].vertexOffset = int(chunk.vertexOffset);
+        draws[drawIdx].firstInstance = chunk.instanceId;
+    }
+}

@@ -1,0 +1,80 @@
+# .gitignore for Vulkanium
+# Gradle + Java + Minecraft mod development defaults
+
+### Build / dependency caches
+.gradle/
+**/build/
+build/
+out/
+
+### Gradle wrapper (keep the wrapper files committed) — do NOT ignore gradle/wrapper/
+
+### IDEs / editors
+.idea/
+*.iml
+*.iws
+.vscode/
+*.code-workspace
+*.sublime-workspace
+*.sublime-project
+
+### OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+### Logs / crash reports / temp
+*.log
+hs_err_pid*
+crash-reports/
+logs/
+tmp/
+*.tmp
+*.temp
+
+### Editor swap / backup files
+*~
+*.swp
+*.swo
+.#*
+
+### Node / frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log
+/dist/
+
+### Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+### Test / coverage reports
+coverage/
+jacoco.exec
+*.lcov
+reports/
+
+### Local configs / secrets
+local.properties
+.env
+.env.*
+*.keystore
+*.jks
+*.p12
+
+### Misc
+hs_err_pid*
+*.class
+*.log
+
+### Project-specific: development run directory (Minecraft run dir)
+/run/
+/run/**
+
+# If you want to ignore compiled shader blobs add: *.spv
+# If you want to keep certain generated files committed, add explicit "!pattern" entries below

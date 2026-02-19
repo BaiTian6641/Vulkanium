@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "vulkanium",
+  "version": "${version}",
+  "name": "Vulkanium",
+  "description": "Next-generation Vulkan rendering engine for Minecraft. Replaces OpenGL with Vulkan for massive performance gains while maintaining full shader pack compatibility.",
+  "authors": ["Vulkanium Team"],
+  "contact": {},
+  "license": "LGPL-3.0",
+  "icon": "assets/vulkanium/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["net.vulkanium.Vulkanium"],
+    "preLaunch": ["net.vulkanium.VulkaniumPreLaunch"]
+  },
+  "mixins": ["vulkanium.mixins.json"],
+  "accessWidener": "vulkanium.accesswidener",
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "~1.20.1",
+    "java": ">=17"
+  },
+  "conflicts": {
+    "vulkanmod": "*"
+  },
+  "custom": {
+    "modmenu": {
+      "badges": ["library"]
+    }
+  }
+}

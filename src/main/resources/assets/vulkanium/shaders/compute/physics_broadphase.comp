@@ -1,0 +1,72 @@
+#version 450
+
+// GPU broadphase collision detection — sort-and-sweep on sorted AABBs
+// Each thread checks one AABB against subsequent AABBs in sorted order
+
+layout(local_size_x = 256) in;
+
+struct AABB {
+    vec3 minPos;
+    uint entityId;
+    vec3 maxPos;
+    uint collisionMask;
+};
+
+struct CollisionPair {
+    uint idA;
+    uint idB;
+};
+
+// Binding 0: Sorted AABBs (sorted by minPos.x)
+layout(set = 0, binding = 0, std430) readonly buffer AABBBuffer {
+    uint aabbCount;
+    uint padding[3];
+    AABB aabbs[];
+};
+
+// Binding 1: Output collision pairs
+layout(set = 0, binding = 1, std430) writeonly buffer PairBuffer {
+    CollisionPair pairs[];
+};
+
+// Binding 2: Atomic counter for pair output
+layout(set = 0, binding = 2, std430) buffer CounterBuffer {
+    uint pairCount;
+};
+
+layout(push_constant) uniform PushConstants {
+    uint maxPairs;
+};
+
+bool overlaps(AABB a, AABB b) {
+    return a.minPos.x <= b.maxPos.x && a.maxPos.x >= b.minPos.x
+        && a.minPos.y <= b.maxPos.y && a.maxPos.y >= b.minPos.y
+        && a.minPos.z <= b.maxPos.z && a.maxPos.z >= b.minPos.z;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= aabbCount) return;
+
+    AABB current = aabbs[idx];
+
+    // Sweep forward: check AABBs with higher index (already sorted by x)
+    for (uint j = idx + 1; j < aabbCount; j++) {
+        AABB other = aabbs[j];
+
+        // Early exit: if other's min.x > current's max.x, no more overlaps
+        if (other.minPos.x > current.maxPos.x) break;
+
+        // Check collision mask compatibility
+        if ((current.collisionMask & other.collisionMask) == 0) continue;
+
+        // Full 3D overlap test
+        if (overlaps(current, other)) {
+            uint pairIdx = atomicAdd(pairCount, 1);
+            if (pairIdx < maxPairs) {
+                pairs[pairIdx].idA = current.entityId;
+                pairs[pairIdx].idB = other.entityId;
+            }
+        }
+    }
+}

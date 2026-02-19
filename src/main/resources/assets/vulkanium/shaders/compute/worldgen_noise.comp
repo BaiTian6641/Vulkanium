@@ -1,0 +1,166 @@
+#version 450
+
+// GPU Perlin/Simplex noise generator for world generation
+// Each workgroup computes noise for one chunk (2D) or section slice (3D)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Binding 0: Noise parameters per chunk request
+layout(set = 0, binding = 0, std430) readonly buffer NoiseParams {
+    // Per-request: seed(4), octaves(4), frequency(4), amplitude(4),
+    //              lacunarity(4), persistence(4), chunkX(4), chunkZ(4),
+    //              noiseType(4), dimensions(4) = 40 bytes
+    uint params[];
+};
+
+// Binding 1: Output noise values (float per sample)
+layout(set = 0, binding = 1, std430) writeonly buffer NoiseOutput {
+    float noiseValues[];
+};
+
+// Push constants: chunk index offset
+layout(push_constant) uniform PushConstants {
+    uint chunkOffset;
+    uint totalChunks;
+};
+
+// ── Noise utility functions ──
+
+// Permutation table (256 entries, duplicated for wrapping)
+const int perm[512] = int[512](
+    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,
+    140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,
+    247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,
+    57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,
+    74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,
+    60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,
+    65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,
+    200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,
+    52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,
+    207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,
+    119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,
+    129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,
+    218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,
+    81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,
+    184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,
+    222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
+    // Duplicated for wrapping
+    151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,
+    140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,
+    247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,
+    57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,
+    74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,
+    60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,
+    65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,
+    200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,
+    52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,
+    207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,
+    119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,
+    129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,
+    218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,
+    81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,
+    184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,
+    222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180
+);
+
+float fade(float t) {
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float grad2(int hash, float x, float y) {
+    int h = hash & 7;
+    float u = h < 4 ? x : y;
+    float v = h < 4 ? y : x;
+    return ((h & 1) != 0 ? -u : u) + ((h & 2) != 0 ? -2.0 * v : 2.0 * v);
+}
+
+float perlinNoise2D(float x, float y) {
+    int X = int(floor(x)) & 255;
+    int Y = int(floor(y)) & 255;
+
+    x -= floor(x);
+    y -= floor(y);
+
+    float u = fade(x);
+    float v = fade(y);
+
+    int aa = perm[perm[X] + Y];
+    int ab = perm[perm[X] + Y + 1];
+    int ba = perm[perm[X + 1] + Y];
+    int bb = perm[perm[X + 1] + Y + 1];
+
+    return mix(
+        mix(grad2(aa, x, y),     grad2(ba, x - 1.0, y),     u),
+        mix(grad2(ab, x, y - 1.0), grad2(bb, x - 1.0, y - 1.0), u),
+        v
+    );
+}
+
+// Fractal Brownian Motion (multi-octave)
+float fbm2D(float x, float y, uint octaves, float freq, float amp,
+            float lacun, float persist) {
+    float sum = 0.0;
+    float f = freq;
+    float a = amp;
+
+    for (uint i = 0; i < octaves; i++) {
+        sum += a * perlinNoise2D(x * f, y * f);
+        f *= lacun;
+        a *= persist;
+    }
+    return sum;
+}
+
+void main() {
+    uint chunkIdx = gl_WorkGroupID.x + chunkOffset;
+    if (chunkIdx >= totalChunks) return;
+
+    uint localX = gl_LocalInvocationID.x;
+    uint localZ = gl_LocalInvocationID.y;
+
+    // Read noise parameters for this chunk
+    uint baseParam = chunkIdx * 10; // 40 bytes / 4 = 10 uints
+    uint seed = params[baseParam + 0];
+    uint octaves = params[baseParam + 1];
+    float frequency = uintBitsToFloat(params[baseParam + 2]);
+    float amplitude = uintBitsToFloat(params[baseParam + 3]);
+    float lacunarity = uintBitsToFloat(params[baseParam + 4]);
+    float persistence = uintBitsToFloat(params[baseParam + 5]);
+    int chunkX = int(params[baseParam + 6]);
+    int chunkZ = int(params[baseParam + 7]);
+    uint noiseType = params[baseParam + 8];
+
+    // World-space coordinates
+    float worldX = float(chunkX * 16 + int(localX)) + float(seed & 0xFFFFu) * 0.001;
+    float worldZ = float(chunkZ * 16 + int(localZ)) + float((seed >> 16) & 0xFFFFu) * 0.001;
+
+    float value;
+    if (noiseType == 0) {
+        // Perlin FBM
+        value = fbm2D(worldX, worldZ, octaves, frequency, amplitude, lacunarity, persistence);
+    } else if (noiseType == 1) {
+        // Simplex (approximate via perlin with offset)
+        value = fbm2D(worldX + 31.7, worldZ + 47.3, octaves, frequency, amplitude, lacunarity, persistence);
+    } else {
+        // Voronoi (simplified)
+        float cellX = floor(worldX * frequency);
+        float cellZ = floor(worldZ * frequency);
+        float minDist = 1e10;
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                float cx = cellX + float(dx);
+                float cz = cellZ + float(dz);
+                // Pseudo-random cell center
+                float rx = cx + fract(sin(cx * 12.9898 + cz * 78.233) * 43758.5453);
+                float rz = cz + fract(sin(cx * 93.9898 + cz * 67.345) * 23421.631);
+                float d = distance(vec2(worldX * frequency, worldZ * frequency), vec2(rx, rz));
+                minDist = min(minDist, d);
+            }
+        }
+        value = minDist * amplitude;
+    }
+
+    // Write output
+    uint outputIdx = chunkIdx * 256 + localZ * 16 + localX;
+    noiseValues[outputIdx] = value;
+}

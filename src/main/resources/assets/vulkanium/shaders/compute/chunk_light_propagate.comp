@@ -1,0 +1,142 @@
+#version 450
+
+// Parallel chunk lighting — flood-fill light propagation on GPU
+// Each workgroup processes one 16x16x16 section
+// Uses shared memory for iterative neighbour propagation
+
+layout(local_size_x = 256) in;
+
+// Binding 0: Light sources (emitters) for this section
+layout(set = 0, binding = 0, std430) readonly buffer LightSources {
+    uint sourceCount;
+    uint padding[3];
+    // Each source: packed position (16 bits) + level (16 bits)
+    uint sources[];
+};
+
+// Binding 1: Block opacity data (per-block, 0=transparent, 15=opaque)
+layout(set = 0, binding = 1, std430) readonly buffer OpacityData {
+    uint opacity[]; // nibble-packed: 2 blocks per uint8, 8 per uint32
+};
+
+// Binding 2: Output light values (block light + sky light)
+layout(set = 0, binding = 2, std430) writeonly buffer LightOutput {
+    uint blockLight[]; // nibble-packed
+};
+
+// Binding 3: Parameters
+layout(set = 0, binding = 3, std140) uniform Params {
+    int sectionOffsetX;
+    int sectionOffsetY;
+    int sectionOffsetZ;
+    int sectionIndex;
+    int maxIterations;
+    int hasSkyAccess; // 1 if section is exposed to sky
+};
+
+// Shared memory: 16x16x16 = 4096 light values, packed 2 per byte
+shared uint sharedLight[2048]; // 4096 nibbles = 2048 bytes = 512 uints
+
+// Unpack a nibble from the shared array
+uint getLight(uint idx) {
+    uint word = sharedLight[idx / 8];
+    uint shift = (idx % 8) * 4;
+    return (word >> shift) & 0xFu;
+}
+
+// Set a nibble in the shared array
+void setLight(uint idx, uint value) {
+    uint word_idx = idx / 8;
+    uint shift = (idx % 8) * 4;
+    uint mask = ~(0xFu << shift);
+    atomicAnd(sharedLight[word_idx], mask);
+    atomicOr(sharedLight[word_idx], (value & 0xFu) << shift);
+}
+
+uint getOpacity(uint idx) {
+    uint word = opacity[idx / 8];
+    uint shift = (idx % 8) * 4;
+    return (word >> shift) & 0xFu;
+}
+
+uint flatIndex(uint x, uint y, uint z) {
+    return z * 256 + y * 16 + x;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationIndex; // 0..255
+    uint voxelsPerThread = 16;
+
+    // Clear shared memory
+    for (uint i = tid; i < 2048; i += 256) {
+        sharedLight[i] = 0;
+    }
+    barrier();
+
+    // Initialize from emitters
+    for (uint i = tid; i < sourceCount; i += 256) {
+        uint packed = sources[i];
+        uint pos = packed & 0xFFFu;  // 12-bit packed xyz
+        uint level = (packed >> 16) & 0xFu;
+        setLight(pos, level);
+    }
+
+    // Initialize sky light if section has sky access
+    if (hasSkyAccess != 0) {
+        for (uint i = tid; i < 256; i += 256) { // top layer (y=15)
+            uint x = i % 16;
+            uint z = i / 16;
+            uint idx = flatIndex(x, 15, z);
+            if (getOpacity(idx) == 0) {
+                setLight(idx, 15);
+            }
+        }
+    }
+    barrier();
+
+    // Iterative flood fill
+    for (int iter = 0; iter < maxIterations; iter++) {
+        bool changed = false;
+
+        for (uint v = 0; v < voxelsPerThread; v++) {
+            uint idx = tid * voxelsPerThread + v;
+            if (idx >= 4096) break;
+
+            uint x = idx % 16;
+            uint y = (idx / 16) % 16;
+            uint z = idx / 256;
+
+            uint currentLight = getLight(idx);
+            uint blockOpacity = getOpacity(idx);
+            if (blockOpacity >= 15) continue; // fully opaque
+
+            uint maxNeighbor = 0;
+
+            // Check 6 neighbors (clamped to section bounds)
+            if (x > 0)  maxNeighbor = max(maxNeighbor, getLight(flatIndex(x-1, y, z)));
+            if (x < 15) maxNeighbor = max(maxNeighbor, getLight(flatIndex(x+1, y, z)));
+            if (y > 0)  maxNeighbor = max(maxNeighbor, getLight(flatIndex(x, y-1, z)));
+            if (y < 15) maxNeighbor = max(maxNeighbor, getLight(flatIndex(x, y+1, z)));
+            if (z > 0)  maxNeighbor = max(maxNeighbor, getLight(flatIndex(x, y, z-1)));
+            if (z < 15) maxNeighbor = max(maxNeighbor, getLight(flatIndex(x, y, z+1)));
+
+            // Propagate: new light = max neighbor - 1 - opacity
+            uint attenuation = 1 + blockOpacity;
+            uint newLight = (maxNeighbor > attenuation) ? (maxNeighbor - attenuation) : 0;
+
+            if (newLight > currentLight) {
+                setLight(idx, newLight);
+                changed = true;
+            }
+        }
+
+        barrier();
+        // Early termination if no thread made progress (would need shared flag)
+    }
+
+    // Write results to output
+    for (uint i = tid; i < 2048; i += 256) {
+        uint sectionBase = uint(sectionIndex) * 2048;
+        blockLight[sectionBase + i] = sharedLight[i];
+    }
+}
