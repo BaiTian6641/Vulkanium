@@ -10,6 +10,8 @@ import net.vulkanium.render.terrain.pass.TerrainPassType;
 import net.vulkanium.render.terrain.pass.TerrainRenderPass;
 import net.vulkanium.render.terrain.region.RenderRegion;
 import net.vulkanium.render.terrain.region.RenderRegionManager;
+import net.vulkanium.render.terrain.section.RenderSection;
+import net.vulkanium.render.terrain.section.SectionVisibility;
 import net.vulkanium.render.terrain.upload.ChunkUploadManager;
 import net.vulkanium.render.shadow.ShadowRenderer;
 import net.vulkanium.resource.StagingRing;
@@ -18,6 +20,7 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -293,8 +296,70 @@ public class ChunkRenderer {
      * @param layerMask     Bitmask of LAYER_* constants to render
      */
     public void renderShadow(long commandBuffer, ShadowRenderer.ShadowFrustum frustum, int layerMask) {
-        // TODO: Implement shadow terrain rendering with layer mask filtering
-        // For now, this is a stub that will be filled in during shadow pass integration
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+
+        if (frustum == null) {
+            recordShadowLayers(cmd, layerMask);
+            return;
+        }
+
+        List<SectionVisibility> touchedVisibility = new ArrayList<>();
+        List<Boolean> previousFrustumVisible = new ArrayList<>();
+        List<Boolean> previousOccluded = new ArrayList<>();
+
+        try {
+            for (RenderRegion region : regionManager.getActiveRegions()) {
+                for (int i = 0; i < RenderRegion.SECTION_COUNT; i++) {
+                    RenderSection section = region.getSection(i);
+                    if (section == null) continue;
+
+                    SectionVisibility visibility = section.getVisibility();
+                    touchedVisibility.add(visibility);
+                    previousFrustumVisible.add(visibility.isFrustumVisible());
+                    previousOccluded.add(visibility.isOccluded());
+
+                    boolean readyAndNonEmpty =
+                            section.getBuildState() == RenderSection.SectionBuildState.READY
+                                    && !section.isEmpty();
+                    boolean visible = readyAndNonEmpty && frustum.testVisibility(
+                            section.getBlockX(),
+                            section.getBlockY(),
+                            section.getBlockZ(),
+                            section.getBlockX() + 16.0,
+                            section.getBlockY() + 16.0,
+                            section.getBlockZ() + 16.0
+                    );
+
+                    visibility.setFrustumVisible(visible);
+                    visibility.setOccluded(false);
+                }
+            }
+
+            recordShadowLayers(cmd, layerMask);
+        } finally {
+            for (int i = 0; i < touchedVisibility.size(); i++) {
+                SectionVisibility visibility = touchedVisibility.get(i);
+                visibility.setFrustumVisible(previousFrustumVisible.get(i));
+                visibility.setOccluded(previousOccluded.get(i));
+            }
+        }
+    }
+
+    private void recordShadowLayers(VkCommandBuffer cmd, int layerMask) {
+        if ((layerMask & LAYER_SOLID) != 0) {
+            renderPasses[TerrainPassType.SOLID.ordinal()].record(cmd, regionManager, null);
+        }
+        if ((layerMask & LAYER_CUTOUT) != 0) {
+            renderPasses[TerrainPassType.CUTOUT.ordinal()].record(cmd, regionManager, null);
+        }
+        if ((layerMask & LAYER_CUTOUT_MIPPED) != 0) {
+            renderPasses[TerrainPassType.CUTOUT_MIPPED.ordinal()].record(cmd, regionManager, null);
+        }
+        if ((layerMask & LAYER_TRANSLUCENT) != 0) {
+            renderPasses[TerrainPassType.TRANSLUCENT.ordinal()].record(cmd, regionManager, null);
+            renderPasses[TerrainPassType.TRIPWIRE.ordinal()].record(cmd, regionManager, null);
+        }
     }
 
     /**

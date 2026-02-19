@@ -2,7 +2,14 @@ package net.vulkanium.render.gbuffer;
 
 import net.vulkanium.core.VulkaniumMemory;
 import net.vulkanium.resource.RenderTarget;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkClearColorValue;
+import org.lwjgl.vulkan.VkClearDepthStencilValue;
+import org.lwjgl.vulkan.VkCommandBuffer;
+import org.lwjgl.vulkan.VkImageCopy;
+import org.lwjgl.vulkan.VkImageMemoryBarrier;
+import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -209,9 +216,7 @@ public class GBufferTargets {
      * @param commandBuffer Active VkCommandBuffer
      */
     public void copyPreTranslucentDepth(long commandBuffer) {
-        // TODO: Record image blit/copy from depthTarget0 → depthTarget1
-        // Requires layout transitions: DEPTH_ATTACHMENT → TRANSFER_SRC, then
-        // SHADER_READ_ONLY → TRANSFER_DST, copy, then transition back.
+        copyDepth(commandBuffer, depthTarget0, depthTarget1);
     }
 
     /**
@@ -221,7 +226,7 @@ public class GBufferTargets {
      * @param commandBuffer Active VkCommandBuffer
      */
     public void copyPreHandDepth(long commandBuffer) {
-        // TODO: Record image blit/copy from depthTarget0 → depthTarget2
+        copyDepth(commandBuffer, depthTarget0, depthTarget2);
     }
 
     // ── Clear ──
@@ -232,17 +237,22 @@ public class GBufferTargets {
      * @param commandBuffer Active VkCommandBuffer
      */
     public void clearTargets(long commandBuffer) {
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+
         for (int i = 0; i < MAX_COLOR; i++) {
             if (!colorCreated[i]) continue;
             RenderTargetSettings.BufferSettings bs = settings.getColorSettings(i);
             if (!bs.shouldClear()) continue;
 
-            // TODO: Record vkCmdClearColorImage for main + alt targets
-            // with bs.getClearColor() values
+            float[] cc = bs.getClearColor();
+            clearColorTarget(cmd, mainColorTargets[i].getImage(), cc);
+            clearColorTarget(cmd, altColorTargets[i].getImage(), cc);
         }
 
-        // Depth targets always cleared to 1.0
-        // TODO: Record vkCmdClearDepthStencilImage for all 3 depth targets
+        clearDepthTarget(cmd, depthTarget0.getImage(), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        clearDepthTarget(cmd, depthTarget1.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        clearDepthTarget(cmd, depthTarget2.getImage(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
     // ── Resize ──
@@ -290,7 +300,22 @@ public class GBufferTargets {
      * Returns the mip level count for a color target.
      */
     public int getMipLevels(int index) {
-        return 1; // TODO: track mip levels per render target
+        if (index < 0 || index >= MAX_COLOR) {
+            throw new IndexOutOfBoundsException("Color target index: " + index);
+        }
+
+        RenderTargetSettings.BufferSettings bs = settings.getColorSettings(index);
+        if (!bs.isMipmapEnabled()) {
+            return 1;
+        }
+
+        int maxDim = Math.max(width, height);
+        int levels = 1;
+        while (maxDim > 1) {
+            maxDim >>= 1;
+            levels++;
+        }
+        return levels;
     }
 
     /**
@@ -381,4 +406,190 @@ public class GBufferTargets {
             default -> 4;
         };
     }
+
+            private void copyDepth(long commandBuffer, RenderTarget src, RenderTarget dst) {
+            if (!depthCreated || src == null || dst == null) return;
+
+            VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkImageMemoryBarrier.Buffer barriers = VkImageMemoryBarrier.calloc(2, stack);
+
+                barriers.get(0)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .oldLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(src.getImage())
+                    .srcAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT);
+                barriers.get(0).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+
+                barriers.get(1)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                    .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(dst.getImage())
+                    .srcAccessMask(0)
+                    .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
+                barriers.get(1).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    null, null, barriers);
+
+                VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+                region.srcSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                region.srcOffset().set(0, 0, 0);
+                region.dstSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                region.dstOffset().set(0, 0, 0);
+                region.extent().set(width, height, 1);
+
+                vkCmdCopyImage(cmd,
+                    src.getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dst.getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    region);
+
+                barriers.get(0)
+                    .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT)
+                    .dstAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                barriers.get(1)
+                    .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    0,
+                    null, null, barriers);
+            }
+            }
+
+            private static void clearColorTarget(VkCommandBuffer cmd, long image, float[] clearColor) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                    .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .srcAccessMask(0)
+                    .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
+                barrier.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(VK_REMAINING_MIP_LEVELS)
+                    .baseArrayLayer(0).layerCount(1);
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    null, null, barrier);
+
+                VkClearColorValue clearValue = VkClearColorValue.calloc(stack)
+                        .float32(0, clearColor.length > 0 ? clearColor[0] : 0.0f)
+                        .float32(1, clearColor.length > 1 ? clearColor[1] : 0.0f)
+                        .float32(2, clearColor.length > 2 ? clearColor[2] : 0.0f)
+                        .float32(3, clearColor.length > 3 ? clearColor[3] : 1.0f);
+
+                VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(VK_REMAINING_MIP_LEVELS)
+                    .baseArrayLayer(0).layerCount(1);
+
+                vkCmdClearColorImage(cmd, image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    clearValue,
+                    range);
+
+                barrier.oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    0,
+                    null, null, barrier);
+            }
+            }
+
+            private static void clearDepthTarget(VkCommandBuffer cmd, long image, int finalLayout) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                    .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .srcAccessMask(0)
+                    .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
+                barrier.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    null, null, barrier);
+
+                VkClearDepthStencilValue clearValue = VkClearDepthStencilValue.calloc(stack)
+                    .depth(1.0f)
+                    .stencil(0);
+
+                VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+
+                vkCmdClearDepthStencilImage(cmd,
+                    image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    clearValue,
+                    range);
+
+                int dstStage = finalLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                    ? (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
+                    : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+                int dstAccess = finalLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                    ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                    : VK_ACCESS_SHADER_READ_BIT;
+
+                barrier.oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .newLayout(finalLayout)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(dstAccess);
+
+                vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    dstStage,
+                    0,
+                    null, null, barrier);
+            }
+            }
 }

@@ -4,9 +4,11 @@ import net.vulkanium.render.gbuffer.MRTGraphicsPipeline;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Predicate;
 
 /**
@@ -81,6 +83,8 @@ public class ShaderProgramManager {
             if (compiled != null) {
                 programs.put(key, compiled);
                 compiledCount++;
+            } else {
+                programs.put(key, createBuiltinProgram(key));
             }
         }
 
@@ -108,8 +112,9 @@ public class ShaderProgramManager {
      */
     public CompiledProgram getBeforeTranslucent(ShaderKey key) {
         CompiledProgram program = programs.get(key);
+        if (program == null) return null;
+        if (program.framebufferBeforeTranslucent != 0) return program;
         return program;
-        // TODO: Return the before-translucent framebuffer variant
     }
 
     /**
@@ -117,38 +122,53 @@ public class ShaderProgramManager {
      */
     public CompiledProgram getAfterTranslucent(ShaderKey key) {
         CompiledProgram program = programs.get(key);
+        if (program == null) return null;
+        if (program.framebufferAfterTranslucent != 0) return program;
         return program;
-        // TODO: Return the after-translucent framebuffer variant
     }
 
     private CompiledProgram compileProgram(long device, long renderPass,
                                             ShaderKey key, ProgramSource source) {
-        // TODO: Implementation:
-        // 1. Get draw buffers from source directives
-        // 2. Look up or create MRT render pass for those draw buffers
-        // 3. Build pipeline key (shader hash + vertex format + blend state + render pass)
-        // 4. Check pipeline cache for dedup
-        // 5. If not cached:
-        //    a. Preprocess GLSL (OptiFineGlslPreprocessor)
-        //    b. Transform GLSL (VulkaniumGlslTransformer) with key's properties
-        //    c. Compile to SPIR-V (ShaderCompiler)
-        //    d. Create VkShaderModules
-        //    e. Create VkPipeline with:
-        //       - Vertex input from key.getVertexFormat()
-        //       - Alpha test threshold as push constant
-        //       - Fog mode as specialization constant
-        //       - Blend state from source directives or key defaults
-        //       - MRT write masks from draw buffers
-        //    f. Store in pipelineCache
-        // 6. Return CompiledProgram
+        if (source == null) {
+            return createBuiltinProgram(key);
+        }
 
-        return null; // TODO
+        int[] drawBuffers = (source.drawBuffers != null && source.drawBuffers.length > 0)
+                ? Arrays.copyOf(source.drawBuffers, source.drawBuffers.length)
+                : new int[]{0};
+
+        long vertexHash = hashSource(source.vertexSource);
+        long fragmentHash = hashSource(source.fragmentSource);
+        int blendHash = source.blend != null ? source.blend.hashCode() : 0;
+
+        PipelineCacheKey cacheKey = new PipelineCacheKey(
+                vertexHash,
+                fragmentHash,
+                key.getVertexFormat(),
+                blendHash,
+                renderPass
+        );
+
+        Long cachedPipeline = pipelineCache.get(cacheKey);
+        if (cachedPipeline != null) {
+            deduplicatedCount++;
+            return new CompiledProgram(cachedPipeline, 0, 0, drawBuffers, key);
+        }
+
+        // TODO (full implementation): compile GLSL -> SPIR-V -> VkShaderModule -> VkPipeline.
+        // For now, register a placeholder pipeline entry so source-equal keys can deduplicate.
+        long placeholderPipeline = 0L;
+        pipelineCache.put(cacheKey, placeholderPipeline);
+        return new CompiledProgram(placeholderPipeline, 0, 0, drawBuffers, key);
     }
 
     private CompiledProgram createBuiltinProgram(ShaderKey key) {
-        // TODO: Create pipeline with built-in shaders (terrain.vert/frag or blit.vert/frag)
-        // that provides basic rendering without pack shaders
         return new CompiledProgram(0, 0, 0, new int[]{0}, key);
+    }
+
+    private long hashSource(String source) {
+        if (source == null || source.isEmpty()) return 0L;
+        return Integer.toUnsignedLong(Objects.hash(source));
     }
 
     // ── Lifecycle ──

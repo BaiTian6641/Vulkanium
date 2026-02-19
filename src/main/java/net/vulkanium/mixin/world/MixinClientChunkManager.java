@@ -5,6 +5,7 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.vulkanium.Vulkanium;
+import net.vulkanium.world.VulkaniumWorldRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -75,7 +76,9 @@ public abstract class MixinClientChunkManager {
      * Notify the Vulkan terrain system that a section has changed.
      */
     private static void onSectionChanged(int chunkX, int sectionY, int chunkZ) {
-        // TODO: Wire to VulkaniumWorldRenderer.markSectionDirty()
-        // For now, just log at debug level
+        VulkaniumWorldRenderer renderer = VulkaniumWorldRenderer.getInstance();
+        if (renderer != null) {
+            renderer.markSectionDirty(chunkX, sectionY, chunkZ);
+        }
     }
 }

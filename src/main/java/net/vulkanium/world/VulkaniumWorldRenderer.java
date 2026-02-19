@@ -1,5 +1,8 @@
 package net.vulkanium.world;
 
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.vulkanium.Vulkanium;
 import net.vulkanium.render.terrain.ChunkRenderer;
 import net.vulkanium.render.terrain.pass.TerrainPassType;
 import org.joml.Matrix4f;
@@ -86,6 +89,18 @@ public class VulkaniumWorldRenderer {
         this.sectionCache = new ClonedChunkSectionCache();
         this.biomeColorCache = new BiomeColorCache();
         this.sectionGraph = new SectionGraph();
+
+        if (this.chunkRenderer == null
+                && Vulkanium.getVulkanMemory() != null
+                && Vulkanium.getVulkanQueues() != null
+                && Vulkanium.getStagingRing() != null) {
+            this.chunkRenderer = new ChunkRenderer(
+                    Vulkanium.getVulkanMemory(),
+                    Vulkanium.getVulkanQueues(),
+                    Vulkanium.getStagingRing()
+            );
+        }
+
         this.worldLoaded = true;
 
         // chunkRenderer should already be initialized by Phase 1
@@ -97,6 +112,9 @@ public class VulkaniumWorldRenderer {
      */
     public void onWorldUnload() {
         worldLoaded = false;
+        if (chunkRenderer != null) {
+            chunkRenderer.onWorldChange();
+        }
         if (sectionCache != null) sectionCache.clear();
         if (biomeColorCache != null) biomeColorCache.invalidate();
         LOGGER.info("World renderer unloaded");
@@ -197,11 +215,12 @@ public class VulkaniumWorldRenderer {
                 net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
 
         // Translucent pass is recorded separately from opaque.
-        // The ChunkRenderer's recordDrawCommands already handles all pass types
-        // in order (SOLID → CUTOUT → TRANSLUCENT), so for a dedicated translucent
-        // call, we record only the translucent pass.
-        // In the current design, this is handled as part of the full recordDrawCommands.
-        // TODO: separate recordTranslucentPass() for explicit translucent-only rendering
+        // Culling/visibility data is prepared in setupTerrain(), then this records
+        // only the TRANSLUCENT pass to support split-phase pipelines.
+        int translucentDraws = chunkRenderer
+            .getRenderPass(TerrainPassType.TRANSLUCENT)
+            .record(cmd, chunkRenderer.getRegionManager(), null);
+        drawCalls += translucentDraws;
     }
 
     /**
@@ -235,9 +254,7 @@ public class VulkaniumWorldRenderer {
      */
     public void markSectionDirty(int sectionX, int sectionY, int sectionZ) {
         if (chunkRenderer != null) {
-            // Delegate to the region manager which tracks per-section dirty state
-            // and schedules rebuilds during the next frame's submitBuilds()
-            // section rebuild is handled by ChunkBuildScheduler
+            chunkRenderer.getRegionManager().markSectionDirty(sectionX, sectionY, sectionZ);
             chunksBuiltThisFrame++; // Track for stats
         }
         // Also invalidate section visibility data in the graph
@@ -250,14 +267,35 @@ public class VulkaniumWorldRenderer {
      * Handle chunk load from network.
      */
     public void onChunkLoaded(int chunkX, int chunkZ) {
-        // Register all sections in column
-        // Mark for initial build
+        if (chunkRenderer == null) return;
+
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) return;
+
+        int minSectionY = level.getMinBuildHeight() >> 4;
+        int maxSectionY = (level.getMaxBuildHeight() - 1) >> 4;
+
+        for (int sectionY = minSectionY; sectionY <= maxSectionY; sectionY++) {
+            chunkRenderer.onSectionLoad(chunkX, sectionY, chunkZ);
+            chunkRenderer.getRegionManager().markSectionDirty(chunkX, sectionY, chunkZ);
+        }
     }
 
     /**
      * Handle chunk unload.
      */
     public void onChunkUnloaded(int chunkX, int chunkZ) {
+        if (chunkRenderer != null) {
+            ClientLevel level = Minecraft.getInstance().level;
+            if (level != null) {
+                int minSectionY = level.getMinBuildHeight() >> 4;
+                int maxSectionY = (level.getMaxBuildHeight() - 1) >> 4;
+                for (int sectionY = minSectionY; sectionY <= maxSectionY; sectionY++) {
+                    chunkRenderer.onSectionUnload(chunkX, sectionY, chunkZ);
+                }
+            }
+        }
+
         if (sectionCache != null) {
             sectionCache.invalidateColumn(chunkX, chunkZ);
         }

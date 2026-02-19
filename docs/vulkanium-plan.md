@@ -1,7 +1,7 @@
 # Vulkanium — Next-Generation Vulkan Rendering Engine for Minecraft
 
-> **Date:** 2026-02-16  
-> **Status:** IMPLEMENTED — All 12 phases (0–11) + gap-filling infrastructure complete (~180 files)  
+> **Date:** 2026-02-19  
+> **Status:** IN PROGRESS — All 12 phases have substantial code scaffolding; runtime integration is partially complete  
 > **Codename:** Vulkanium  
 > **Based on:** VulkanMod (Vulkan core) + Sodium (optimization patterns) + Iris (shader compat layer)  
 > **Goal:** A ground-up reconstruction of VulkanMod that delivers massive Vulkan performance gains while maintaining full OptiFine/Iris shader pack compatibility
@@ -30,6 +30,48 @@
 9. [File Inventory](#file-inventory)
 10. [Risk Assessment & Mitigations](#risk-assessment--mitigations)
 11. [Performance Targets](#performance-targets)
+12. [Current Progress Checklist (Audit: 2026-02-19)](#current-progress-checklist-audit-2026-02-19)
+
+---
+
+## Current Progress Checklist (Audit: 2026-02-19)
+
+> **Audit basis:** `src/main/java/net/vulkanium` + `src/main/resources/assets/vulkanium/shaders` + `src/main/resources/vulkanium.mixins.json`  
+> **Verification:** `./gradlew classes -x test` → BUILD SUCCESSFUL  
+> **Measured inventory:** 227 Java files, 34 mixin classes, 12 shader files
+
+### Checklist Snapshot
+
+- [x] Core project builds successfully
+- [x] Core subsystem scaffolding is present (core/resource/render/world/api/compute/rt)
+- [x] Expanded mixin surface is present in config and sources
+- [x] Shaderpack loading, preprocessing, and compiler/cache classes are present
+- [x] External shaderpack discovery and load path works at runtime (zip + directory sources)
+- [x] Real-pack smoke load succeeded (`iterationRP Alpha 0.8.11`: 48/48 programs compiled, 0 failed)
+- [x] Chunk shadow layer-mask path and frustum-aware terrain filtering are implemented
+- [x] G-buffer depth copy/clear commands and mip-level tracking are implemented
+- [x] Shadow renderer command path now includes pass begin/end hooks + mipmap generation + image cleanup
+- [ ] Vulkan command recording path is fully implemented end-to-end
+- [ ] Descriptor set lifecycle is fully implemented across all passes
+- [ ] Shaderpack runtime compatibility validated against real pack matrix
+- [ ] Ray tracing path is production-ready (BLAS/TLAS/SBT/trace dispatch)
+
+### Phase-by-Phase Status
+
+| Phase | Status | Audit Notes |
+|------|--------|-------------|
+| 0 — Core Vulkan | 🟡 Partial | Core classes are in place and compiling; several Vulkan command/barrier paths still marked TODO. |
+| 1 — Chunk Rendering | 🟡 Partial | Region/section/cull/upload/build structure exists; shadow-layer dispatch and frustum-aware shadow filtering are now wired, but broader runtime validation remains. |
+| 2 — GLSL Compat | 🟡 Partial | Transformer/preprocessor/compiler/UBO bridge exist; external pack discovery/load works and at least one real pack compiles cleanly, but broader runtime binding validation remains incomplete. |
+| 3 — MRT/G-Buffer | 🟡 Partial | MRT target/pass/pipeline classes exist; depth copy/clear command recording and mip-level handling are implemented, with full descriptor/render-path wiring still in progress. |
+| 4 — Composite/Deferred | 🟡 Partial | Composite pass manager/final pass exist; descriptor and binding completion remains. |
+| 5 — Shadows | 🟡 Partial | Shadow structures exist; pass begin/end hooks, viewport restore, shadow mipmap generation, and shadow image cleanup are implemented; full production shadow framebuffer wiring and runtime pack matrix validation remain. |
+| 6 — Entity/Sky/Particle | 🟡 Partial | Program and renderer scaffolding exist; full pass-by-pass runtime parity still pending. |
+| 7 — Vulkan Perf | 🟡 Partial | Async transfer/parallel recording/culling modules exist; deeper Vulkan integration still pending. |
+| 8 — Polish/UX | 🟡 Partial | Cache/progress/debug/config/overlay components exist and compile. |
+| 9 — Compute Platform | 🟡 Partial | Compute scheduler/allocator/modules exist; complete production dispatch-readback path still pending. |
+| 10 — Ray Tracing | 🟠 Scaffolded | RT classes/shaders exist, but BLAS/TLAS/SBT/trace pipeline has significant TODO coverage. |
+| 11 — Module System | 🟡 Partial | Module API and built-ins exist; runtime conflict handling and full integration require more validation. |
 
 ---
 
@@ -531,7 +573,7 @@ Phase 0 (Core) ──┬──► Phase 1 (Chunks) ──┬──► Phase 2 (G
 
 ---
 
-### Phase 0 — Foundation: Core Vulkan Abstraction ✅ IMPLEMENTED
+### Phase 0 — Foundation: Core Vulkan Abstraction 🟡 PARTIALLY IMPLEMENTED
 
 **Complexity:** HIGH  
 **Files:** 28 implemented (build system, entry points, core abstractions, resource layer, mixins, built-in shaders)  
@@ -640,7 +682,7 @@ public class FrameOrchestrator {
 
 ---
 
-### Phase 1 — Chunk Rendering Engine ✅ IMPLEMENTED (18 files)
+### Phase 1 — Chunk Rendering Engine 🟡 PARTIALLY IMPLEMENTED (18 files)
 
 **Complexity:** HIGH  
 **Files:** ~12  
@@ -735,7 +777,7 @@ No stalls on graphics queue for chunk uploads.
 
 ---
 
-### Phase 2 — GLSL Compatibility Layer (OptiFine Bridge) ✅ IMPLEMENTED (5 files)
+### Phase 2 — GLSL Compatibility Layer (OptiFine Bridge) 🟡 PARTIALLY IMPLEMENTED (5 files)
 
 **Complexity:** HIGH  
 **Files:** ~6  
@@ -850,7 +892,7 @@ centerDepthSmooth        → iris_DepthParams.x                 // NEW: real dep
 
 ---
 
-### Phase 3 — Multi-Render Target (MRT) & G-Buffer System ✅ IMPLEMENTED (5 files)
+### Phase 3 — Multi-Render Target (MRT) & G-Buffer System 🟡 PARTIALLY IMPLEMENTED (5 files)
 
 **Complexity:** HIGH  
 **Files:** ~5  
@@ -911,7 +953,7 @@ public class MRTGraphicsPipeline extends VulkaniumGraphicsPipeline {
 
 ---
 
-### Phase 4 — Composite/Deferred Pass Engine ✅ IMPLEMENTED (3 files)
+### Phase 4 — Composite/Deferred Pass Engine 🟡 PARTIALLY IMPLEMENTED (3 files)
 
 **Complexity:** MEDIUM-HIGH  
 **Files:** ~4  
@@ -957,7 +999,7 @@ void main() {
 
 ---
 
-### Phase 5 — Shadow Mapping System ✅ IMPLEMENTED (4 files)
+### Phase 5 — Shadow Mapping System 🟡 PARTIALLY IMPLEMENTED (4 files)
 
 **Complexity:** MEDIUM  
 **Files:** ~4  
@@ -990,7 +1032,7 @@ boolean shadowHardwareFiltering; // use VK_COMPARE_OP_LESS sampler
 
 ---
 
-### Phase 6 — Entity/Sky/Particle/Hand/Weather Pipeline ✅ IMPLEMENTED (5 files)
+### Phase 6 — Entity/Sky/Particle/Hand/Weather Pipeline 🟡 PARTIALLY IMPLEMENTED (5 files)
 
 **Complexity:** MEDIUM  
 **Files:** ~8  
@@ -1016,7 +1058,7 @@ boolean shadowHardwareFiltering; // use VK_COMPARE_OP_LESS sampler
 
 ---
 
-### Phase 7 — Vulkan-Native Performance Optimizations ✅ IMPLEMENTED (6 files)
+### Phase 7 — Vulkan-Native Performance Optimizations 🟡 PARTIALLY IMPLEMENTED (6 files)
 
 **Complexity:** MEDIUM-HIGH  
 **Files:** ~6  
@@ -1158,7 +1200,7 @@ vkCreatePipelineCache(device, cacheInfo, null, pCache);
 
 ---
 
-### Phase 8 — Polish, Caching & UX ✅ IMPLEMENTED (5 files)
+### Phase 8 — Polish, Caching & UX 🟡 PARTIALLY IMPLEMENTED (5 files)
 
 **Complexity:** LOW-MEDIUM  
 **Files:** ~5  
@@ -1412,7 +1454,7 @@ Vulkanium uses more VRAM due to render targets and shadows — this is expected 
 
 ---
 
-## Phase 9 — Compute Pipeline Platform (GP-Computing) ✅ IMPLEMENTED
+## Phase 9 — Compute Pipeline Platform (GP-Computing) 🟡 PARTIALLY IMPLEMENTED
 
 **Complexity:** HIGH  
 **Files:** 12 implemented (5 core Java + 4 compute module Java + 3 GLSL compute shaders)  
@@ -1546,7 +1588,7 @@ GPU → CPU (Readback):
 
 ---
 
-## Phase 10 — Ray-Tracing Pipeline (Hardware RT) ✅ IMPLEMENTED
+## Phase 10 — Ray-Tracing Pipeline (Hardware RT) 🟠 SCAFFOLDED / PARTIAL
 
 **Complexity:** VERY HIGH  
 **Files:** 15 implemented (11 Java + 4 RT shaders: .rgen, .rchit, 2×.rmiss)  
@@ -1792,7 +1834,7 @@ public interface Upscaler extends WorldModule {
 
 ---
 
-## Phase 11 — Module/Plugin Architecture ✅ IMPLEMENTED
+## Phase 11 — Module/Plugin Architecture 🟡 PARTIALLY IMPLEMENTED
 
 **Complexity:** MEDIUM-HIGH  
 **Files:** 13 implemented (5 core API + 8 built-in module implementations)  
@@ -2153,7 +2195,7 @@ Plus ~12 mixin files, ~16 shader files, ~5 resource files.
 
 ## Implementation Summary
 
-All 12 phases (0–11) have been structurally implemented. Below is the complete file inventory.
+All 12 phases (0–11) now have substantial code artifacts in-tree, but multiple runtime-critical paths are still in progress. The inventory below reflects structure and coverage, not production completeness.
 
 ### File Counts by Phase
 

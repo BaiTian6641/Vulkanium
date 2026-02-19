@@ -1,12 +1,16 @@
 package net.vulkanium.render.shadow;
 
+import net.vulkanium.Vulkanium;
 import net.vulkanium.render.composite.CompositePassManager;
 import net.vulkanium.render.terrain.ChunkRenderer;
 import org.joml.Matrix4f;
 import org.joml.Vector3d;
+import org.joml.Vector4f;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
+import org.lwjgl.vulkan.VkClearValue;
 import org.lwjgl.vulkan.VkRect2D;
+import org.lwjgl.vulkan.VkRenderPassBeginInfo;
 import org.lwjgl.vulkan.VkViewport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,6 +68,12 @@ public class ShadowRenderer {
     private final ShadowMatrices matrices;
     private final ShadowDirectives directives;
     private final CompositePassManager shadowComposites;
+    private long shadowCompositeUniformDescriptorSet = 0L;
+
+    /** Optional externally-created shadow render pass integration. */
+    private long shadowRenderPass = VK_NULL_HANDLE;
+    private long shadowFramebuffer = VK_NULL_HANDLE;
+    private int shadowColorAttachmentCount = 0;
 
     // ── Frustum state ──
     private ShadowFrustum terrainFrustum;
@@ -149,9 +159,7 @@ public class ShadowRenderer {
             shadowMap.clearColorTargets(commandBuffer);
 
             // ── Step 6: Begin shadow render pass ──
-            // TODO: Begin MRT render pass with shadow depth + color attachments
-            //   load op = CLEAR for depth (with 1.0f clear value)
-            //   load op based on clear settings for color
+            boolean opaquePassBegun = beginShadowRenderPass(commandBuffer, true);
 
             // ── Step 7: Render opaque terrain ──
             if (shouldRenderTerrain) {
@@ -169,27 +177,31 @@ public class ShadowRenderer {
             }
 
             // ── Step 10: End render pass for opaque ──
-            // TODO: vkCmdEndRenderPass
+            endShadowRenderPass(commandBuffer, opaquePassBegun);
 
             // ── Step 11: Copy pre-translucent depth ──
             shadowMap.copyPreTranslucentDepth(commandBuffer);
 
             // ── Step 12: Begin render pass for translucent ──
             if (shouldRenderTranslucent) {
-                // TODO: Begin render pass with LOAD (not clear) for depth and color
+                boolean translucentPassBegun = beginShadowRenderPass(commandBuffer, false);
                 renderTranslucentTerrainShadow(commandBuffer, chunkRenderer);
-                // TODO: vkCmdEndRenderPass
+                endShadowRenderPass(commandBuffer, translucentPassBegun);
             }
 
             // ── Step 13: Generate mipmaps ──
-            // TODO: Generate mipmaps for depth/color targets that have mipmap=true
+            shadowMap.generateMipmaps(commandBuffer);
 
             // ── Step 14: Restore viewport ──
-            // TODO: Restore main viewport
+            if (Vulkanium.getVulkanSwapchain() != null) {
+                setShadowViewport(commandBuffer,
+                        Vulkanium.getVulkanSwapchain().getWidth(),
+                        Vulkanium.getVulkanSwapchain().getHeight());
+            }
 
             // ── Step 15: Run shadow composites ──
             if (shadowComposites != null && shadowComposites.getActivePassCount() > 0) {
-                shadowComposites.renderAll(commandBuffer, 0 /* TODO: uniform desc */,
+                shadowComposites.renderAll(commandBuffer, shadowCompositeUniformDescriptorSet,
                         res, res);
             }
         } finally {
@@ -268,10 +280,62 @@ public class ShadowRenderer {
         }
     }
 
+    private boolean beginShadowRenderPass(long commandBuffer, boolean clearDepth) {
+        if (shadowRenderPass == VK_NULL_HANDLE || shadowFramebuffer == VK_NULL_HANDLE) {
+            return false;
+        }
+
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+
+        int attachmentCount = Math.max(1, shadowColorAttachmentCount + 1);
+
+        try (MemoryStack stack = stackPush()) {
+            VkClearValue.Buffer clearValues = VkClearValue.calloc(attachmentCount, stack);
+            for (int i = 0; i < shadowColorAttachmentCount; i++) {
+                clearValues.get(i).color()
+                        .float32(0, 0.0f)
+                        .float32(1, 0.0f)
+                        .float32(2, 0.0f)
+                        .float32(3, 0.0f);
+            }
+            clearValues.get(attachmentCount - 1).depthStencil()
+                    .depth(1.0f)
+                    .stencil(0);
+
+            VkRenderPassBeginInfo beginInfo = VkRenderPassBeginInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+                    .renderPass(shadowRenderPass)
+                    .framebuffer(shadowFramebuffer)
+                    .pClearValues(clearDepth ? clearValues : null);
+
+            beginInfo.renderArea().offset().set(0, 0);
+            beginInfo.renderArea().extent().set(shadowMap.getResolution(), shadowMap.getResolution());
+
+            vkCmdBeginRenderPass(cmd, beginInfo, VK_SUBPASS_CONTENTS_INLINE);
+            return true;
+        }
+    }
+
+    private void endShadowRenderPass(long commandBuffer, boolean begun) {
+        if (!begun) return;
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+        vkCmdEndRenderPass(cmd);
+    }
+
     // ── Configuration ──
 
     public void setSunPathRotation(float rotation) { sunPathRotation = rotation; }
     public void setVoxelization(boolean hasVoxelization) { packHasVoxelization = hasVoxelization; }
+    public void setShadowCompositeUniformDescriptorSet(long descriptorSet) {
+        this.shadowCompositeUniformDescriptorSet = descriptorSet;
+    }
+    public void setShadowRenderTargets(long renderPass, long framebuffer, int colorAttachmentCount) {
+        this.shadowRenderPass = renderPass;
+        this.shadowFramebuffer = framebuffer;
+        this.shadowColorAttachmentCount = Math.max(0, colorAttachmentCount);
+    }
 
     // ── Getters ──
 
@@ -351,9 +415,47 @@ public class ShadowRenderer {
                     yield (cx * cx + cz * cz) <= maxDistance * maxDistance;
                 }
                 case MATRIX_BASED, REVERSED -> {
-                    // TODO: Full frustum plane extraction from MVP and AABB test
-                    //   For REVERSED, invert the near/far plane check
-                    yield true; // Placeholder
+                    if (mvp == null) {
+                        yield true;
+                    }
+
+                    Vector4f[] corners = {
+                            new Vector4f((float) minX, (float) minY, (float) minZ, 1.0f),
+                            new Vector4f((float) minX, (float) minY, (float) maxZ, 1.0f),
+                            new Vector4f((float) minX, (float) maxY, (float) minZ, 1.0f),
+                            new Vector4f((float) minX, (float) maxY, (float) maxZ, 1.0f),
+                            new Vector4f((float) maxX, (float) minY, (float) minZ, 1.0f),
+                            new Vector4f((float) maxX, (float) minY, (float) maxZ, 1.0f),
+                            new Vector4f((float) maxX, (float) maxY, (float) minZ, 1.0f),
+                            new Vector4f((float) maxX, (float) maxY, (float) maxZ, 1.0f)
+                    };
+
+                    for (Vector4f corner : corners) {
+                        mvp.transform(corner);
+                    }
+
+                    boolean outsideLeft = true;
+                    boolean outsideRight = true;
+                    boolean outsideBottom = true;
+                    boolean outsideTop = true;
+                    boolean outsideNear = !reversed;
+                    boolean outsideFar = !reversed;
+
+                    for (Vector4f c : corners) {
+                        float w = c.w;
+                        if (c.x >= -w) outsideLeft = false;
+                        if (c.x <= w) outsideRight = false;
+                        if (c.y >= -w) outsideBottom = false;
+                        if (c.y <= w) outsideTop = false;
+                        if (!reversed) {
+                            if (c.z >= -w) outsideNear = false;
+                            if (c.z <= w) outsideFar = false;
+                        }
+                    }
+
+                    boolean rejected = outsideLeft || outsideRight || outsideBottom || outsideTop
+                            || outsideNear || outsideFar;
+                    yield !rejected;
                 }
             };
         }

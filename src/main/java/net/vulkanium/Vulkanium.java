@@ -111,6 +111,7 @@ public class Vulkanium implements ClientModInitializer {
     private static boolean frameStarted = false;
     // Track last viewport/scissor to avoid redundant vkCmdSet calls
     private static int lastVpX = -1, lastVpY = -1, lastVpW = -1, lastVpH = -1;
+    private static Boolean lastVpFlipY = null;
     private static boolean lastScissorEnabled = false;
     private static int lastScX = -1, lastScY = -1, lastScW = -1, lastScH = -1;
 
@@ -841,6 +842,20 @@ public class Vulkanium implements ClientModInitializer {
                 || "position_tex_color".equals(shaderName);
     }
 
+    private static boolean isTerrainShaderName(String shaderName) {
+        if (shaderName == null || shaderName.isEmpty()) {
+            return false;
+        }
+        String name = shaderName.toLowerCase(Locale.ROOT);
+        return name.startsWith("rendertype_solid")
+                || name.startsWith("rendertype_cutout")
+                || name.startsWith("rendertype_cutout_mipped")
+                || name.startsWith("rendertype_translucent")
+                || name.startsWith("rendertype_tripwire")
+                || name.contains("terrain")
+                || name.contains("water");
+    }
+
     private static boolean isTerrainLikeFormat(com.mojang.blaze3d.vertex.VertexFormat format) {
         boolean hasUV0 = false;
         boolean hasUV1 = false;
@@ -962,18 +977,17 @@ public class Vulkanium implements ClientModInitializer {
         net.vulkanium.compat.VRenderSystem.getTextureMatrix().get(texMat);
 
         boolean shaderpackCompat = getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-                && pipeline.getName().startsWith("shaderpack_");
+            && pipeline.getName().startsWith("shaderpack_");
 
         int uboOffset;
         if (shaderpackCompat) {
-            boolean terrainLike = isTerrainLikeFormat(format);
             float chunkOffsetX = net.vulkanium.compat.VRenderSystem.getChunkOffsetX();
             float chunkOffsetY = net.vulkanium.compat.VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
             boolean hasChunkOffset = chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f;
 
             org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
-            if (terrainLike && hasChunkOffset) {
+            if (hasChunkOffset) {
             // Stabilize terrain compatibility path: apply section translation in CPU model-view
             // and zero the explicit chunk offset uniform to avoid double application.
             modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
@@ -1043,8 +1057,12 @@ public class Vulkanium implements ClientModInitializer {
             vkCmdSetDepthBias(cmd, 0.0f, 0.0f, 0.0f);
         }
 
-        // Update dynamic viewport/scissor if MC changed them since last draw
-        updateViewportScissor(cmd);
+        // Update dynamic viewport/scissor if MC changed them since last draw.
+        // Two-lane split:
+        // 1) Shaderpack compatibility draws: shader transform already handles clip-space conversion,
+        //    so avoid extra viewport Y flip.
+        // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
+        updateViewportScissor(cmd, !shaderpackCompat);
 
         // Bind the per-draw descriptor set with dynamic UBO offset
         drawBatcher.bindDescriptorSet(cmd, pipeline.getPipelineLayout(), setIdx, uboOffset);
@@ -1109,14 +1127,13 @@ public class Vulkanium implements ClientModInitializer {
 
         int uboOffset;
         if (shaderpackCompat) {
-            boolean terrainLike = isTerrainLikeFormat(format);
             float chunkOffsetX = VRenderSystem.getChunkOffsetX();
             float chunkOffsetY = VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = VRenderSystem.getChunkOffsetZ();
             boolean hasChunkOffset = chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f;
 
             org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix());
-            if (terrainLike && hasChunkOffset) {
+            if (hasChunkOffset) {
                 // Stabilize terrain compatibility path: apply section translation in CPU model-view
                 // and zero the explicit chunk offset uniform to avoid double application.
                 modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
@@ -1194,8 +1211,12 @@ public class Vulkanium implements ClientModInitializer {
             org.lwjgl.vulkan.VK10.vkCmdSetDepthBias(cmd, 0.0f, 0.0f, 0.0f);
         }
 
-        // Update viewport/scissor
-        updateViewportScissor(cmd);
+        // Update viewport/scissor.
+        // Two-lane split:
+        // 1) Shaderpack compatibility draws: shader transform already handles clip-space conversion,
+        //    so avoid extra viewport Y flip.
+        // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
+        updateViewportScissor(cmd, !shaderpackCompat);
 
         // Bind descriptor set
         drawBatcher.bindDescriptorSet(cmd, pipeline.getPipelineLayout(), setIdx, uboOffset);
@@ -1242,7 +1263,7 @@ public class Vulkanium implements ClientModInitializer {
      * MC changes viewport for GUI vs 3D rendering within the same frame.
      * Respects VRenderSystem.isScissorEnabled() for scroll area clipping.
      */
-    private static void updateViewportScissor(VkCommandBuffer cmd) {
+    private static void updateViewportScissor(VkCommandBuffer cmd, boolean flipViewportY) {
         // Read current viewport from VRenderSystem (set by MixinGlStateManager._viewport)
         int vpX = VRenderSystem.getViewportX();
         int vpY = VRenderSystem.getViewportY();
@@ -1265,7 +1286,9 @@ public class Vulkanium implements ClientModInitializer {
             scH = vpH;
         }
 
-        boolean vpChanged = vpW > 0 && vpH > 0 && (vpX != lastVpX || vpY != lastVpY || vpW != lastVpW || vpH != lastVpH);
+        boolean vpChanged = vpW > 0 && vpH > 0
+            && (vpX != lastVpX || vpY != lastVpY || vpW != lastVpW || vpH != lastVpH
+            || lastVpFlipY == null || lastVpFlipY.booleanValue() != flipViewportY);
         boolean scChanged = (scissorEnabled != lastScissorEnabled || scX != lastScX || scY != lastScY || scW != lastScW || scH != lastScH);
 
         if (vpChanged || scChanged) {
@@ -1274,14 +1297,20 @@ public class Vulkanium implements ClientModInitializer {
 
             try (MemoryStack stack = stackPush()) {
                 if (vpChanged) {
-                    // Negative height + y = vpY + vpH for OpenGL Y-up convention
-                    // (VulkanMod: viewport.y(height + y), viewport.height(-height))
-                    VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
-                            .x(vpX).y(vpY + vpH)
-                            .width(vpW).height(-vpH)
+                    VkViewport.Buffer viewport = VkViewport.calloc(1, stack).x(vpX).width(vpW)
                             .minDepth(0.0f).maxDepth(1.0f);
+                    if (flipViewportY) {
+                        // Negative height + y = vpY + vpH for OpenGL Y-up convention
+                        // (VulkanMod: viewport.y(height + y), viewport.height(-height))
+                        viewport.y(vpY + vpH).height(-vpH);
+                    } else {
+                        // Keep Vulkan's standard positive-height viewport while still
+                        // converting GL viewport origin (bottom-left) to Vulkan (top-left).
+                        viewport.y(fbHeight - (vpY + vpH)).height(vpH);
+                    }
                     vkCmdSetViewport(cmd, 0, viewport);
                     lastVpX = vpX; lastVpY = vpY; lastVpW = vpW; lastVpH = vpH;
+                    lastVpFlipY = flipViewportY;
                 }
 
                 if (vpChanged || scChanged) {

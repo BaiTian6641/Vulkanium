@@ -409,6 +409,41 @@ public class ShadowMap {
         }
     }
 
+        /**
+         * Generates mipmaps for shadow targets that have mipmap=true in directives.
+         */
+        public void generateMipmaps(long commandBuffer) {
+                VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+
+                if (directives.getDepthSettings(0).mipmap) {
+                        int mipLevels = calculateMipLevels();
+                        if (mipLevels > 1 && mainDepthImage != VK_NULL_HANDLE) {
+                                generateDepthMipmaps(cmd, mainDepthImage, mipLevels);
+                        }
+                }
+
+                if (directives.getDepthSettings(1).mipmap) {
+                        int mipLevels = calculateMipLevels();
+                        if (mipLevels > 1 && noTranslucentsDepthImage != VK_NULL_HANDLE) {
+                                generateDepthMipmaps(cmd, noTranslucentsDepthImage, mipLevels);
+                        }
+                }
+
+                for (int i = 0; i < MAX_COLOR_TARGETS; i++) {
+                        if (!colorAllocated[i]) continue;
+                        ShadowDirectives.ColorSamplingSettings settings = directives.getColorSettings(i);
+                        if (!settings.mipmap) continue;
+
+                        int mipLevels = calculateMipLevels();
+                        if (mipLevels <= 1) continue;
+
+                        int filter = settings.isIntegerFormat() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+                        generateColorMipmaps(cmd, colorImages[i], mipLevels, filter);
+                        generateColorMipmaps(cmd, colorAltImages[i], mipLevels, filter);
+                }
+        }
+
     // ── Ping-pong ──
 
     public void flip(int index) {
@@ -461,6 +496,218 @@ public class ShadowMap {
         return (int) Math.floor(Math.log(resolution) / Math.log(2)) + 1;
     }
 
+    private void generateColorMipmaps(VkCommandBuffer cmd, long image, int mipLevels, int filter) {
+        try (MemoryStack stack = stackPush()) {
+            VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .image(image)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+
+            barrier.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseArrayLayer(0)
+                    .layerCount(1)
+                    .levelCount(1);
+
+            int mipWidth = resolution;
+            int mipHeight = resolution;
+
+            for (int i = 1; i < mipLevels; i++) {
+                barrier.subresourceRange().baseMipLevel(i - 1);
+                barrier.oldLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                        .srcAccessMask(VK_ACCESS_SHADER_READ_BIT)
+                        .dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0,
+                        null,
+                        null,
+                        barrier);
+
+                barrier.subresourceRange().baseMipLevel(i);
+                barrier.oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                        .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcAccessMask(0)
+                        .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0,
+                        null,
+                        null,
+                        barrier);
+
+                VkImageBlit.Buffer blit = VkImageBlit.calloc(1, stack);
+                blit.srcSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(i - 1)
+                        .baseArrayLayer(0)
+                        .layerCount(1);
+                blit.srcOffsets(0).set(0, 0, 0);
+                blit.srcOffsets(1).set(mipWidth, mipHeight, 1);
+
+                int nextWidth = Math.max(1, mipWidth / 2);
+                int nextHeight = Math.max(1, mipHeight / 2);
+
+                blit.dstSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(i)
+                        .baseArrayLayer(0)
+                        .layerCount(1);
+                blit.dstOffsets(0).set(0, 0, 0);
+                blit.dstOffsets(1).set(nextWidth, nextHeight, 1);
+
+                vkCmdBlitImage(cmd,
+                        image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        blit,
+                        filter);
+
+                barrier.subresourceRange().baseMipLevel(i - 1);
+                barrier.oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                        .newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                        .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT)
+                        .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        0,
+                        null,
+                        null,
+                        barrier);
+
+                mipWidth = nextWidth;
+                mipHeight = nextHeight;
+            }
+
+            barrier.subresourceRange().baseMipLevel(mipLevels - 1);
+            barrier.oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    0,
+                    null,
+                    null,
+                    barrier);
+        }
+    }
+
+    private void generateDepthMipmaps(VkCommandBuffer cmd, long image, int mipLevels) {
+        try (MemoryStack stack = stackPush()) {
+            VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .image(image)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+
+            barrier.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseArrayLayer(0)
+                    .layerCount(1)
+                    .levelCount(1);
+
+            int mipWidth = resolution;
+            int mipHeight = resolution;
+
+            for (int i = 1; i < mipLevels; i++) {
+                barrier.subresourceRange().baseMipLevel(i - 1);
+                barrier.oldLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                        .newLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                        .srcAccessMask(VK_ACCESS_SHADER_READ_BIT)
+                        .dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0,
+                        null,
+                        null,
+                        barrier);
+
+                barrier.subresourceRange().baseMipLevel(i);
+                barrier.oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                        .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcAccessMask(0)
+                        .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0,
+                        null,
+                        null,
+                        barrier);
+
+                VkImageBlit.Buffer blit = VkImageBlit.calloc(1, stack);
+                blit.srcSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                        .mipLevel(i - 1)
+                        .baseArrayLayer(0)
+                        .layerCount(1);
+                blit.srcOffsets(0).set(0, 0, 0);
+                blit.srcOffsets(1).set(mipWidth, mipHeight, 1);
+
+                int nextWidth = Math.max(1, mipWidth / 2);
+                int nextHeight = Math.max(1, mipHeight / 2);
+
+                blit.dstSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                        .mipLevel(i)
+                        .baseArrayLayer(0)
+                        .layerCount(1);
+                blit.dstOffsets(0).set(0, 0, 0);
+                blit.dstOffsets(1).set(nextWidth, nextHeight, 1);
+
+                vkCmdBlitImage(cmd,
+                        image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        blit,
+                        VK_FILTER_NEAREST);
+
+                barrier.subresourceRange().baseMipLevel(i - 1);
+                barrier.oldLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+                        .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                        .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT)
+                        .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+
+                vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        0,
+                        null,
+                        null,
+                        barrier);
+
+                mipWidth = nextWidth;
+                mipHeight = nextHeight;
+            }
+
+            barrier.subresourceRange().baseMipLevel(mipLevels - 1);
+            barrier.oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    0,
+                    null,
+                    null,
+                    barrier);
+        }
+    }
+
     // ── Lifecycle ──
 
     public void destroy(long device, long allocator) {
@@ -473,7 +720,12 @@ public class ShadowMap {
         // Destroy depth views and images
         destroyImageView(device, mainDepthView);
         destroyImageView(device, noTranslucentsDepthView);
-        // TODO: vmaDestroyImage for depth images
+                if (mainDepthImage != VK_NULL_HANDLE && depthAllocations[0] != 0L) {
+                        vmaDestroyImage(allocator, mainDepthImage, depthAllocations[0]);
+                }
+                if (noTranslucentsDepthImage != VK_NULL_HANDLE && depthAllocations[1] != 0L) {
+                        vmaDestroyImage(allocator, noTranslucentsDepthImage, depthAllocations[1]);
+                }
 
         // Destroy color targets
         for (int i = 0; i < MAX_COLOR_TARGETS; i++) {
@@ -481,15 +733,25 @@ public class ShadowMap {
             destroySampler(device, colorSamplers[i]);
             destroyImageView(device, colorViews[i]);
             destroyImageView(device, colorAltViews[i]);
-            // TODO: vmaDestroyImage for color images + alt images
+                        if (colorImages[i] != VK_NULL_HANDLE && colorAllocations[i] != 0L) {
+                                vmaDestroyImage(allocator, colorImages[i], colorAllocations[i]);
+                        }
+                        if (colorAltImages[i] != VK_NULL_HANDLE && colorAltAllocations[i] != 0L) {
+                                vmaDestroyImage(allocator, colorAltImages[i], colorAltAllocations[i]);
+                        }
         }
 
         mainDepthImage = mainDepthView = mainDepthSampler = VK_NULL_HANDLE;
         noTranslucentsDepthImage = noTranslucentsDepthView = noTranslucentsDepthSampler = VK_NULL_HANDLE;
         mainDepthHwSampler = noTranslucentsHwSampler = VK_NULL_HANDLE;
         java.util.Arrays.fill(colorImages, VK_NULL_HANDLE);
+        java.util.Arrays.fill(colorAltImages, VK_NULL_HANDLE);
         java.util.Arrays.fill(colorViews, VK_NULL_HANDLE);
+        java.util.Arrays.fill(colorAltViews, VK_NULL_HANDLE);
         java.util.Arrays.fill(colorSamplers, VK_NULL_HANDLE);
+        java.util.Arrays.fill(depthAllocations, 0L);
+        java.util.Arrays.fill(colorAllocations, 0L);
+        java.util.Arrays.fill(colorAltAllocations, 0L);
         java.util.Arrays.fill(colorAllocated, false);
 
         LOGGER.debug("Shadow map destroyed");

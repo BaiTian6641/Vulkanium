@@ -2,12 +2,14 @@ package net.vulkanium.mixin;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.Camera;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.RenderType;
 import net.vulkanium.Vulkanium;
+import net.vulkanium.world.VulkaniumWorldRenderer;
 import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -68,9 +70,11 @@ public abstract class MixinLevelRenderer {
 
             Vulkanium.LOGGER.trace("setupRender: camera at ({}, {}, {})", x, y, z);
 
-            // TODO: Wire VulkaniumWorldRenderer.setupTerrain() here
-            // For now, let vanilla run so the game is playable during development
-            // ci.cancel();
+            VulkaniumWorldRenderer.getInstance().setupTerrain(
+                    x, y, z,
+                    Minecraft.getInstance().getFrameTime(),
+                    isSpectator
+            );
         } catch (Exception e) {
             Vulkanium.LOGGER.error("Error in Vulkan setupRender", e);
         }
@@ -178,10 +182,10 @@ public abstract class MixinLevelRenderer {
         if (level != null) {
             Vulkanium.LOGGER.info("Level loaded — initializing Vulkan terrain for '{}'",
                     level.dimension().location());
-            // TODO: Initialize VulkaniumWorldRenderer for this level
+            VulkaniumWorldRenderer.getInstance().onWorldLoad(vulkanium$getRenderDistance());
         } else {
             Vulkanium.LOGGER.info("Level unloaded — cleaning up Vulkan terrain resources");
-            // TODO: Destroy terrain VkBuffers, section graph, etc.
+            VulkaniumWorldRenderer.getInstance().onWorldUnload();
         }
     }
 
@@ -192,6 +196,15 @@ public abstract class MixinLevelRenderer {
     private void onAllChanged(CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
         Vulkanium.LOGGER.info("LevelRenderer.allChanged — rebuilding Vulkan terrain");
-        // Recreate chunk section render data, recompute section graph, etc.
+        VulkaniumWorldRenderer.getInstance().onRenderDistanceChange(vulkanium$getRenderDistance());
+    }
+
+    @Unique
+    private int vulkanium$getRenderDistance() {
+        try {
+            return Minecraft.getInstance().options.renderDistance().get();
+        } catch (Throwable ignored) {
+            return 12;
+        }
     }
 }

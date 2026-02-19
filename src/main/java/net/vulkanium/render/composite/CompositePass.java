@@ -64,6 +64,7 @@ public class CompositePass {
     private long fragmentModule;
     private long pipeline;
     private long pipelineLayout;
+    private long samplerDescriptorSet;
 
     /** Optional compute shader that runs before this pass */
     private long computeModule;
@@ -126,6 +127,10 @@ public class CompositePass {
         this.computePipeline = computePipeline;
     }
 
+    public void setSamplerDescriptorSet(long samplerDescriptorSet) {
+        this.samplerDescriptorSet = samplerDescriptorSet;
+    }
+
     public void setViewportScale(float x, float y) {
         this.viewportScaleX = x;
         this.viewportScaleY = y;
@@ -166,7 +171,7 @@ public class CompositePass {
     public long getComputeModule() { return computeModule; }
     public long getComputePipeline() { return computePipeline; }
     public long getComputePipelineLayout() { return pipelineLayout; }
-    public long getSamplerDescriptorSet() { return 0; /* TODO: descriptor set binding */ }
+    public long getSamplerDescriptorSet() { return samplerDescriptorSet; }
     public int getComputeWorkGroupsX() { return computeWorkGroupsX; }
     public int getComputeWorkGroupsY() { return computeWorkGroupsY; }
 
