@@ -138,13 +138,18 @@ public abstract class MixinVertexBuffer {
      * reads quad center positions from vertex data, sorts back-to-front from
      * camera, and generates triangle indices in sorted order.
      *
-     * This is critical for correct alpha blending of water when vanilla
+     * This is a fallback for correct alpha blending of water when vanilla
      * provides sequentialIndex=true (no custom sorted indices).
      */
     @Unique
     private void vulkanium$generateSortedQuadIndices(ByteBuffer vertexData, int vertexCount, int vertexStride) {
         int quadCount = vertexCount / 4;
         if (quadCount <= 0) return;
+
+        // Ensure native byte order for reading floats from vertex data
+        // (MC uses native byte order via LWJGL MemoryUtil, but Java ByteBuffer defaults to BIG_ENDIAN)
+        ByteBuffer nativeOrder = vertexData.duplicate();
+        nativeOrder.order(ByteOrder.nativeOrder());
 
         // Get camera position in section-local coordinates via chunk offset.
         // Chunk offset = (sectionOrigin - cameraPos), so camera in section-local
@@ -171,12 +176,12 @@ public abstract class MixinVertexBuffer {
             int quadByteOffset = q * quadStride;
             // Average of vertex[0] and vertex[2] positions → quad center
             // (same approach as VulkanMod's makeQuadSortingPoints)
-            float x0 = vertexData.getFloat(quadByteOffset);
-            float y0 = vertexData.getFloat(quadByteOffset + 4);
-            float z0 = vertexData.getFloat(quadByteOffset + 8);
-            float x2 = vertexData.getFloat(quadByteOffset + thirdVertexOffset);
-            float y2 = vertexData.getFloat(quadByteOffset + thirdVertexOffset + 4);
-            float z2 = vertexData.getFloat(quadByteOffset + thirdVertexOffset + 8);
+            float x0 = nativeOrder.getFloat(quadByteOffset);
+            float y0 = nativeOrder.getFloat(quadByteOffset + 4);
+            float z0 = nativeOrder.getFloat(quadByteOffset + 8);
+            float x2 = nativeOrder.getFloat(quadByteOffset + thirdVertexOffset);
+            float y2 = nativeOrder.getFloat(quadByteOffset + thirdVertexOffset + 4);
+            float z2 = nativeOrder.getFloat(quadByteOffset + thirdVertexOffset + 8);
 
             float cx = (x0 + x2) * 0.5f;
             float cy = (y0 + y2) * 0.5f;
@@ -292,6 +297,14 @@ public abstract class MixinVertexBuffer {
      * Cancels the vanilla GL upload (glBufferData etc) since there's no GL context.
      * Manually releases the rendered buffer since vanilla's finally block won't
      * run.
+     *
+     * Upload cases:
+     * 1. Full upload (vertex + index data): Initial chunk build with sorted indices.
+     *    Both vertex buffer and index buffer are created/replaced.
+     * 2. Full upload (vertex only, sequential): Opaque terrain build. Vertex buffer
+     *    is created/replaced, auto-index buffers used at draw time.
+     * 3. Index-only upload (re-sort): Camera moved, vanilla re-sorted translucent
+     *    quads. Only the index buffer is replaced; vertex buffer is kept.
      */
     @Inject(method = "upload", at = @At("HEAD"), cancellable = true)
     private void onUpload(BufferBuilder.RenderedBuffer buffer, CallbackInfo ci) {
@@ -306,25 +319,37 @@ public abstract class MixinVertexBuffer {
             this.indexType = drawState.indexType();
             this.persistentSequentialIndex = drawState.sequentialIndex();
 
-            ByteBuffer vtxBuf = buffer.vertexBuffer();
-            ByteBuffer idxBuf = buffer.indexBuffer();
-            ByteBuffer vtxUpload = vtxBuf != null ? vtxBuf.duplicate() : null;
-            ByteBuffer idxUpload = idxBuf != null ? idxBuf.duplicate() : null;
-            if (vtxUpload != null)
-                vtxUpload.rewind();
-            if (idxUpload != null)
-                idxUpload.rewind();
-            if (vtxUpload != null && vtxUpload.remaining() > 0) {
+            // CRITICAL: Check drawState.indexOnly() to determine if this upload
+            // contains new vertex data or is an index-only re-sort.
+            //
+            // For index-only re-sorts (translucent terrain when camera moves):
+            //   - Vanilla's BufferBuilder writes ONLY sorted indices to its buffer
+            //   - But vertexBuffer() returns a non-empty ByteBuffer because
+            //     DrawState.vertexBufferSize() always returns vertexCount * stride
+            //     (it doesn't know about indexOnly). The returned bytes are actually
+            //     the sorted index data, NOT vertex positions.
+            //   - Vanilla's uploadVertexBuffer explicitly checks drawState.indexOnly()
+            //     and SKIPS the GL vertex upload in that case.
+            //   - Without this check, we destroy the real vertex buffer and replace
+            //     it with index bytes interpreted as vertex positions → stretched
+            //     triangles and corruption for water/ice/portals during movement.
+            boolean indexOnly = drawState.indexOnly();
+
+            ByteBuffer vtxRaw = buffer.vertexBuffer();
+            ByteBuffer idxRaw = buffer.indexBuffer();
+
+            boolean hasVertexData = !indexOnly && vtxRaw != null && vtxRaw.remaining() > 0;
+            boolean hasIndexData  = idxRaw != null && idxRaw.remaining() > 0;
+
+            // ── Vertex buffer upload ───────────────────────────────────────
+            if (hasVertexData) {
                 this.persistentVertexCount = drawState.vertexCount();
-                int dataSize = vtxUpload.remaining();
+                int dataSize = vtxRaw.remaining();
 
                 // ALWAYS defer-free the old buffer and allocate a new one.
                 // We must NOT reuse the same VkBuffer even if the size matches,
                 // because in-flight command buffers (from previous frames) may still
-                // be reading the old vertex data from this buffer. Overwriting a
-                // HOST_COHERENT buffer while the GPU reads it causes data races,
-                // leading to torn geometry: "some chunks missing, wrong texture,
-                // wrong biome color" — especially visible on TRANSLUCENT water.
+                // be reading the old vertex data from this buffer.
                 if (vkVertexBuffer != VK_NULL_HANDLE) {
                     Vulkanium.deferBufferFree(vkVertexBuffer, vkVertexAllocation,
                             persistentBufferSize, persistentMappedPtr);
@@ -334,7 +359,6 @@ public abstract class MixinVertexBuffer {
                 }
 
                 // Acquire buffer from pool (or allocate new if pool empty)
-                // Pool buffers are persistently mapped — no map/unmap needed per upload
                 net.vulkanium.core.ChunkBufferPool pool = Vulkanium.getChunkBufferPool();
                 if (pool != null && pool.isInitialized()) {
                     net.vulkanium.core.ChunkBufferPool.PooledBuffer pb = pool.acquire(dataSize);
@@ -343,7 +367,6 @@ public abstract class MixinVertexBuffer {
                     persistentBufferSize = pb.capacity();
                     persistentMappedPtr = pb.mappedPtr();
                 } else {
-                    // Fallback: direct VMA allocation + map
                     VulkaniumMemory.BufferAllocation alloc = Vulkanium.getVulkanMemory().createBuffer(
                             dataSize,
                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -354,127 +377,69 @@ public abstract class MixinVertexBuffer {
                     persistentMappedPtr = Vulkanium.getVulkanMemory().map(alloc.allocation());
                 }
 
-                // Upload vertex data using the persistently mapped pointer
-                // (zero-overhead: no VMA map/unmap per upload)
-                MemoryUtil.memCopy(MemoryUtil.memAddress(vtxUpload), persistentMappedPtr, dataSize);
+                // Upload vertex data via persistently mapped pointer (zero-overhead)
+                MemoryUtil.memCopy(MemoryUtil.memAddress(vtxRaw), persistentMappedPtr, dataSize);
 
-                // Notify RT pipeline about terrain mesh uploads for BLAS construction.
-                // Terrain uses BLOCK format (has UV2 lightmap), distinguishing it from
-                // clouds (no UV2), GUI, sky, etc.
+                // Notify RT pipeline about terrain mesh uploads for BLAS construction
                 if (vulkanium$isTerrainFormat(this.format)) {
                     Vulkanium.notifyChunkMeshUploaded(vkVertexBuffer, persistentVertexCount,
                             this.format.getVertexSize(), dataSize);
                 }
+            }
+            // For index-only uploads (re-sorts), vertex buffer is preserved as-is.
 
-                // Vertex-only uploads are common while moving.
-                // Keep an existing uploaded index buffer when metadata is still compatible,
-                // otherwise drop it and fall back to generated indices for safety.
-                if (this.persistentSequentialIndex && vkIndexBuffer != VK_NULL_HANDLE) {
-                    if (VULKANIUM$DEBUG_TRANSLUCENT && vulkanium$isTerrainFormat(this.format)) {
-                        VULKANIUM$LOGGER.info(
-                                "[UPLOAD-IB0] action=drop reason=sequential-index drawStateIdxCount={} persistentIdxCount={} idxType={}",
-                                this.indexCount,
-                                this.persistentIndexCount,
-                                (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"));
-                    }
+            // ── Index buffer handling ──────────────────────────────────────
+            if (hasIndexData && this.indexCount > 0) {
+                // Vanilla provided custom sorted indices (initial build or re-sort).
+                // Upload them directly — this is the primary path for translucent terrain.
+                vulkanium$uploadPersistentIndex(idxRaw);
+                this.persistentSequentialIndex = false;
+            } else if (this.persistentSequentialIndex) {
+                // Sequential indexing (opaque terrain): no custom sorted indices needed.
+                // Drop any stale sorted index buffer from a previous translucent upload
+                // (can happen if the same VertexBuffer object is reused between render types).
+                if (vkIndexBuffer != VK_NULL_HANDLE) {
                     Vulkanium.deferBufferFree(vkIndexBuffer, vkIndexAllocation,
                             persistentIndexBufferSize, 0);
                     vkIndexBuffer = VK_NULL_HANDLE;
                     vkIndexAllocation = 0;
                     persistentIndexBufferSize = 0;
-                    persistentIndexCount = 0;
-                } else if ((idxUpload == null || idxUpload.remaining() <= 0) && vkIndexBuffer != VK_NULL_HANDLE) {
-                    int expectedVkType = (this.indexType == VertexFormat.IndexType.INT)
-                        ? VK_INDEX_TYPE_UINT32
-                        : VK_INDEX_TYPE_UINT16;
-                    boolean indexMetaChanged = (this.indexCount != this.persistentIndexCount)
-                        || (expectedVkType != this.persistentIndexVkType);
-                    if (indexMetaChanged) {
-                    if (VULKANIUM$DEBUG_TRANSLUCENT && vulkanium$isTerrainFormat(this.format)) {
-                        VULKANIUM$LOGGER.info(
-                                "[UPLOAD-IB0] action=drop reason=meta-changed drawStateIdxCount={} persistentIdxCount={} drawStateType={} persistentType={}",
-                                this.indexCount,
-                                this.persistentIndexCount,
-                                (expectedVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
-                                (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"));
-                    }
-                    Vulkanium.deferBufferFree(vkIndexBuffer, vkIndexAllocation,
-                        persistentIndexBufferSize, 0);
-                    vkIndexBuffer = VK_NULL_HANDLE;
-                    vkIndexAllocation = 0;
-                    persistentIndexBufferSize = 0;
-                    persistentIndexCount = 0;
-                    } else if (VULKANIUM$DEBUG_TRANSLUCENT && vulkanium$isTerrainFormat(this.format)) {
-                        VULKANIUM$LOGGER.info(
-                                "[UPLOAD-IB0] action=keep drawStateIdxCount={} persistentIdxCount={} idxType={}",
-                                this.indexCount,
-                                this.persistentIndexCount,
-                                (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"));
-                    }
-                } else if ((idxUpload == null || idxUpload.remaining() <= 0)
-                        && VULKANIUM$DEBUG_TRANSLUCENT
-                        && vulkanium$isTerrainFormat(this.format)) {
-                    VULKANIUM$LOGGER.info(
-                            "[UPLOAD-IB0] action=none drawStateIdxCount={} persistentIdxCount=0 idxType={}",
-                            this.indexCount,
-                            (this.indexType == VertexFormat.IndexType.INT ? "u32" : "u16"));
                 }
-            }
-
-            if (idxUpload != null && idxUpload.remaining() > 0 && this.indexCount > 0) {
-                // Vanilla provided custom sorted indices (translucent re-sort) — use them
-                vulkanium$uploadPersistentIndex(idxUpload);
-                this.persistentSequentialIndex = false;
-            } else if (this.persistentSequentialIndex
+                // Auto-index buffers will be used at draw time
+                this.persistentIndexCount = this.indexCount;
+            } else if (!hasIndexData && hasVertexData
                     && this.mode == VertexFormat.Mode.QUADS
                     && vulkanium$isTerrainFormat(this.format)
-                    && Vulkanium.isActiveTerrainLayerTranslucent()
-                    && vtxUpload != null && vtxUpload.remaining() > 0) {
-                // Translucent terrain QUADS with sequential indexing: vanilla didn't
-                // provide sorted indices. Generate CPU-sorted indices ourselves
-                // (like VulkanMod's putSortedQuadIndices) to ensure correct
-                // back-to-front alpha blending order for water.
-                vtxUpload.rewind(); // rewind since memCopy already consumed it
-                vulkanium$generateSortedQuadIndices(vtxUpload, this.persistentVertexCount, this.format.getVertexSize());
-            } else if (this.persistentSequentialIndex) {
-                // Non-translucent sequential: use global auto-index buffers at draw time.
-                this.persistentIndexCount = this.indexCount;
+                    && this.vkVertexBuffer != VK_NULL_HANDLE) {
+                // Edge case: non-sequential QUADS terrain with no index data provided.
+                // This shouldn't normally happen for translucent (vanilla always sorts),
+                // but as a safety fallback, generate CPU-sorted indices if we're in
+                // a translucent layer, or fall back to auto-index.
+                if (Vulkanium.isActiveTerrainLayerTranslucent()) {
+                    vtxRaw.rewind();
+                    vulkanium$generateSortedQuadIndices(vtxRaw, this.persistentVertexCount,
+                            this.format.getVertexSize());
+                } else {
+                    // Non-translucent, non-sequential, no index data: use auto-index
+                    this.persistentIndexCount = this.indexCount;
+                    this.persistentSequentialIndex = true;
+                }
             }
+            // else: keep existing index buffer (e.g., index-only re-sort already handled)
 
             if (VULKANIUM$DEBUG_TRANSLUCENT && vulkanium$isTerrainFormat(this.format)) {
-                int vbBytes = vtxUpload != null ? vtxUpload.remaining() : 0;
-                int ibBytes = idxUpload != null ? idxUpload.remaining() : 0;
                 VULKANIUM$LOGGER.info(
-                        "[UPLOAD] mode={} terrain={} vbBytes={} ibBytes={} vtxCount={} idxCount(drawState={}/persistent={}) idxType={} hasVB={} hasIB={}",
+                        "[UPLOAD] mode={} hasVtx={} hasIdx={} vtxCount={} idxCount(draw={}/persist={}) idxType={} seq={} hasVB={} hasIB={}",
                         this.mode,
-                        true,
-                        vbBytes,
-                        ibBytes,
+                        hasVertexData,
+                        hasIndexData,
                         this.persistentVertexCount,
                         this.indexCount,
                         this.persistentIndexCount,
                         (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
+                        this.persistentSequentialIndex,
                         this.vkVertexBuffer != VK_NULL_HANDLE,
                         this.vkIndexBuffer != VK_NULL_HANDLE);
-            }
-
-            if ((VULKANIUM$DEBUG_TRANSLUCENT || VULKANIUM$DEBUG_WATER) && vulkanium$isTerrainFormat(this.format)) {
-                int vbBytes = vtxUpload != null ? vtxUpload.remaining() : 0;
-                int ibBytes = idxUpload != null ? idxUpload.remaining() : 0;
-                if (this.mode == VertexFormat.Mode.QUADS) {
-                    VULKANIUM$LOGGER.info(
-                            "[WATER-UPLOAD] mode={} vbBytes={} ibBytes={} drawStateVtxCount={} drawStateIdxCount={} persistentVtxCount={} persistentIdxCount={} idxType={} hasVB={} hasIB={}",
-                            this.mode,
-                            vbBytes,
-                            ibBytes,
-                            drawState.vertexCount(),
-                            this.indexCount,
-                            this.persistentVertexCount,
-                            this.persistentIndexCount,
-                            (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
-                            this.vkVertexBuffer != VK_NULL_HANDLE,
-                            this.vkIndexBuffer != VK_NULL_HANDLE);
-                }
             }
         } finally {
             buffer.release(); // Must release since we're cancelling vanilla's upload_() which does this

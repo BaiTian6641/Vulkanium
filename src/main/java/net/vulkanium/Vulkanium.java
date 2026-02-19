@@ -1201,9 +1201,9 @@ public class Vulkanium implements ClientModInitializer {
         boolean depth = net.vulkanium.compat.VRenderSystem.isDepthTestEnabled();
         boolean depthWrite = net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled();
         boolean cull = net.vulkanium.compat.VRenderSystem.isCullEnabled();
-        if (blend && isTerrainLikeFormat(format) && isActiveTerrainLayerTranslucent()) {
-            depthWrite = false;
-        }
+        // Match vanilla: translucent terrain uses depth-write as set by RenderType.setupRenderState().
+        // Previously we suppressed depth-write here, but that caused dark rectangular
+        // patches on water during movement (incorrect alpha accumulation).
         int topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // Quads use indexed triangles
 
         int srcColorVk = net.vulkanium.compat.VRenderSystem.glToVkBlendFactor(
@@ -1386,9 +1386,9 @@ public class Vulkanium implements ClientModInitializer {
         boolean depth = VRenderSystem.isDepthTestEnabled();
         boolean depthWrite = VRenderSystem.isDepthWriteEnabled();
         boolean cull = VRenderSystem.isCullEnabled();
-        if (blend && isTerrainLikeFormat(format) && isActiveTerrainLayerTranslucent()) {
-            depthWrite = false;
-        }
+        // Match vanilla: translucent terrain uses depth-write as set by RenderType.setupRenderState().
+        // Previously we suppressed depth-write here, but that caused dark rectangular
+        // patches on water during movement (incorrect alpha accumulation).
         String currentShaderName = VRenderSystem.getCurrentShaderName();
         boolean isWaterDraw = isTerrainLikeFormat(format)
                 && (isActiveTerrainLayerTranslucent()
