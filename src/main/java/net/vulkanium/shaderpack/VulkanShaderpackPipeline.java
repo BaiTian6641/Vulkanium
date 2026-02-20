@@ -16,6 +16,9 @@ import net.vulkanium.render.shader.VulkaniumGlslTransformer.PassType;
 import net.vulkanium.render.texture.VulkanTexture;
 import net.vulkanium.resource.RenderTarget;
 import net.vulkanium.core.VulkaniumCommand;
+import net.vulkanium.shaderpack.compute.ShaderpackComputeManager;
+import net.vulkanium.shaderpack.compute.ShaderpackSSBOManager;
+import net.vulkanium.shaderpack.compute.ShaderpackImageManager;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
 import org.lwjgl.vulkan.*;
@@ -218,6 +221,25 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
     /** Per-target format/clear settings parsed from shaderpack source. */
     private RenderTargetSettings renderTargetSettings;
+
+    /**
+     * Compute shader dispatch manager. Creates VkPipelines for .csh programs
+     * and dispatches them via vkCmdDispatch.
+     * <p>Reference: Iris ComputeProgram/ComputeRenderer (Iris Shaders, LGPL-3.0)</p>
+     */
+    private ShaderpackComputeManager computeManager;
+
+    /**
+     * SSBO manager. Creates VMA-backed VkBuffers for shaderpack storage buffers.
+     * <p>Reference: Iris ShaderStorageBufferHolder (Iris Shaders, LGPL-3.0)</p>
+     */
+    private ShaderpackSSBOManager ssboManager;
+
+    /**
+     * Custom image manager. Creates VMA-backed VkImages for shaderpack storage images.
+     * <p>Reference: Iris IrisImages/GlImage (Iris Shaders, LGPL-3.0)</p>
+     */
+    private ShaderpackImageManager imageManager;
 
     /** Cached MRT pipelines: keyed by ProgramId + attachment count to match MRT render pass. */
     private final Map<String, BasicPipeline> mrtPipelines = new HashMap<>();
@@ -480,6 +502,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     LoadProgress.Phase.TRANSFORMING, null,
                     "Preparing shader compilation...", 0, totalPrograms, progressSnapshot(allResults)));
 
+            // ── Phase 4b: Initialize compute/SSBO/image managers ──
+            // Must happen before compilation so registerComputeProgram() is available.
+            // Reference: Iris ComputeRenderer initialization (Iris Shaders, LGPL-3.0)
+            initializeComputeInfrastructure();
+
             // ── Phase 5: Compile all programs through the full pipeline ──
             LOGGER.info("[LOAD] ──── Phase 5: Compiling GLSL → Preprocess → Transform → SPIR-V ────");
             reportProgress(new LoadProgress(
@@ -586,6 +613,68 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         shaderModuleManager.setTranslatedCacheNamespace(packName);
         shaderModuleManager.createFallbacks();
         LOGGER.info("[LOAD]   ShaderModuleManager initialized with fallback shaders");
+    }
+
+    /**
+     * Initializes compute shader infrastructure: ShaderpackComputeManager, SSBOManager, ImageManager.
+     *
+     * <p>Reference: Iris CompositeRenderer initialization (Iris Shaders, LGPL-3.0)
+     * sets up ComputeProgram instances, ShaderStorageBufferHolder, and image bindings
+     * during pipeline construction. This Vulkan implementation mirrors that with
+     * VkPipeline-based compute dispatch, VMA storage buffers, and VMA storage images.</p>
+     */
+    private void initializeComputeInfrastructure() {
+        try {
+            // Initialize compute manager (pipeline layout + descriptor set layout)
+            computeManager = new ShaderpackComputeManager();
+            computeManager.initialize();
+            LOGGER.info("[LOAD]   ShaderpackComputeManager initialized");
+
+            // Initialize SSBO manager and register any declared SSBOs
+            long vmaAllocator = Vulkanium.getVulkanMemory().getAllocator();
+            ssboManager = new ShaderpackSSBOManager(vmaAllocator);
+            if (properties != null && properties.hasSSBOs()) {
+                for (Map.Entry<Integer, String> entry : properties.getSSBODeclarations().entrySet()) {
+                    ShaderpackSSBOManager.SSBOInfo info =
+                            ShaderpackSSBOManager.parseSSBODeclaration(
+                                    "bufferObject." + entry.getKey(), entry.getValue());
+                    if (info != null) {
+                        ssboManager.registerSSBO(entry.getKey(), info);
+                    }
+                }
+                // Create buffers at current screen dimensions
+                int w = net.minecraft.client.Minecraft.getInstance().getWindow().getWidth();
+                int h = net.minecraft.client.Minecraft.getInstance().getWindow().getHeight();
+                if (w > 0 && h > 0) {
+                    ssboManager.createBuffers(w, h);
+                }
+                LOGGER.info("[LOAD]   ShaderpackSSBOManager: {} SSBOs registered", properties.getSSBODeclarations().size());
+            }
+
+            // Initialize custom image manager and register any declared images
+            imageManager = new ShaderpackImageManager(vmaAllocator);
+            if (properties != null && properties.hasCustomImages()) {
+                for (Map.Entry<String, String> entry : properties.getImageDeclarations().entrySet()) {
+                    ShaderpackImageManager.ImageInfo info =
+                            ShaderpackImageManager.parseImageDeclaration(entry.getKey(), entry.getValue());
+                    if (info != null) {
+                        imageManager.registerImage(info);
+                    }
+                }
+                // Create images at current screen dimensions
+                int w = net.minecraft.client.Minecraft.getInstance().getWindow().getWidth();
+                int h = net.minecraft.client.Minecraft.getInstance().getWindow().getHeight();
+                if (w > 0 && h > 0) {
+                    imageManager.createImages(w, h);
+                }
+                LOGGER.info("[LOAD]   ShaderpackImageManager: {} custom images registered",
+                        properties.getImageDeclarations().size());
+            }
+        } catch (Exception e) {
+            LOGGER.warn("[LOAD]   Compute infrastructure initialization failed (compute shaders will be disabled): {}",
+                    e.getMessage());
+            LOGGER.debug("[LOAD]   Stack trace:", e);
+        }
     }
 
     /**
@@ -753,10 +842,26 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
 
                     if (module != 0) {
-                        pipelines.put(id, 0L);
+                        // Register with compute manager to create a real VkPipeline
+                        if (computeManager != null && computeManager.isInitialized()) {
+                            ShaderpackComputeManager.ComputeProgramInfo info =
+                                    computeManager.registerComputeProgram(programName, module);
+                            if (info != null && info.pipeline != VK_NULL_HANDLE) {
+                                pipelines.put(id, info.pipeline);
+                                LOGGER.info("[COMPILE] ✓ {} — compute OK (module=0x{}, pipeline=0x{}) [{}ms]",
+                                        programName, Long.toHexString(module),
+                                        Long.toHexString(info.pipeline), elapsedMs);
+                            } else {
+                                pipelines.put(id, 0L);
+                                LOGGER.warn("[COMPILE] ⚠ {} — compute module OK but pipeline creation failed [{}ms]",
+                                        programName, elapsedMs);
+                            }
+                        } else {
+                            pipelines.put(id, 0L);
+                            LOGGER.info("[COMPILE] ✓ {} — compute OK (module=0x{}, no compute manager) [{}ms]",
+                                    programName, Long.toHexString(module), elapsedMs);
+                        }
                         compiled++;
-                        LOGGER.info("[COMPILE] ✓ {} — compute OK (module=0x{}) [{}ms]",
-                                programName, Long.toHexString(module), elapsedMs);
                         results.add(new ProgramResult(programName, true, false, false, null, elapsedMs));
                     } else {
                         LOGGER.error("[COMPILE] ✗ {} — compute compilation failed [{}ms]", programName, elapsedMs);
@@ -916,6 +1021,21 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             gbufferManager = null;
         }
         renderTargetSettings = null;
+
+        // Destroy compute infrastructure
+        // Reference: Iris CompositeRenderer cleanup (Iris Shaders, LGPL-3.0)
+        if (computeManager != null) {
+            computeManager.destroy();
+            computeManager = null;
+        }
+        if (ssboManager != null) {
+            ssboManager.destroy();
+            ssboManager = null;
+        }
+        if (imageManager != null) {
+            imageManager.destroy();
+            imageManager = null;
+        }
 
         for (BasicPipeline mrtP : mrtPipelines.values()) {
             if (mrtP != null) mrtP.destroy();
@@ -1267,8 +1387,75 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
         int executed = 0;
         int skipped = 0;
+        int computeDispatched = 0;
 
         for (ProgramId programId : FULLSCREEN_PASS_ORDER) {
+            String programName = programId.getSourceName();
+
+            // ── Compute dispatch: if this pass has a .csh, dispatch it before the fragment pass ──
+            // Reference: Iris CompositeRenderer (Iris Shaders, LGPL-3.0) dispatches each
+            // pass's compute programs, then glMemoryBarrier, then renders the fragment pass.
+            boolean hasCompute = computeManager != null && computeManager.isInitialized()
+                    && computeManager.hasComputeProgram(programName);
+            if (hasCompute && FULLSCREEN_COMPAT_MODE == FullscreenCompatMode.FULL) {
+                try {
+                    // Upload uniforms for compute dispatch
+                    int computeUboOffset = drawBatcher.uploadUniformsShaderpack(
+                            frameIndex, modelView, modelViewInv, projection, projectionInv,
+                            colorMod, fogParams, texMat, chunkOffset
+                    );
+
+                    // Allocate and update compute descriptor set
+                    long computeDescSet = computeManager.allocateComputeDescriptorSet();
+                    if (computeDescSet != VK_NULL_HANDLE) {
+                        // Build sampler/image/SSBO arrays for compute descriptor update
+                        int maxTex = ShaderpackComputeManager.MAX_SAMPLERS;
+                        long[] compViews = new long[maxTex];
+                        long[] compSamplers = new long[maxTex];
+                        fillFullscreenSamplerBindings(compViews, compSamplers, placeholderView, placeholderSampler);
+
+                        // Storage images (colorimgN from G-buffer targets + custom images)
+                        long[] storageImageViews = new long[ShaderpackComputeManager.MAX_STORAGE_IMAGES];
+                        Arrays.fill(storageImageViews, VK_NULL_HANDLE);
+                        if (fsTargets != null) {
+                            for (int i = 0; i < Math.min(storageImageViews.length,
+                                    FullscreenRenderTargets.MAX_COLOR_TARGETS); i++) {
+                                RenderTarget rt = fsTargets.getReadTarget(i);
+                                if (rt != null && rt.getImageView() != VK_NULL_HANDLE) {
+                                    storageImageViews[i] = rt.getImageView();
+                                }
+                            }
+                        }
+
+                        // SSBO buffers
+                        long[] ssboBuffers = ssboManager != null ? ssboManager.getAllBuffers() : new long[0];
+                        long[] ssboSizes = ssboManager != null ? ssboManager.getAllSizes() : new long[0];
+
+                        long uboBuffer = drawBatcher.getUniformBuffer(frameIndex);
+                        long uboRange = (long) drawBatcher.getUniformBufferRange();
+                        computeManager.updateComputeDescriptorSet(computeDescSet,
+                                uboBuffer, 0L, uboRange,
+                                compViews, compSamplers,
+                                storageImageViews,
+                                ssboBuffers, ssboSizes);
+
+                        // Set screen dimensions for workgroup calculation
+                        computeManager.setScreenDimensions(width, height);
+
+                        // Dispatch compute
+                        computeManager.dispatch(cmd, programName, computeDescSet, computeUboOffset);
+
+                        // Pipeline barrier: compute write → fragment read
+                        computeManager.recordComputeToFragmentBarrier(cmd);
+                        computeDispatched++;
+                    }
+                } catch (Exception e) {
+                    LOGGER.warn("[FULLSCREEN] Compute dispatch failed for '{}': {}", programName, e.getMessage());
+                    LOGGER.debug("[FULLSCREEN]   Stack trace:", e);
+                }
+            }
+
+            // ── Fragment pass: standard fullscreen triangle rendering ──
             CompiledProgram program = compiledPrograms.get(programId);
             if (program == null || program.vertexModule == 0 || program.fragmentModule == 0) continue;
 
@@ -1380,8 +1567,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
 
         if (executed > 0 && !loggedFullscreenExecution) {
-            LOGGER.info("[FULLSCREEN] Executed {} deferred/composite/final passes (mode={}, skipped={}, blit={})",
+            LOGGER.info("[FULLSCREEN] Executed {} deferred/composite/final passes (mode={}, skipped={}, compute={}, blit={})",
                     executed, FULLSCREEN_COMPAT_MODE.name().toLowerCase(Locale.ROOT), skipped,
+                    computeDispatched,
                     mrtGbuffersAvailable ? "enabled (MRT G-buffer active)" : "disabled (no MRT gbuffers)");
             if (!mrtGbuffersAvailable) {
                 LOGGER.info("[FULLSCREEN] Blit disabled: colortex1-7 are empty without MRT gbuffers. "

@@ -47,6 +47,24 @@ public class ShaderpackProperties {
     /** Profile definitions (from "profile.NAME=OPTION1=VALUE1 OPTION2=VALUE2") */
     private final Map<String, Map<String, String>> profiles = new LinkedHashMap<>();
 
+    /**
+     * SSBO declarations from "bufferObject.N = size [relative scaleX scaleY]".
+     * <p>Reference: Iris ShaderProperties SSBO parsing (Iris Shaders, LGPL-3.0)</p>
+     */
+    private final Map<Integer, String> ssboDeclarations = new LinkedHashMap<>();
+
+    /**
+     * Custom image declarations from "image.NAME = samplerName format ...".
+     * <p>Reference: Iris ShaderProperties image parsing (Iris Shaders, LGPL-3.0)</p>
+     */
+    private final Map<String, String> imageDeclarations = new LinkedHashMap<>();
+
+    /**
+     * Indirect dispatch pointers from "indirectDispatch.PROGRAM = ssboIndex offset".
+     * <p>Reference: Iris ShaderProperties IndirectPointer parsing (Iris Shaders, LGPL-3.0)</p>
+     */
+    private final Map<String, int[]> indirectPointers = new LinkedHashMap<>();
+
     // ── Preprocessor condition matching ──
     private static final Pattern IF_DEFINE_EQ = Pattern.compile(
             "#if\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*==\\s*(-?\\d+)");
@@ -296,6 +314,33 @@ public class ShaderpackProperties {
             }
             profiles.put(profileName, profileValues);
         }
+        // SSBO declarations: bufferObject.N = size [relative scaleX scaleY]
+        // Reference: Iris ShaderProperties (Iris Shaders, LGPL-3.0)
+        else if (key.startsWith("bufferObject.")) {
+            try {
+                int index = Integer.parseInt(key.substring(13));
+                ssboDeclarations.put(index, value);
+            } catch (NumberFormatException ignored) {}
+        }
+        // Custom image declarations: image.NAME = samplerName format ...
+        // Reference: Iris ShaderProperties (Iris Shaders, LGPL-3.0)
+        else if (key.startsWith("image.")) {
+            String imageName = key.substring(6);
+            imageDeclarations.put(imageName, value);
+        }
+        // Indirect dispatch pointers: indirectDispatch.PROGRAM = ssboIndex offset
+        // Reference: Iris ShaderProperties (Iris Shaders, LGPL-3.0)
+        else if (key.startsWith("indirectDispatch.")) {
+            String programName = key.substring(17);
+            String[] parts = value.trim().split("\\s+");
+            if (parts.length >= 2) {
+                try {
+                    int ssboIndex = Integer.parseInt(parts[0]);
+                    int offset = Integer.parseInt(parts[1]);
+                    indirectPointers.put(programName, new int[]{ssboIndex, offset});
+                } catch (NumberFormatException ignored) {}
+            }
+        }
     }
 
     private static List<String> parseWhitespacedList(String value) {
@@ -427,4 +472,30 @@ public class ShaderpackProperties {
 
     /** Profile definitions keyed by profile name. Each profile maps option names to values. */
     public Map<String, Map<String, String>> getProfiles() { return Collections.unmodifiableMap(profiles); }
+
+    // ─── SSBO / Custom Image / Indirect Dispatch ──────────────────────────
+
+    /**
+     * SSBO declarations: index → raw value string.
+     * <p>Reference: Iris ShaderProperties (Iris Shaders, LGPL-3.0)</p>
+     */
+    public Map<Integer, String> getSSBODeclarations() { return Collections.unmodifiableMap(ssboDeclarations); }
+
+    /**
+     * Custom image declarations: name → raw value string.
+     * <p>Reference: Iris ShaderProperties (Iris Shaders, LGPL-3.0)</p>
+     */
+    public Map<String, String> getImageDeclarations() { return Collections.unmodifiableMap(imageDeclarations); }
+
+    /**
+     * Indirect dispatch pointers: program name → {ssboIndex, offset}.
+     * <p>Reference: Iris ShaderProperties (Iris Shaders, LGPL-3.0)</p>
+     */
+    public Map<String, int[]> getIndirectPointers() { return Collections.unmodifiableMap(indirectPointers); }
+
+    /** Whether any SSBOs are declared. */
+    public boolean hasSSBOs() { return !ssboDeclarations.isEmpty(); }
+
+    /** Whether any custom images are declared. */
+    public boolean hasCustomImages() { return !imageDeclarations.isEmpty(); }
 }

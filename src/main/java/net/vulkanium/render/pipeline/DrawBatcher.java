@@ -681,6 +681,12 @@ public class DrawBatcher {
     public long getVertexBuffer(int frameIndex) { return vertexBuffers[frameIndex]; }
     public void advanceVertexOffset(int frameIndex, int bytes) { vertexOffsets[frameIndex] += bytes; }
 
+    /** Returns the VkBuffer handle for the per-frame uniform buffer. */
+    public long getUniformBuffer(int frameIndex) { return uniformBuffers[frameIndex]; }
+
+    /** Returns the range (in bytes) of a single shaderpack UBO upload. */
+    public int getUniformBufferRange() { return SHADERPACK_UBO_SIZE; }
+
     private static int align(int value, int alignment) {
         return (value + alignment - 1) & ~(alignment - 1);
     }

@@ -48,30 +48,33 @@ public enum FeatureFlags {
     /**
      * Custom image textures (image load/store) for compute shaders.
      * <p>Iris reference: {@code CUSTOM_IMAGES} — requires {@code GL_ARB_shader_image_load_store}.
-     * Vulkanium equivalent: requires VkImage + storage image descriptors + compute pipeline.</p>
+     * Vulkanium: Implemented via VkImage (VK_IMAGE_USAGE_STORAGE_BIT) + storage image
+     * descriptors in compute pipeline. Managed by {@link net.vulkanium.shaderpack.compute.ShaderpackImageManager}.</p>
      */
-    CUSTOM_IMAGES(false),
+    CUSTOM_IMAGES(true),
 
     /**
      * Compute shader dispatch support.
      * <p>Iris reference: {@code COMPUTE_SHADERS} — requires {@code glDispatchCompute}.
-     * Vulkanium equivalent: requires {@code vkCmdDispatch} + compute pipeline layout.</p>
+     * Vulkanium: Implemented via {@code vkCmdDispatch} + compute pipeline layout.
+     * Managed by {@link net.vulkanium.shaderpack.compute.ShaderpackComputeManager}.</p>
      */
-    COMPUTE_SHADERS(false),
+    COMPUTE_SHADERS(true),
 
     /**
      * Tessellation shader stages (hull + domain).
      * <p>Iris reference: {@code TESSELLATION_SHADERS} — requires {@code GL_ARB_tessellation_shader}.
-     * Vulkanium equivalent: requires VkPipeline tessellation state.</p>
+     * Vulkanium equivalent: requires VkPipeline tessellation state. NOT YET IMPLEMENTED.</p>
      */
     TESSELLATION_SHADERS(false),
 
     /**
      * Shader Storage Buffer Objects.
      * <p>Iris reference: {@code SSBO} — requires {@code GL_ARB_shader_storage_buffer_object}.
-     * Vulkanium equivalent: requires VkBuffer with storage buffer usage + descriptors.</p>
+     * Vulkanium: Implemented via VMA-backed VkBuffer (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+     * + storage buffer descriptors. Managed by {@link net.vulkanium.shaderpack.compute.ShaderpackSSBOManager}.</p>
      */
-    SSBO(false),
+    SSBO(true),
 
     /** Placeholder for unrecognized feature names. */
     UNKNOWN(false);
