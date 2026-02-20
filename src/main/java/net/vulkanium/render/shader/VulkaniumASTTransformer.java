@@ -290,15 +290,19 @@ public class VulkaniumASTTransformer {
     //  Vertex decode preambles (injected as external declarations)
     // ═══════════════════════════════════════════════════════════════
 
+    // UV.y is flipped (0.5 - y*0.5) to account for Vulkan's top-down texture layout.
+    // The function returns vec4(x, -y, ...) so that shaders computing UV from
+    // gl_Vertex.xy * 0.5 + 0.5 also get the correct flipped V coordinate.
+    // vkm_composite_ClipPos retains real Y for the Y-flipped viewport.
     private static final String COMPOSITE_VERTEX_PREAMBLE = """
             vec2 vkm_composite_TexCoord;
             vec4 vkm_composite_ClipPos;
             vec4 vkm_composite_Position() {
                 float x = -1.0 + float((gl_VertexIndex & 1) << 2);
                 float y = -1.0 + float((gl_VertexIndex & 2) << 1);
-                vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
+                vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, 0.5 - y * 0.5);
                 vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
-                return vkm_composite_ClipPos;
+                return vec4(x, -y, 0.0, 1.0);
             }
             """;
 
@@ -655,32 +659,42 @@ public class VulkaniumASTTransformer {
                 tree.prependMainFunctionBody(transformer, "vkm_decodeVertex();");
                 remap = TERRAIN_VERTEX_REMAP;
 
-                // Inject Vulkan clip-space fix (Y-flip compensation)
+                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.y = -gl_Position.y;");
+                tree.appendMainFunctionBody(transformer,
+                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
             case ENTITY, HAND -> {
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
 
-                // Inject Vulkan clip-space fix
+                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.y = -gl_Position.y;");
+                tree.appendMainFunctionBody(transformer,
+                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
             case SKY -> {
                 // Sky uses position + optional UV — entity-like format
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
 
+                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.y = -gl_Position.y;");
+                tree.appendMainFunctionBody(transformer,
+                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
             case PARTICLE -> {
                 injectCodeBlock(tree, PARTICLE_VERTEX_INPUTS);
                 remap = PARTICLE_VERTEX_REMAP;
 
+                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.y = -gl_Position.y;");
+                tree.appendMainFunctionBody(transformer,
+                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
             default -> {
                 remap = Collections.emptyMap();

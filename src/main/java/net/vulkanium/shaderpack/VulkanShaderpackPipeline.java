@@ -453,10 +453,17 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 ? new HashMap<>(opts.shader.shaderpackOptionOverrides)
                 : Collections.emptyMap();
 
+            // Scan shader source for option defaults (e.g. #define SKYBOX_RESOLUTION 64 // [48 64 96 ...])
+            // These defaults are needed so that shaders.properties #if conditionals can be
+            // evaluated correctly even when the user hasn't explicitly overridden a value.
+            Map<String, String> optionDefaults = source.scanOptionDefaults();
+            Map<String, String> mergedDefines = new HashMap<>(optionDefaults);
+            mergedDefines.putAll(optionOverrides); // user overrides take precedence
+
             properties = new ShaderpackProperties();
             String propsContent = source.readProperties();
             if (propsContent != null) {
-                properties.parse(propsContent, optionOverrides);
+                properties.parse(propsContent, mergedDefines);
                 LOGGER.info("[LOAD]   shaders.properties: {} entries parsed", properties.getAll().size());
                 LOGGER.info("[LOAD]   Shadow resolution: {}x{}", properties.getShadowResolution(), properties.getShadowResolution());
                 LOGGER.info("[LOAD]   Cloud setting: {}", properties.getCloudSetting());
@@ -666,9 +673,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             // Initialize custom image manager and register any declared images
             imageManager = new ShaderpackImageManager(vmaAllocator);
             if (properties != null && properties.hasCustomImages()) {
+                Map<String, String> defines = properties.getActiveDefines();
                 for (Map.Entry<String, String> entry : properties.getImageDeclarations().entrySet()) {
                     ShaderpackImageManager.ImageInfo info =
-                            ShaderpackImageManager.parseImageDeclaration(entry.getKey(), entry.getValue());
+                            ShaderpackImageManager.parseImageDeclaration(entry.getKey(), entry.getValue(), defines);
                     if (info != null) {
                         imageManager.registerImage(info);
                     }

@@ -435,6 +435,15 @@ public class ShaderpackImageManager {
      * <p>Reference: Iris ShaderProperties image parsing (Iris Shaders, LGPL-3.0)</p>
      */
     public static ImageInfo parseImageDeclaration(String name, String value) {
+        return parseImageDeclaration(name, value, null);
+    }
+
+    /**
+     * Parses a custom image declaration, resolving macro tokens from the
+     * provided defines map (e.g. {@code SKYBOX_RESOLUTION_X → 192}).
+     */
+    public static ImageInfo parseImageDeclaration(String name, String value,
+                                                   Map<String, String> defines) {
         if (value == null || value.isBlank()) return null;
 
         String[] parts = value.trim().split("\\s+");
@@ -454,9 +463,9 @@ public class ShaderpackImageManager {
                 relW = Float.parseFloat(parts[6]);
                 relH = Float.parseFloat(parts[7]);
             } else if (!relative && parts.length >= 7) {
-                width = Integer.parseInt(parts[6]);
-                height = parts.length >= 8 ? Integer.parseInt(parts[7]) : 0;
-                depth = parts.length >= 9 ? Integer.parseInt(parts[8]) : 0;
+                width = resolveIntToken(parts[6], defines);
+                height = parts.length >= 8 ? resolveIntToken(parts[7], defines) : 0;
+                depth = parts.length >= 9 ? resolveIntToken(parts[8], defines) : 0;
             }
 
             return new ImageInfo(name, samplerName, vkFormat,
@@ -464,6 +473,30 @@ public class ShaderpackImageManager {
         } catch (Exception e) {
             LOGGER.warn("Invalid image declaration: {} = {}", name, value);
             return null;
+        }
+    }
+
+    /**
+     * Attempts to parse a token as an integer.  If it fails, looks it up in the
+     * defines map (e.g. {@code SKYBOX_RESOLUTION_X → "192"}).
+     */
+    private static int resolveIntToken(String token, Map<String, String> defines) {
+        try {
+            return Integer.parseInt(token);
+        } catch (NumberFormatException e) {
+            if (defines != null) {
+                String resolved = defines.get(token);
+                if (resolved != null) {
+                    try {
+                        return Integer.parseInt(resolved.trim());
+                    } catch (NumberFormatException e2) {
+                        LOGGER.warn("Cannot resolve image dimension macro '{}' = '{}'", token, resolved);
+                    }
+                } else {
+                    LOGGER.warn("Unresolved image dimension macro '{}' (not in active defines)", token);
+                }
+            }
+            throw e; // re-throw to let caller handle
         }
     }
 }

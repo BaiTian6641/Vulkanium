@@ -2,6 +2,7 @@ package net.vulkanium.shaderpack;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.Map;
 
 /**
  * Abstraction over shaderpack source locations (folder or ZIP file).
@@ -58,6 +59,21 @@ public interface ShaderpackSource {
      * @throws IOException if reading fails
      */
     String readProperties() throws IOException;
+
+    /**
+     * Scans shader source files for option defaults.
+     *
+     * <p>Looks for {@code #define NAME VALUE // [choice1 choice2 ...]} patterns in
+     * all {@code .glsl}, {@code .vsh}, {@code .fsh}, {@code .csh}, {@code .gsh} files
+     * and returns a map of name → default value.  This is used to provide initial
+     * define values to the shaders.properties preprocessor so that conditionals
+     * like {@code #if SKYBOX_RESOLUTION == 64} can be evaluated correctly.</p>
+     *
+     * @return map of option name → default value string
+     */
+    default Map<String, String> scanOptionDefaults() {
+        return Map.of(); // default implementation returns empty
+    }
 
     /**
      * Creates a source from a directory path.

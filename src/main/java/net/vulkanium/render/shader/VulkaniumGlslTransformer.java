@@ -1590,6 +1590,12 @@ public class VulkaniumGlslTransformer {
         // preventing camera projection/modelview matrices from distorting
         // the triangle (those matrices stay available for the fragment
         // shader's gbufferProjection / gbufferModelView aliases).
+        // UV.y is flipped (0.5 - y*0.5 instead of y*0.5+0.5) because Vulkan's
+        // texture row 0 is at the TOP of the image, while OpenGL shaders expect
+        // UV(0,0) at the bottom-left.  The function returns vec4(x, -y, ...)
+        // so that shaders computing UV from gl_Vertex.xy * 0.5 + 0.5 also get
+        // the correct flipped V coordinate.  vkm_composite_ClipPos retains the
+        // original Y for the Y-flipped viewport used during composite rendering.
         String compute = """
                 // ── Vulkanium Composite Fullscreen Triangle ──
                 vec2 vkm_composite_TexCoord;
@@ -1597,9 +1603,9 @@ public class VulkaniumGlslTransformer {
                 vec4 vkm_composite_Position() {
                     float x = -1.0 + float((gl_VertexIndex & 1) << 2);
                     float y = -1.0 + float((gl_VertexIndex & 2) << 1);
-                    vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
+                    vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, 0.5 - y * 0.5);
                     vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
-                    return vkm_composite_ClipPos;
+                    return vec4(x, -y, 0.0, 1.0);
                 }
                 """;
 

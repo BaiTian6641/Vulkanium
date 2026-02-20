@@ -205,6 +205,27 @@ public class ShaderpackProperties {
                 continue;
             }
 
+            // Process #define directives in active branches — adds tokens to
+            // activeDefines so later #if conditions and property value macro
+            // substitution can reference them.
+            if (trimmed.startsWith("#define ")) {
+                if (conditionStack.isEmpty() || conditionStack.peek()) {
+                    String rest = trimmed.substring(8).trim();
+                    int sp = rest.indexOf(' ');
+                    if (sp > 0) {
+                        String defName = rest.substring(0, sp).trim();
+                        String defValue = rest.substring(sp + 1).trim();
+                        // Strip trailing comments: #define FOO 64 // [32 64 128]
+                        int commentIdx = defValue.indexOf("//");
+                        if (commentIdx >= 0) defValue = defValue.substring(0, commentIdx).trim();
+                        activeDefines.put(defName, defValue);
+                    } else {
+                        activeDefines.put(rest, "");
+                    }
+                }
+                continue;
+            }
+
             // Regular line — include if all enclosing conditions are true
             if (conditionStack.isEmpty() || conditionStack.peek()) {
                 result.add(line);
@@ -436,6 +457,15 @@ public class ShaderpackProperties {
      */
     public Map<String, String> getAll() {
         return Collections.unmodifiableMap(properties);
+    }
+
+    /**
+     * Returns the active preprocessor defines (from option overrides and #define
+     * directives processed during conditional evaluation).  Used by image/SSBO
+     * parsers to resolve macro tokens in property values.
+     */
+    public Map<String, String> getActiveDefines() {
+        return Collections.unmodifiableMap(activeDefines);
     }
 
     // ─── Screen layout accessors ───────────────────────────────────

@@ -10,6 +10,11 @@ import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 /**
  * Reads shader files from a ZIP archive.
@@ -95,5 +100,53 @@ class ZipShaderpackSource implements ShaderpackSource {
     @Override
     public String readProperties() throws IOException {
         return readShaderFile("shaders.properties");
+    }
+
+    private static final Pattern DEFINE_OPTION = Pattern.compile(
+            "^\\s*#\\s*define\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+([^\\s/]+).*?//\\s*\\[",
+            Pattern.MULTILINE);
+
+    @Override
+    public Map<String, String> scanOptionDefaults() {
+        Map<String, String> defaults = new HashMap<>();
+        try (FileSystem fs = FileSystems.newFileSystem(zipPath)) {
+            // Find the shaders directory (could be root/shaders or nested)
+            Path shadersDir = fs.getPath("shaders");
+            if (!Files.isDirectory(shadersDir)) {
+                // Check for nested structure
+                for (Path rootEntry : Files.newDirectoryStream(fs.getPath("/"))) {
+                    if (Files.isDirectory(rootEntry)) {
+                        Path nested = rootEntry.resolve("shaders");
+                        if (Files.isDirectory(nested)) {
+                            shadersDir = nested;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!Files.isDirectory(shadersDir)) return defaults;
+
+            try (Stream<Path> walk = Files.walk(shadersDir)) {
+                walk.filter(Files::isRegularFile)
+                    .filter(p -> {
+                        String name = p.getFileName().toString().toLowerCase();
+                        return name.endsWith(".glsl") || name.endsWith(".vsh")
+                            || name.endsWith(".fsh")  || name.endsWith(".csh")
+                            || name.endsWith(".gsh");
+                    })
+                    .forEach(p -> {
+                        try (InputStream is = Files.newInputStream(p)) {
+                            String content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                            Matcher m = DEFINE_OPTION.matcher(content);
+                            while (m.find()) {
+                                String key = m.group(1);
+                                String value = m.group(2).trim();
+                                defaults.putIfAbsent(key, value);
+                            }
+                        } catch (IOException ignored) {}
+                    });
+            }
+        } catch (IOException ignored) {}
+        return defaults;
     }
 }
