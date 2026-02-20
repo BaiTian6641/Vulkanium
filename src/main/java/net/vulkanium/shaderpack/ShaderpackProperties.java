@@ -1,6 +1,8 @@
 package net.vulkanium.shaderpack;
 
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Parsed representation of a shaderpack's {@code shaders.properties} file.
@@ -8,16 +10,13 @@ import java.util.*;
  * <p>This file controls which render targets are used, their formats,
  * clear colors, and various rendering options like shadow map resolution.</p>
  *
- * <h2>Key properties:</h2>
+ * <p>Supports:</p>
  * <ul>
- *   <li>{@code shadowResolution} — Shadow map resolution (e.g., 1024, 2048)</li>
- *   <li>{@code shadowDistance} — Shadow render distance</li>
- *   <li>{@code ambientOcclusionLevel} — AO strength</li>
- *   <li>{@code colortex0Format} through {@code colortex15Format} — Render target formats</li>
- *   <li>{@code shadowHardwareFiltering} — PCF shadow filtering</li>
- *   <li>{@code oldHandLight} — Use old-style held light behavior</li>
- *   <li>{@code dynamicHandLight} — Enable dynamic hand light</li>
- *   <li>{@code oldLighting} — Use Minecraft's old vanilla lighting model</li>
+ *   <li>Backslash line continuation (lines ending in {@code \})</li>
+ *   <li>{@code #if DEFINE == VALUE} / {@code #ifdef DEFINE} / {@code #ifndef DEFINE} /
+ *       {@code #else} / {@code #endif} preprocessor conditionals</li>
+ *   <li>{@code iris.features.required} / {@code iris.features.optional} parsing</li>
+ *   <li>Screen layout, slider, and profile directives</li>
  * </ul>
  */
 public class ShaderpackProperties {
@@ -39,38 +38,229 @@ public class ShaderpackProperties {
     /** Options that use slider widgets (from "sliders=OPTION1 OPTION2 ...") */
     private final Set<String> sliderOptions = new HashSet<>();
 
+    /** Required feature flags (from "iris.features.required=FEATURE1 FEATURE2") */
+    private final Set<String> requiredFeatures = new LinkedHashSet<>();
+
+    /** Optional feature flags (from "iris.features.optional=FEATURE1 FEATURE2") */
+    private final Set<String> optionalFeatures = new LinkedHashSet<>();
+
+    /** Profile definitions (from "profile.NAME=OPTION1=VALUE1 OPTION2=VALUE2") */
+    private final Map<String, Map<String, String>> profiles = new LinkedHashMap<>();
+
+    // ── Preprocessor condition matching ──
+    private static final Pattern IF_DEFINE_EQ = Pattern.compile(
+            "#if\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*==\\s*(-?\\d+)");
+    private static final Pattern IF_DEFINE_GT = Pattern.compile(
+            "#if\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*>\\s*(-?\\d+)");
+    private static final Pattern IF_DEFINE_LT = Pattern.compile(
+            "#if\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*<\\s*(-?\\d+)");
+    private static final Pattern IFDEF = Pattern.compile(
+            "#ifdef\\s+([A-Za-z_][A-Za-z0-9_]*)");
+    private static final Pattern IFNDEF = Pattern.compile(
+            "#ifndef\\s+([A-Za-z_][A-Za-z0-9_]*)");
+
+    /** Known defines to evaluate preprocessor conditions against. */
+    private Map<String, String> activeDefines = new HashMap<>();
+
     public ShaderpackProperties() {}
 
     /**
-     * Parses a shaders.properties file content.
+     * Parses a shaders.properties file content with preprocessor support.
+     *
+     * @param content    raw file content
+     * @param optionDefines defines from user option overrides + defaults
+     *                      (used to evaluate {@code #if DEFINE == VALUE} blocks)
      */
-    public void parse(String content) {
+    public void parse(String content, Map<String, String> optionDefines) {
         if (content == null) return;
-        for (String line : content.split("\n")) {
+
+        // Merge environment defines with provided option defines
+        activeDefines.clear();
+        // Default IS_IRIS since Vulkanium is Iris-compatible
+        activeDefines.put("IS_IRIS", "");
+        if (optionDefines != null) {
+            activeDefines.putAll(optionDefines);
+        }
+
+        // Phase 1: Join backslash-continued lines
+        List<String> joinedLines = joinContinuedLines(content);
+
+        // Phase 2: Evaluate #if/#ifdef/#ifndef/#else/#endif conditionals
+        List<String> activeLines = evaluateConditionals(joinedLines);
+
+        // Phase 3: Parse key=value pairs
+        for (String line : activeLines) {
             line = line.trim();
-            if (line.isEmpty() || line.startsWith("#")) continue;
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("//")) continue;
             int eq = line.indexOf('=');
             if (eq > 0) {
                 String key = line.substring(0, eq).trim();
                 String value = line.substring(eq + 1).trim();
                 properties.put(key, value);
-                parseScreenDirective(key, value);
+                parseDirective(key, value);
             }
         }
     }
 
     /**
-     * Parses screen.* directives for option menu layout.
-     * <p>Format follows OptiFine/Iris conventions:</p>
-     * <pre>
-     *   screen=OPTION1 OPTION2 [SUBSCREEN] &lt;empty&gt; OPTION3
-     *   screen.SUBSCREEN=OPTION4 OPTION5
-     *   screen.columns=2
-     *   screen.SUBSCREEN.columns=3
-     *   sliders=OPTION1 OPTION2
-     * </pre>
+     * Backwards-compatible parse without option defines.
      */
-    private void parseScreenDirective(String key, String value) {
+    public void parse(String content) {
+        parse(content, null);
+    }
+
+    // ─── Phase 1: Join backslash-continued lines ───────────────────
+
+    private static List<String> joinContinuedLines(String content) {
+        List<String> result = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        for (String rawLine : content.split("\n")) {
+            String trimmed = rawLine.trim();
+            if (trimmed.endsWith("\\")) {
+                // Continuation: strip trailing backslash, append to accumulator
+                current.append(trimmed, 0, trimmed.length() - 1).append(' ');
+            } else {
+                current.append(trimmed);
+                result.add(current.toString());
+                current.setLength(0);
+            }
+        }
+        // Flush remaining
+        if (current.length() > 0) {
+            result.add(current.toString());
+        }
+        return result;
+    }
+
+    // ─── Phase 2: Evaluate preprocessor conditionals ───────────────
+
+    private List<String> evaluateConditionals(List<String> lines) {
+        List<String> result = new ArrayList<>();
+        Deque<Boolean> conditionStack = new ArrayDeque<>(); // true = currently in active branch
+        Deque<Boolean> elseUsed = new ArrayDeque<>();       // true = an active branch was found
+
+        for (String line : lines) {
+            String trimmed = line.trim();
+
+            if (trimmed.startsWith("#if ") || trimmed.startsWith("#ifdef ") || trimmed.startsWith("#ifndef ")) {
+                boolean condition = evaluateCondition(trimmed);
+                boolean parentActive = conditionStack.isEmpty() || conditionStack.peek();
+                conditionStack.push(parentActive && condition);
+                elseUsed.push(parentActive && condition);
+                continue;
+            }
+
+            if (trimmed.equals("#else")) {
+                if (!conditionStack.isEmpty()) {
+                    boolean anyBranchWasActive = elseUsed.peek();
+                    boolean parentActive = conditionStack.size() <= 1 ||
+                            new ArrayList<>(conditionStack).get(1); // parent level
+                    conditionStack.pop();
+                    conditionStack.push(parentActive && !anyBranchWasActive);
+                }
+                continue;
+            }
+
+            if (trimmed.startsWith("#elif ")) {
+                if (!conditionStack.isEmpty()) {
+                    boolean anyBranchWasActive = elseUsed.peek();
+                    boolean parentActive = conditionStack.size() <= 1 ||
+                            new ArrayList<>(conditionStack).get(1);
+                    conditionStack.pop();
+                    String elifCondition = "#if " + trimmed.substring(6);
+                    boolean condition = evaluateCondition(elifCondition);
+                    boolean active = parentActive && !anyBranchWasActive && condition;
+                    conditionStack.push(active);
+                    if (active) {
+                        elseUsed.pop();
+                        elseUsed.push(true);
+                    }
+                }
+                continue;
+            }
+
+            if (trimmed.equals("#endif")) {
+                if (!conditionStack.isEmpty()) {
+                    conditionStack.pop();
+                    elseUsed.pop();
+                }
+                continue;
+            }
+
+            // Regular line — include if all enclosing conditions are true
+            if (conditionStack.isEmpty() || conditionStack.peek()) {
+                result.add(line);
+            }
+        }
+
+        return result;
+    }
+
+    private boolean evaluateCondition(String directive) {
+        String trimmed = directive.trim();
+
+        // #ifdef DEFINE
+        Matcher m = IFDEF.matcher(trimmed);
+        if (m.matches()) {
+            return activeDefines.containsKey(m.group(1));
+        }
+
+        // #ifndef DEFINE
+        m = IFNDEF.matcher(trimmed);
+        if (m.matches()) {
+            return !activeDefines.containsKey(m.group(1));
+        }
+
+        // #if DEFINE == VALUE
+        m = IF_DEFINE_EQ.matcher(trimmed);
+        if (m.matches()) {
+            String name = m.group(1);
+            int expected = Integer.parseInt(m.group(2));
+            String actual = activeDefines.get(name);
+            if (actual == null) return expected == 0; // undefined == 0
+            try {
+                return Integer.parseInt(actual.trim()) == expected;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+
+        // #if DEFINE > VALUE
+        m = IF_DEFINE_GT.matcher(trimmed);
+        if (m.matches()) {
+            String name = m.group(1);
+            int threshold = Integer.parseInt(m.group(2));
+            String actual = activeDefines.get(name);
+            if (actual == null) return 0 > threshold;
+            try {
+                return Integer.parseInt(actual.trim()) > threshold;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+
+        // #if DEFINE < VALUE
+        m = IF_DEFINE_LT.matcher(trimmed);
+        if (m.matches()) {
+            String name = m.group(1);
+            int threshold = Integer.parseInt(m.group(2));
+            String actual = activeDefines.get(name);
+            if (actual == null) return 0 < threshold;
+            try {
+                return Integer.parseInt(actual.trim()) < threshold;
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+
+        // Unrecognized condition — assume false (skip block)
+        return false;
+    }
+
+    // ─── Phase 3: Directive parsing ────────────────────────────────
+
+    private void parseDirective(String key, String value) {
+        // Screen layout directives
         if (key.equals("screen")) {
             mainScreenOptions = parseWhitespacedList(value);
         } else if (key.equals("screen.columns")) {
@@ -87,6 +277,24 @@ public class ShaderpackProperties {
             } else if (!rest.contains(".")) {
                 subScreenOptions.put(rest, parseWhitespacedList(value));
             }
+        }
+        // Iris feature flags
+        else if (key.equals("iris.features.required")) {
+            requiredFeatures.addAll(parseWhitespacedList(value));
+        } else if (key.equals("iris.features.optional")) {
+            optionalFeatures.addAll(parseWhitespacedList(value));
+        }
+        // Profile definitions
+        else if (key.startsWith("profile.")) {
+            String profileName = key.substring(8);
+            Map<String, String> profileValues = new LinkedHashMap<>();
+            for (String token : value.split("\\s+")) {
+                int eqIdx = token.indexOf('=');
+                if (eqIdx > 0) {
+                    profileValues.put(token.substring(0, eqIdx), token.substring(eqIdx + 1));
+                }
+            }
+            profiles.put(profileName, profileValues);
         }
     }
 
@@ -143,13 +351,6 @@ public class ShaderpackProperties {
 
     /**
      * Returns the cloud rendering setting from {@code shaders.properties}.
-     *
-     * <p>Shaderpacks like iterationT, iterationRP set {@code clouds = off} because
-     * they render volumetric clouds in composite/deferred passes. Complementary
-     * Unbound conditionally discards in gbuffers_clouds but still renders vanilla
-     * geometry as a base.</p>
-     *
-     * @return The cloud setting (OFF, FAST, FANCY, or DEFAULT)
      */
     public CloudSetting getCloudSetting() {
         return CloudSetting.fromString(get("clouds"));
@@ -157,9 +358,6 @@ public class ShaderpackProperties {
 
     /**
      * Gets the VkFormat-equivalent format string for a color texture attachment.
-     *
-     * @param index Color texture index (0–15)
-     * @return Format string (e.g., "RGBA8", "RGBA16F", "R11F_G11F_B10F")
      */
     public String getColorTexFormat(int index) {
         return get("colortex" + index + "Format", index == 0 ? "RGBA8" : "");
@@ -216,4 +414,17 @@ public class ShaderpackProperties {
 
     /** All slider option names. */
     public Set<String> getSliderOptions() { return Collections.unmodifiableSet(sliderOptions); }
+
+    // ─── Feature flags ─────────────────────────────────────────────
+
+    /** Required Iris features (pack will not work correctly without them). */
+    public Set<String> getRequiredFeatures() { return Collections.unmodifiableSet(requiredFeatures); }
+
+    /** Optional Iris features (pack can work without them but with reduced quality). */
+    public Set<String> getOptionalFeatures() { return Collections.unmodifiableSet(optionalFeatures); }
+
+    // ─── Profile accessors ─────────────────────────────────────────
+
+    /** Profile definitions keyed by profile name. Each profile maps option names to values. */
+    public Map<String, Map<String, String>> getProfiles() { return Collections.unmodifiableMap(profiles); }
 }

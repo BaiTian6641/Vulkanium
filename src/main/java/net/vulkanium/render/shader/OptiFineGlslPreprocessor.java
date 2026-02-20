@@ -351,7 +351,7 @@ public class OptiFineGlslPreprocessor {
      * environment defines but extended for Vulkan-native features.</p>
      */
     private static String buildCapabilityDefines() {
-        StringBuilder sb = new StringBuilder(512);
+        StringBuilder sb = new StringBuilder(1024);
         sb.append("// ── Vulkanium Capability Defines ──\n");
 
         // MC version and GLSL version defines
@@ -359,14 +359,37 @@ public class OptiFineGlslPreprocessor {
         sb.append("#define MC_GL_VERSION 330\n");
         sb.append("#define MC_GLSL_VERSION 330\n");
 
+        // ── Iris compatibility ── (shaderpacks check IS_IRIS for Iris-specific code paths)
+        sb.append("#define IS_IRIS\n");
+        sb.append("#define IRIS_TAG_SUPPORT 2\n");
+
         // Standard Iris/OptiFine defines
         sb.append("#define MC_RENDER_QUALITY 1.0\n");
         sb.append("#define MC_SHADOW_QUALITY 1.0\n");
-        sb.append("#define MC_NORMAL_MAP 1\n");
-        sb.append("#define MC_SPECULAR_MAP 1\n");
-        sb.append("#define MC_ANISOTROPIC_FILTERING 0\n");
+        sb.append("#define MC_NORMAL_MAP\n");
+        sb.append("#define MC_SPECULAR_MAP\n");
+        // Note: MC_ANISOTROPIC_FILTERING is intentionally NOT defined.
+        // Shaderpacks use #ifdef MC_ANISOTROPIC_FILTERING to detect OptiFine AF
+        // being enabled, and show an error if it is. We don't use OptiFine AF.
         sb.append("#define MC_HAND_DEPTH 0.125\n");
-        sb.append("#define MC_GL_VENDOR_OTHER 0\n");
+        sb.append("#define MC_MIPMAP_LEVEL 4\n");
+
+        // OS detection
+        String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        if (os.contains("linux")) {
+            sb.append("#define MC_OS_LINUX\n");
+        } else if (os.contains("win")) {
+            sb.append("#define MC_OS_WINDOWS\n");
+        } else if (os.contains("mac")) {
+            sb.append("#define MC_OS_MAC\n");
+        } else {
+            sb.append("#define MC_OS_OTHER\n");
+        }
+
+        // GPU vendor detection — Vulkan doesn't provide GL strings, use Vulkan device info
+        // Default to OTHER; could be refined with VkPhysicalDeviceProperties
+        sb.append("#define MC_GL_VENDOR_OTHER\n");
+        sb.append("#define MC_GL_RENDERER_OTHER\n");
 
         // Vulkanium-specific
         sb.append("#define VULKANIUM 1\n");
@@ -374,9 +397,6 @@ public class OptiFineGlslPreprocessor {
         sb.append("#define VULKANIUM_MRT 1\n");           // Signals native MRT support
         sb.append("#define VULKANIUM_COMPUTE 1\n");       // Signals compute shader support
         sb.append("#define VULKANIUM_SPIRV 1\n");         // Signals SPIR-V compilation path
-
-        // Vendor detection (populated at runtime)
-        sb.append("// Vendor detection populated by uniform bridge\n");
 
         return sb.toString();
     }

@@ -425,13 +425,26 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     LoadProgress.Phase.PARSING_PROPERTIES, null,
                     "Parsing shaders.properties...", 0, 0, null));
 
+            // Load option overrides first so properties can evaluate #if conditionals
+            VulkaniumGameOptions opts = VulkaniumGameOptions.loadFromDisk();
+            optionOverrides = opts.shader.shaderpackOptionOverrides != null
+                ? new HashMap<>(opts.shader.shaderpackOptionOverrides)
+                : Collections.emptyMap();
+
             properties = new ShaderpackProperties();
             String propsContent = source.readProperties();
             if (propsContent != null) {
-                properties.parse(propsContent);
+                properties.parse(propsContent, optionOverrides);
                 LOGGER.info("[LOAD]   shaders.properties: {} entries parsed", properties.getAll().size());
                 LOGGER.info("[LOAD]   Shadow resolution: {}x{}", properties.getShadowResolution(), properties.getShadowResolution());
                 LOGGER.info("[LOAD]   Cloud setting: {}", properties.getCloudSetting());
+                // Log required/optional feature flags
+                if (!properties.getRequiredFeatures().isEmpty()) {
+                    LOGGER.warn("[LOAD]   Required features: {}", properties.getRequiredFeatures());
+                }
+                if (!properties.getOptionalFeatures().isEmpty()) {
+                    LOGGER.info("[LOAD]   Optional features: {}", properties.getOptionalFeatures());
+                }
             } else {
                 LOGGER.info("[LOAD]   No shaders.properties found (using defaults)");
             }
@@ -442,10 +455,6 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     LoadProgress.Phase.DISCOVERING_PROGRAMS, null,
                     "Discovering shader programs...", 0, 0, null));
 
-                VulkaniumGameOptions opts = VulkaniumGameOptions.loadFromDisk();
-                optionOverrides = opts.shader.shaderpackOptionOverrides != null
-                    ? new HashMap<>(opts.shader.shaderpackOptionOverrides)
-                    : Collections.emptyMap();
                 programSet = new ProgramSet(source, properties, optionOverrides,
                     (scanned, total, programName, status) -> reportProgress(new LoadProgress(
                         LoadProgress.Phase.DISCOVERING_PROGRAMS,
@@ -1048,6 +1057,30 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
      */
     private boolean evaluateCompatibilitySupport() {
         if (programSet == null) return true;
+
+        // ── Check iris.features.required ──
+        // These are features the pack declares it needs to function properly.
+        // We support some, but not all (e.g., CUSTOM_IMAGES, COMPUTE require Vulkan compute shaders).
+        if (properties != null && !properties.getRequiredFeatures().isEmpty()) {
+            // Features Vulkanium currently supports
+            Set<String> supportedFeatures = Set.of(
+                    "HIGHER_SHADOWCOLOR", "PER_BUFFER_BLENDING",
+                    "SEPARATE_HARDWARE_SAMPLERS", "ENTITY_TRANSLUCENT",
+                    "EXTENDED_SHADOW"
+            );
+            List<String> unsupported = new ArrayList<>();
+            for (String feature : properties.getRequiredFeatures()) {
+                if (!supportedFeatures.contains(feature)) {
+                    unsupported.add(feature);
+                }
+            }
+            if (!unsupported.isEmpty()) {
+                LOGGER.warn("[COMPAT] Pack requires unsupported features: {}", unsupported);
+                compatibilityIssueMessage = "Required features not supported: " + String.join(", ", unsupported)
+                        + ". Pack may not render correctly.";
+                // Don't return false — let the pack try to load anyway
+            }
+        }
 
         boolean hasFullscreenPasses = false;
         List<String> fullscreenPrograms = new ArrayList<>();

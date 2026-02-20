@@ -82,6 +82,12 @@ public class ShaderpackScreen extends Screen {
     private String hoveredOptionName = null;
     private int hoverTicks = 0;
 
+    // ── Slider drag state ──
+    /** Index of the option being slider-dragged, or -1 */
+    private int draggingSliderIndex = -1;
+    /** Cached slider bounds during drag (x, y, w, h) */
+    private int[] draggingSliderBounds = null;
+
     // ── Buttons ──
     private Button switchModeButton;
     private Button applyButton;
@@ -500,9 +506,20 @@ public class ShaderpackScreen extends Screen {
             navigateToSubScreen(entry.linkTarget);
             return true;
         } else if (entry.type == OptionEntry.Type.OPTION && entry.option != null) {
-            int delta = (button == 1) ? -1 : 1; // right-click = previous
-            cycleOption(entry.option, delta);
-            return true;
+            boolean isSlider = packProperties != null && packProperties.isSlider(entry.option.name());
+            if (isSlider && entry.option.allowedValues().size() > 2) {
+                // Slider: map click position to value
+                int entryX = areaX + col * colWidth + 2;
+                int entryW = colWidth - 4;
+                setSliderValueFromMouse(entry.option, mouseX, entryX, entryW);
+                draggingSliderIndex = index;
+                draggingSliderBounds = new int[]{entryX, 0, entryW, 0}; // y/h not needed for drag
+                return true;
+            } else {
+                int delta = (button == 1) ? -1 : 1; // right-click = previous
+                cycleOption(entry.option, delta);
+                return true;
+            }
         }
 
         return false;
@@ -523,6 +540,51 @@ public class ShaderpackScreen extends Screen {
                     Math.min(listScrollOffset - delta * ENTRY_HEIGHT, maxScroll));
         }
         return true;
+    }
+
+    @Override
+    public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (draggingSliderIndex >= 0 && draggingSliderIndex < currentScreenOptions.size()
+                && draggingSliderBounds != null) {
+            OptionEntry entry = currentScreenOptions.get(draggingSliderIndex);
+            if (entry.type == OptionEntry.Type.OPTION && entry.option != null) {
+                setSliderValueFromMouse(entry.option, mouseX,
+                        draggingSliderBounds[0], draggingSliderBounds[2]);
+                return true;
+            }
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (draggingSliderIndex >= 0) {
+            draggingSliderIndex = -1;
+            draggingSliderBounds = null;
+            return true;
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    /**
+     * Maps a mouse X position within a slider track to the nearest allowed value.
+     */
+    private void setSliderValueFromMouse(ShaderpackOption option, double mouseX, int trackX, int trackW) {
+        List<String> values = option.allowedValues();
+        if (values == null || values.size() <= 1) return;
+
+        // Slider track area is the right half of the entry
+        int sliderX = trackX + trackW / 2;
+        int sliderW = trackW / 2 - 8;
+        if (sliderW <= 0) sliderW = 1;
+
+        double fraction = (mouseX - sliderX) / sliderW;
+        fraction = Math.max(0.0, Math.min(1.0, fraction));
+
+        int idx = (int) Math.round(fraction * (values.size() - 1));
+        idx = Math.max(0, Math.min(values.size() - 1, idx));
+
+        pendingOverrides.put(option.name(), values.get(idx));
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -642,7 +704,7 @@ public class ShaderpackScreen extends Screen {
 
         // Subtitle
         if (currentSubScreen == null) {
-            String subtitle = "Click to cycle values \u2022 Right-click for reverse \u2022 Tab to switch views";
+            String subtitle = "Click/drag sliders \u2022 Right-click to reverse \u2022 Tab to switch views";
             graphics.drawCenteredString(this.font, subtitle, this.width / 2, 22, 0x888888);
         }
 
@@ -730,36 +792,72 @@ public class ShaderpackScreen extends Screen {
                 boolean isModified = !currentValue.equals(opt.defaultValue());
                 boolean isBoolean = opt.allowedValues().size() == 2
                         && opt.allowedValues().containsAll(List.of("true", "false"));
+                boolean isSlider = packProperties != null && packProperties.isSlider(opt.name())
+                        && !isBoolean && opt.allowedValues().size() > 2;
 
                 int bgColor = hovered ? 0xA0333355 : 0x80222233;
                 if (isModified) bgColor = hovered ? 0xA0443322 : 0x80332211;
                 graphics.fill(x, y, x + w, y + h, bgColor);
 
-                // Option name
+                // Option name (left half)
                 String name = formatOptionName(opt.name());
                 int nameMaxW = w / 2 - 4;
                 graphics.drawString(this.font, truncate(name, nameMaxW / 6), x + 4, y + 6, 0xDDDDDD);
 
-                // Value
-                String valueStr;
-                int valueColor;
-                if (isBoolean) {
-                    boolean boolVal = "true".equalsIgnoreCase(currentValue);
-                    valueStr = boolVal ? "ON" : "OFF";
-                    valueColor = isModified
-                            ? (boolVal ? 0x55FF55 : 0xFF5555)
-                            : 0xFFFFFF;
+                if (isSlider) {
+                    // ── Slider rendering ──
+                    int sliderX = x + w / 2;
+                    int sliderW = w / 2 - 8;
+                    int sliderY = y + h / 2;
+
+                    List<String> values = opt.allowedValues();
+                    int valueIdx = values.indexOf(currentValue);
+                    if (valueIdx < 0) valueIdx = 0;
+                    double fraction = values.size() > 1
+                            ? (double) valueIdx / (values.size() - 1) : 0.5;
+
+                    // Track background
+                    int trackH = 3;
+                    int trackY = sliderY - trackH / 2;
+                    graphics.fill(sliderX, trackY, sliderX + sliderW, trackY + trackH, 0x80AAAAAA);
+
+                    // Filled portion
+                    int filledW = (int) (fraction * sliderW);
+                    int fillColor = isModified ? 0xFF6688FF : 0xFF55CC55;
+                    graphics.fill(sliderX, trackY, sliderX + filledW, trackY + trackH, fillColor);
+
+                    // Thumb
+                    int thumbX = sliderX + filledW - 3;
+                    int thumbColor = hovered ? 0xFFFFFFFF : 0xFFCCCCCC;
+                    graphics.fill(thumbX, sliderY - 5, thumbX + 6, sliderY + 5, thumbColor);
+
+                    // Value text to the right of the slider
+                    String valueStr = currentValue;
+                    int valueColor = isModified ? 0x6688FF : 0xBBBBBB;
+                    graphics.drawString(this.font, valueStr,
+                            sliderX + sliderW + 4, y + 6, valueColor);
                 } else {
-                    valueStr = currentValue;
-                    valueColor = isModified ? 0x6688FF : 0xBBBBBB;
-                }
+                    // ── Standard click-to-cycle rendering ──
+                    String valueStr;
+                    int valueColor;
+                    if (isBoolean) {
+                        boolean boolVal = "true".equalsIgnoreCase(currentValue);
+                        valueStr = boolVal ? "ON" : "OFF";
+                        valueColor = isModified
+                                ? (boolVal ? 0x55FF55 : 0xFF5555)
+                                : 0xFFFFFF;
+                    } else {
+                        valueStr = currentValue;
+                        valueColor = isModified ? 0x6688FF : 0xBBBBBB;
+                    }
 
-                int valueW = this.font.width(valueStr);
-                graphics.drawString(this.font, valueStr, x + w - valueW - 4, y + 6, valueColor);
+                    int valueW = this.font.width(valueStr);
+                    graphics.drawString(this.font, valueStr, x + w - valueW - 4, y + 6, valueColor);
 
-                // Modified indicator
-                if (isModified) {
-                    graphics.drawString(this.font, "*", x + w - valueW - 12, y + 4, 0xFFAA44);
+                    // Modified indicator
+                    if (isModified) {
+                        graphics.drawString(this.font, "*", x + w - valueW - 12, y + 4, 0xFFAA44);
+                    }
                 }
             }
         }
