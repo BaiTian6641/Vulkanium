@@ -1,5 +1,6 @@
 package net.vulkanium.core;
 
+import net.vulkanium.render.hdr.HdrConfig;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
 import org.slf4j.Logger;
@@ -71,12 +72,29 @@ public class VulkaniumSwapchain {
 
         this.depthFormat = findDepthFormat();
 
+        // ── HDR Initialization ──
+        // Probe GPU/display for HDR capability, then resolve format if user enabled HDR
+        HdrConfig.probeHdrSupport(physicalDevice, surface);
+        boolean wantHdr = false;
+        try {
+            net.vulkanium.VulkaniumConfig cfg = net.vulkanium.Vulkanium.getConfig();
+            if (cfg != null) wantHdr = cfg.hdrOutput;
+        } catch (Exception ignored) {}
+        if (wantHdr && HdrConfig.isHdrAvailable()) {
+            HdrConfig.resolveSwapchainFormat(physicalDevice, surface,
+                    HdrConfig.HdrMode.AUTO, true);
+        } else {
+            HdrConfig.reset();
+        }
+
         createSwapchain(preferredPresentMode, VK_NULL_HANDLE);
         createImageViews();
         createDepthResources();
 
-        LOGGER.info("Swapchain created: {}x{}, {} images, format {}, present mode {}",
-                width, height, imageCount, imageFormat, presentModeName(currentPresentMode));
+        LOGGER.info("Swapchain created: {}x{}, {} images, format {} ({}), present mode {}",
+                width, height, imageCount,
+                HdrConfig.formatName(imageFormat), HdrConfig.colorSpaceName(colorSpace),
+                presentModeName(currentPresentMode));
     }
 
     /**
@@ -208,7 +226,24 @@ public class VulkaniumSwapchain {
     // === Format / Present Mode / Extent Selection ===
 
     private VkSurfaceFormatKHR chooseFormat(VkSurfaceFormatKHR.Buffer formats) {
-        // Prefer BGRA8 UNORM — MC's rendering pipeline is NOT gamma-correct,
+        // ── HDR path: use HdrConfig-resolved format/colorSpace ──
+        if (HdrConfig.isHdrEnabled()) {
+            int hdrFmt = HdrConfig.getResolvedFormat();
+            int hdrCS  = HdrConfig.getResolvedColorSpace();
+
+            for (int i = 0; i < formats.capacity(); i++) {
+                VkSurfaceFormatKHR format = formats.get(i);
+                if (format.format() == hdrFmt && format.colorSpace() == hdrCS) {
+                    LOGGER.info("[HDR] Swapchain format: {} + {}",
+                            HdrConfig.formatName(hdrFmt), HdrConfig.colorSpaceName(hdrCS));
+                    return format;
+                }
+            }
+            LOGGER.warn("[HDR] Resolved HDR format not available in surface — falling back to SDR");
+        }
+
+        // ── SDR path: Prefer BGRA8 UNORM ──
+        // MC's rendering pipeline is NOT gamma-correct,
         // it expects raw byte values passed through without sRGB conversion.
         // Using SRGB format would cause double-gamma (washed out / too bright).
         for (int i = 0; i < formats.capacity(); i++) {

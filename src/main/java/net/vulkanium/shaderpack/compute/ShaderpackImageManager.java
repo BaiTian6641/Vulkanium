@@ -182,7 +182,7 @@ public class ShaderpackImageManager {
         if (w <= 0 || h <= 0) return;
 
         int format = img.info.format();
-        if (format == 0) format = VK_FORMAT_R8G8B8A8_UNORM; // default
+        if (format == 0) format = net.vulkanium.render.hdr.HdrConfig.getDefaultCustomImageFormat(); // HDR-aware default
 
         try (MemoryStack stack = stackPush()) {
             // Create VkImage with STORAGE + SAMPLED usage

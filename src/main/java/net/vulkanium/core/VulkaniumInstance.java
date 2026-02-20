@@ -183,14 +183,20 @@ public class VulkaniumInstance {
             throw new RuntimeException("GLFW: Vulkan not supported (glfwGetRequiredInstanceExtensions returned null)");
         }
 
+        // Always request: VK_EXT_swapchain_colorspace (for HDR color spaces)
+        // + optionally VK_EXT_debug_utils (validation)
+        int extraCount = 1; // swapchain_colorspace
+        if (validationEnabled) extraCount++;
+
+        PointerBuffer extensions = stack.mallocPointer(glfwExtensions.capacity() + extraCount);
+        extensions.put(glfwExtensions);
+        extensions.put(stack.UTF8("VK_EXT_swapchain_colorspace"));
+
         if (validationEnabled) {
-            PointerBuffer extensions = stack.mallocPointer(glfwExtensions.capacity() + 1);
-            extensions.put(glfwExtensions);
             extensions.put(stack.UTF8(VK_EXT_DEBUG_UTILS_EXTENSION_NAME));
-            return extensions.rewind();
         }
 
-        return glfwExtensions;
+        return extensions.rewind();
     }
 
     // === Cleanup ===

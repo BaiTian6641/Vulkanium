@@ -38,6 +38,9 @@ public class VulkaniumConfig {
     /** GPU device index (-1 = auto-select best) */
     public int deviceIndex = -1;
 
+    /** Enable HDR output if display supports it */
+    public boolean hdrOutput = false;
+
     // === Shadows ===
 
     /** Shadow map resolution override (0 = use pack default) */

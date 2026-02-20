@@ -1281,11 +1281,16 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         int depthFormat = Vulkanium.getVulkanSwapchain().getDepthFormat();
         VkDevice device = Vulkanium.getVulkanDevice().getLogicalDevice();
 
+        // Use HDR-aware internal render format when HDR is active
+        int renderFormat = net.vulkanium.render.hdr.HdrConfig.isHdrEnabled()
+                ? net.vulkanium.render.hdr.HdrConfig.getInternalRenderFormat()
+                : colorFormat;
+
         // Lazily create / resize MRT targets
         if (fsTargets == null) {
             fsTargets = new FullscreenRenderTargets();
         }
-        fsTargets.ensureSize(device, Vulkanium.getVulkanMemory(), width, height, colorFormat, depthFormat);
+        fsTargets.ensureSize(device, Vulkanium.getVulkanMemory(), width, height, renderFormat, depthFormat);
         fsTargets.initializeImageLayouts(cmd); // transition UNDEFINED → SHADER_READ on first use
         fsTargets.resetFlips();
 

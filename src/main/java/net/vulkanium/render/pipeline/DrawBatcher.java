@@ -510,6 +510,25 @@ public class DrawBatcher {
         // Safe default alpha test reference (offset 1264)
         MemoryUtil.memPutFloat(ptr + net.vulkanium.render.shader.UniformBridge.OFF_ALPHA_TEST_REF, 0.1f);
 
+        // ── HDR params (offset 1280): vec4(currentColorSpace, hdrEnabled, maxLuminance, exposure) ──
+        {
+            net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget cs =
+                    net.vulkanium.render.hdr.HdrConfig.getColorSpaceTarget();
+            boolean hdrOn = net.vulkanium.render.hdr.HdrConfig.isHdrEnabled();
+            float[] meta = net.vulkanium.render.hdr.HdrConfig.getHdrMetadata();
+            long hdrPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_HDR_PARAMS;
+            MemoryUtil.memPutFloat(hdrPtr, (float) cs.index);
+            MemoryUtil.memPutFloat(hdrPtr + 4, hdrOn ? 1.0f : 0.0f);
+            MemoryUtil.memPutFloat(hdrPtr + 8, meta[0]);   // maxContentLuminance
+            MemoryUtil.memPutFloat(hdrPtr + 12, 1.0f);     // exposure
+
+            long hdrDispPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_HDR_DISPLAY;
+            MemoryUtil.memPutFloat(hdrDispPtr, meta[3]);     // whitePointX
+            MemoryUtil.memPutFloat(hdrDispPtr + 4, meta[4]); // whitePointY
+            MemoryUtil.memPutFloat(hdrDispPtr + 8, meta[2]); // minLuminance
+            MemoryUtil.memPutFloat(hdrDispPtr + 12, 0.0f);   // reserved
+        }
+
         // ── Screen size (offset 1024): vec4(viewWidth, viewHeight, 1/w, 1/h) ──
         float screenW, screenH;
         if (net.vulkanium.Vulkanium.getVulkanSwapchain() != null) {

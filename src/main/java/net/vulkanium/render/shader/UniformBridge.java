@@ -112,6 +112,12 @@ public class UniformBridge {
     public static final int OFF_BIOME_DATA              = 1248;
     public static final int OFF_ALPHA_TEST_REF          = 1264;
 
+    // ── HDR uniforms (bytes 1280-1311) ──
+    /** vec4: (currentColorSpace, hdrEnabled, maxLuminance, exposure) */
+    public static final int OFF_HDR_PARAMS              = 1280;
+    /** vec4: (hdrWhitePointX, hdrWhitePointY, minLuminance, reserved) */
+    public static final int OFF_HDR_DISPLAY             = 1296;
+
     // ── Double-buffered UBOs ──
     private final long[] uboBuffers = new long[2];
     private final long[] uboAllocations = new long[2];
@@ -374,6 +380,32 @@ public class UniformBridge {
      */
     public void updateAlphaTest(float ref) {
         putVec4(getWriteMapped(), OFF_ALPHA_TEST_REF, ref, 0, 0, 0);
+    }
+
+    /**
+     * Updates HDR-related uniform data.
+     *
+     * <p>Writes the current color space target index, HDR enabled flag,
+     * max display luminance, and display white point into the UBO
+     * so shaders can adapt their output for HDR displays.</p>
+     */
+    public void updateHdrParams() {
+        net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget cs =
+                net.vulkanium.render.hdr.HdrConfig.getColorSpaceTarget();
+        boolean hdrOn = net.vulkanium.render.hdr.HdrConfig.isHdrEnabled();
+        float[] meta = net.vulkanium.render.hdr.HdrConfig.getHdrMetadata();
+
+        putVec4(getWriteMapped(), OFF_HDR_PARAMS,
+                (float) cs.index,          // currentColorSpace (0=sRGB,1=DCI_P3,2=DISPLAY_P3,3=REC2020,4=AdobeRGB)
+                hdrOn ? 1.0f : 0.0f,       // hdrEnabled
+                meta[0],                    // maxContentLuminance (nits)
+                1.0f);                      // exposure (placeholder — shaderpack can override)
+
+        putVec4(getWriteMapped(), OFF_HDR_DISPLAY,
+                meta[3],                    // whitePointX (D65 = 0.3127)
+                meta[4],                    // whitePointY (D65 = 0.3290)
+                meta[2],                    // minLuminance
+                0.0f);                      // reserved
     }
 
     // ═══════════════════════════════════════════════════════════════
