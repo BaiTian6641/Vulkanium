@@ -642,9 +642,21 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                         ssboManager.registerSSBO(entry.getKey(), info);
                     }
                 }
-                // Create buffers at current screen dimensions
-                int w = net.minecraft.client.Minecraft.getInstance().getWindow().getWidth();
-                int h = net.minecraft.client.Minecraft.getInstance().getWindow().getHeight();
+                // Create buffers at current screen dimensions (use swapchain size if
+                // the window object is not yet available during early initialization).
+                int w = 0, h = 0;
+                var mc = net.minecraft.client.Minecraft.getInstance();
+                if (mc != null && mc.getWindow() != null) {
+                    w = mc.getWindow().getWidth();
+                    h = mc.getWindow().getHeight();
+                }
+                if (w <= 0 || h <= 0) {
+                    var swapchain = Vulkanium.getVulkanSwapchain();
+                    if (swapchain != null) {
+                        w = swapchain.getWidth();
+                        h = swapchain.getHeight();
+                    }
+                }
                 if (w > 0 && h > 0) {
                     ssboManager.createBuffers(w, h);
                 }
@@ -661,9 +673,21 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                         imageManager.registerImage(info);
                     }
                 }
-                // Create images at current screen dimensions
-                int w = net.minecraft.client.Minecraft.getInstance().getWindow().getWidth();
-                int h = net.minecraft.client.Minecraft.getInstance().getWindow().getHeight();
+                // Create images at current screen dimensions (use swapchain size if
+                // the window object is not yet available during early initialization).
+                int w = 0, h = 0;
+                var mc = net.minecraft.client.Minecraft.getInstance();
+                if (mc != null && mc.getWindow() != null) {
+                    w = mc.getWindow().getWidth();
+                    h = mc.getWindow().getHeight();
+                }
+                if (w <= 0 || h <= 0) {
+                    var swapchain = Vulkanium.getVulkanSwapchain();
+                    if (swapchain != null) {
+                        w = swapchain.getWidth();
+                        h = swapchain.getHeight();
+                    }
+                }
                 if (w > 0 && h > 0) {
                     imageManager.createImages(w, h);
                 }
@@ -838,7 +862,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
                     LOGGER.info("[COMPILE] [{}/{}] {} — compute shader", index, total, programName);
 
-                    long module = shaderModuleManager.compileComputeProgram(programName, source.computeSource());
+                    long module = shaderModuleManager.compileComputeProgram(
+                            programName, source.computeSource(), DEFAULT_SAMPLER_BINDINGS);
                     long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
 
                     if (module != 0) {
@@ -847,7 +872,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                             ShaderpackComputeManager.ComputeProgramInfo info =
                                     computeManager.registerComputeProgram(programName, module);
                             if (info != null && info.pipeline != VK_NULL_HANDLE) {
-                                pipelines.put(id, info.pipeline);
+                                // Compute pipelines are owned/destroyed exclusively by
+                                // ShaderpackComputeManager. Keep the generic pipeline map
+                                // at 0 for compute ProgramIds to avoid double-destroy
+                                // during unload on drivers sensitive to repeated free.
+                                pipelines.put(id, 0L);
                                 LOGGER.info("[COMPILE] ✓ {} — compute OK (module=0x{}, pipeline=0x{}) [{}ms]",
                                         programName, Long.toHexString(module),
                                         Long.toHexString(info.pipeline), elapsedMs);
@@ -965,11 +994,18 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         fullscreenPipelines.clear();
 
         if (device != null) {
-            // Destroy VkPipelines
-            for (long pipeline : pipelines.values()) {
-                if (pipeline != VK_NULL_HANDLE && pipeline != 0) {
-                    vkDestroyPipeline(device, pipeline, null);
+            // Destroy VkPipelines (graphics/fullscreen compatibility only).
+            // Compute pipelines are owned by ShaderpackComputeManager and destroyed
+            // there to avoid double-destroy across owners.
+            for (Map.Entry<ProgramId, Long> entry : pipelines.entrySet()) {
+                long pipeline = entry.getValue() != null ? entry.getValue() : 0L;
+                if (pipeline == VK_NULL_HANDLE || pipeline == 0) continue;
+
+                if (computeManager != null && computeManager.hasComputeProgram(entry.getKey().getSourceName())) {
+                    continue;
                 }
+
+                vkDestroyPipeline(device, pipeline, null);
             }
 
             // Destroy VkPipelineLayouts
@@ -1249,6 +1285,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     @Override
     public void onFrameBegin(VkCommandBuffer cmd, int frameIndex) {
         if (!loaded) return;
+        if (computeManager != null && computeManager.isInitialized()) {
+            computeManager.resetDescriptorPoolForFrame(frameIndex);
+        }
         // Update per-frame uniforms from game state
         if (uniforms != null) {
             uniforms.updateFromGameState();
@@ -1411,7 +1450,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     );
 
                     // Allocate and update compute descriptor set
-                    long computeDescSet = computeManager.allocateComputeDescriptorSet();
+                    long computeDescSet = computeManager.allocateComputeDescriptorSet(frameIndex);
                     if (computeDescSet != VK_NULL_HANDLE) {
                         // Build sampler/image/SSBO arrays for compute descriptor update
                         int maxTex = ShaderpackComputeManager.MAX_SAMPLERS;

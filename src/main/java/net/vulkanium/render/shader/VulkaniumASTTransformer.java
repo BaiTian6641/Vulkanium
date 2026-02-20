@@ -1087,6 +1087,12 @@ public class VulkaniumASTTransformer {
      * Finds uniform sampler/image declarations without layout qualifiers
      * and auto-assigns layout(set=0, binding=N+1).
      * Binding 0 is reserved for the UBO, so samplers start at binding 1.
+     *
+     * <p>For compute shaders ({@code params.imageBindingOffset > 0}), storage
+     * images ({@code image2D}, etc.) are assigned to a separate binding range
+     * starting at {@code imageBindingOffset} so they align with the compute
+     * descriptor set layout's STORAGE_IMAGE slots rather than colliding with
+     * the COMBINED_IMAGE_SAMPLER or STORAGE_BUFFER ranges.</p>
      */
     private static String assignUnboundSamplerBindings(String source, TransformParams params) {
         int nextBinding = 28; // DEFAULT_SAMPLER_BINDINGS goes up to 27
@@ -1095,6 +1101,12 @@ public class VulkaniumASTTransformer {
                 if (b >= nextBinding) nextBinding = b + 1;
             }
         }
+
+        // For compute shaders, images go to a separate binding range that
+        // aligns with VK_DESCRIPTOR_TYPE_STORAGE_IMAGE in the compute layout.
+        // imageBindingOffset is the 0-based start of the image range (the +1
+        // UBO offset is applied below when building the layout string).
+        int nextImageBinding = params.imageBindingOffset > 0 ? params.imageBindingOffset : -1;
 
         // Match sampler/image uniform declarations that don't have binding=
         // This covers both:
@@ -1126,9 +1138,24 @@ public class VulkaniumASTTransformer {
                 continue; // Already handled by remapSamplerBindings AST step
             }
 
+            // Determine the correct binding based on descriptor type.
+            // For compute shaders, images (image2D, etc.) must go to the
+            // STORAGE_IMAGE binding range, not the sampler range.
+            boolean isImageType = type.startsWith("image") || type.startsWith("iimage") || type.startsWith("uimage");
+            int binding;
+            if (isImageType && nextImageBinding >= 0) {
+                // Compute shader: assign image to the storage image binding range
+                binding = nextImageBinding;
+                nextImageBinding++;
+            } else {
+                // Sampler (or image in a graphics shader): use the sampler range
+                binding = nextBinding;
+                nextBinding++;
+            }
+
             // Merge existing format qualifiers with binding
             // +1 because binding 0 is reserved for the UBO in the single descriptor set
-            String layoutContent = "set = 0, binding = " + (nextBinding + 1);
+            String layoutContent = "set = 0, binding = " + (binding + 1);
             if (existingLayout != null && !existingLayout.isBlank()) {
                 // Extract existing layout content (e.g., "rgba16f")
                 Matcher layoutMatcher = Pattern.compile("layout\\s*\\((.*)\\)").matcher(existingLayout);
@@ -1139,14 +1166,14 @@ public class VulkaniumASTTransformer {
 
             String replacement = indent + "layout(" + layoutContent + ") uniform " + accessQual + type + " " + name + ";";
             m.appendReplacement(sb, Matcher.quoteReplacement(replacement));
-            LOGGER.debug("Auto-bound sampler {} to binding {}", name, nextBinding);
-            nextBinding++;
+            LOGGER.debug("Auto-bound {} {} to binding {} ({})", isImageType ? "image" : "sampler", name, binding,
+                    isImageType ? "storage-image" : "combined-image-sampler");
             count++;
         }
         m.appendTail(sb);
 
         if (count > 0) {
-            LOGGER.debug("Auto-assigned bindings to {} unbound samplers", count);
+            LOGGER.debug("Auto-assigned bindings to {} unbound samplers/images", count);
         }
         return sb.toString();
     }

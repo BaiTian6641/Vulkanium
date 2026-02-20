@@ -298,14 +298,20 @@ public class ShaderModuleManager {
 
     /**
      * Compiles a compute shader program.
+     *
+     * @param programName     Program name (e.g., "deferred", "composite3")
+     * @param source          Raw compute shader GLSL from pack
+     * @param samplerBindings Sampler name → binding index map (same as graphics)
      */
-    public long compileComputeProgram(String programName, String source) {
+    public long compileComputeProgram(String programName, String source,
+                                      Map<String, Integer> samplerBindings) {
         try {
             emitStage(programName, "compute-preprocess", "Preprocessing compute shader");
             OptiFineGlslPreprocessor.PreprocessResult pp =
                     OptiFineGlslPreprocessor.preprocess(source, false);
             TransformParams params = new TransformParams(
-                    PassType.COMPUTE, false, false, true, null, null);
+                    PassType.COMPUTE, false, false, true, samplerBindings, null, programName,
+                    net.vulkanium.shaderpack.compute.ShaderpackComputeManager.MAX_SAMPLERS);
                 emitStage(programName, "compute-transform", "Transforming compute shader");
                 String transformed = getOrCreateTranslatedSource(
                     programName, "comp", pp.source, params,

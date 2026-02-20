@@ -107,16 +107,29 @@ public class VulkaniumGlslTransformer {
         public final Map<String, Integer> samplerBindings;
         public final int[] renderTargets;
         public final String programName;
+        /**
+         * 0-based binding offset for storage images in compute shaders.
+         * When &gt; 0, image uniforms (image2D, etc.) are assigned bindings starting
+         * at this value (+1 for the UBO offset) instead of being interleaved with
+         * samplers. For graphics shaders this is -1 (images share the sampler range).
+         */
+        public final int imageBindingOffset;
 
         public TransformParams(PassType passType, boolean isVertex, boolean isFragment,
                                boolean isCompute, Map<String, Integer> samplerBindings,
                                int[] renderTargets) {
-            this(passType, isVertex, isFragment, isCompute, samplerBindings, renderTargets, null);
+            this(passType, isVertex, isFragment, isCompute, samplerBindings, renderTargets, null, -1);
         }
 
         public TransformParams(PassType passType, boolean isVertex, boolean isFragment,
                                boolean isCompute, Map<String, Integer> samplerBindings,
                                int[] renderTargets, String programName) {
+            this(passType, isVertex, isFragment, isCompute, samplerBindings, renderTargets, programName, -1);
+        }
+
+        public TransformParams(PassType passType, boolean isVertex, boolean isFragment,
+                               boolean isCompute, Map<String, Integer> samplerBindings,
+                               int[] renderTargets, String programName, int imageBindingOffset) {
             this.passType = passType;
             this.isVertex = isVertex;
             this.isFragment = isFragment;
@@ -124,6 +137,7 @@ public class VulkaniumGlslTransformer {
             this.samplerBindings = samplerBindings != null ? samplerBindings : Collections.emptyMap();
             this.renderTargets = renderTargets != null ? renderTargets : new int[]{0};
             this.programName = programName;
+            this.imageBindingOffset = imageBindingOffset;
         }
     }
 

@@ -59,8 +59,11 @@ public class ShaderpackComputeManager {
     /** Maximum SSBO bindings for compute shaders */
     public static final int MAX_SSBOS = 16;
 
-    /** Maximum sampler bindings for compute shaders */
-    public static final int MAX_SAMPLERS = 16;
+    /** Maximum sampler bindings for compute shaders.
+     *  Must be >= the highest binding value in DEFAULT_SAMPLER_BINDINGS + 4 extra
+     *  for auto-assigned unbound samplers.  The +1 offset applied by the GLSL
+     *  transformer means SPIR-V sampler bindings span [1 .. MAX_SAMPLERS]. */
+    public static final int MAX_SAMPLERS = 32;
 
     // ── Vulkan Objects ──
 
@@ -70,8 +73,11 @@ public class ShaderpackComputeManager {
     /** Pipeline layout for shaderpack compute shaders */
     private long computePipelineLayout = VK_NULL_HANDLE;
 
-    /** Descriptor pool for compute descriptor sets */
-    private long computeDescriptorPool = VK_NULL_HANDLE;
+    /** Per-frame descriptor pools for compute descriptor sets */
+    private long[] computeDescriptorPools = new long[0];
+
+    /** Number of frames-in-flight used to size per-frame pools */
+    private int framesInFlight = 3;
 
     /** Created compute pipelines: program name → VkPipeline */
     private final Map<String, Long> computePipelines = new LinkedHashMap<>();
@@ -167,10 +173,10 @@ public class ShaderpackComputeManager {
      *
      * <p>Layout bindings for shaderpack compute:</p>
      * <pre>
-     *   Binding 0:  Uniform Buffer (shaderpack UBO — same as graphics set 0)
-     *   Binding 1-16:  Combined Image Samplers (colortex, depthtex, shadowtex, etc.)
-     *   Binding 17-24: Storage Images (colorimg0 through colorimg7)
-     *   Binding 25-40: Storage Buffers (SSBO indices 0-15)
+     *   Binding 0:      Uniform Buffer (shaderpack UBO — same as graphics set 0)
+     *   Binding 1-32:   Combined Image Samplers (colortex, depthtex, shadowtex, etc.)
+     *   Binding 33-40:  Storage Images (colorimg0 through colorimg7)
+     *   Binding 41-56:  Storage Buffers (SSBO indices 0-15)
      * </pre>
      */
     public void initialize() {
@@ -180,7 +186,15 @@ public class ShaderpackComputeManager {
 
         createComputeDescriptorSetLayout(device);
         createComputePipelineLayout(device);
-        createComputeDescriptorPool(device);
+        int configuredFrames = 3;
+        try {
+            if (net.vulkanium.Vulkanium.getConfig() != null) {
+                configuredFrames = Math.max(1, net.vulkanium.Vulkanium.getConfig().getFramesInFlight());
+            }
+        } catch (Exception ignored) {
+        }
+        this.framesInFlight = configuredFrames;
+        createComputeDescriptorPools(device, configuredFrames);
 
         initialized = true;
         LOGGER.info("Shaderpack compute manager initialized");
@@ -256,36 +270,42 @@ public class ShaderpackComputeManager {
         }
     }
 
-    private void createComputeDescriptorPool(VkDevice device) {
+        private void createComputeDescriptorPools(VkDevice device, int framesInFlight) {
         try (MemoryStack stack = stackPush()) {
-            int maxSets = 64; // Enough for all composite/deferred compute passes
+            final int maxSetsPerFrame = 512;
+            this.computeDescriptorPools = new long[Math.max(1, framesInFlight)];
 
+            for (int frame = 0; frame < this.computeDescriptorPools.length; frame++) {
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(4, stack);
             poolSizes.get(0)
-                    .type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
-                    .descriptorCount(maxSets);
+                .type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
+                .descriptorCount(maxSetsPerFrame);
             poolSizes.get(1)
-                    .type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .descriptorCount(maxSets * MAX_SAMPLERS);
+                .type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                .descriptorCount(maxSetsPerFrame * MAX_SAMPLERS);
             poolSizes.get(2)
-                    .type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
-                    .descriptorCount(maxSets * MAX_STORAGE_IMAGES);
+                .type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                .descriptorCount(maxSetsPerFrame * MAX_STORAGE_IMAGES);
             poolSizes.get(3)
-                    .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
-                    .descriptorCount(maxSets * MAX_SSBOS);
+                .type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                .descriptorCount(maxSetsPerFrame * MAX_SSBOS);
 
             VkDescriptorPoolCreateInfo ci = VkDescriptorPoolCreateInfo.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
-                    .flags(VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)
-                    .maxSets(maxSets)
-                    .pPoolSizes(poolSizes);
+                .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
+                .flags(0)
+                .maxSets(maxSetsPerFrame)
+                .pPoolSizes(poolSizes);
 
             LongBuffer pPool = stack.mallocLong(1);
             int result = vkCreateDescriptorPool(device, ci, null, pPool);
             if (result != VK_SUCCESS) {
-                throw new RuntimeException("Failed to create compute descriptor pool: " + result);
+                throw new RuntimeException("Failed to create compute descriptor pool (frame " + frame + "): " + result);
             }
-            computeDescriptorPool = pPool.get(0);
+            this.computeDescriptorPools[frame] = pPool.get(0);
+            }
+
+            LOGGER.info("Shaderpack compute descriptor pools created: {} pools × {} sets/frame",
+                this.computeDescriptorPools.length, maxSetsPerFrame);
         }
     }
 
@@ -340,23 +360,49 @@ public class ShaderpackComputeManager {
     /**
      * Allocates a descriptor set for a compute pass.
      */
-    public long allocateComputeDescriptorSet() {
-        if (computeDescriptorPool == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    public long allocateComputeDescriptorSet(int frameIndex) {
+        if (computeDescriptorPools == null || computeDescriptorPools.length == 0) return VK_NULL_HANDLE;
+
+        int idx = Math.floorMod(frameIndex, computeDescriptorPools.length);
+        long descriptorPool = computeDescriptorPools[idx];
+        if (descriptorPool == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
         VkDevice device = VulkaniumDevice.getGlobalDevice();
         try (MemoryStack stack = stackPush()) {
             VkDescriptorSetAllocateInfo allocInfo = VkDescriptorSetAllocateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO)
-                    .descriptorPool(computeDescriptorPool)
+                    .descriptorPool(descriptorPool)
                     .pSetLayouts(stack.longs(computeDescriptorSetLayout));
 
             LongBuffer pSet = stack.mallocLong(1);
             int result = vkAllocateDescriptorSets(device, allocInfo, pSet);
             if (result != VK_SUCCESS) {
-                LOGGER.error("Failed to allocate compute descriptor set: {}", result);
+                LOGGER.error("Failed to allocate compute descriptor set (frame={} pool=0x{}): {}",
+                        idx, Long.toHexString(descriptorPool), result);
                 return VK_NULL_HANDLE;
             }
             return pSet.get(0);
+        }
+    }
+
+    /**
+     * Resets the descriptor pool for the current frame index.
+     *
+     * <p>This is safe when called at frame begin after waiting for the frame fence.
+     * It reclaims all descriptor sets allocated from that frame's pool in prior uses
+     * of the same frame slot.</p>
+     */
+    public void resetDescriptorPoolForFrame(int frameIndex) {
+        if (!initialized || computeDescriptorPools == null || computeDescriptorPools.length == 0) return;
+
+        int idx = Math.floorMod(frameIndex, computeDescriptorPools.length);
+        long pool = computeDescriptorPools[idx];
+        if (pool == VK_NULL_HANDLE) return;
+
+        VkDevice device = VulkaniumDevice.getGlobalDevice();
+        int result = vkResetDescriptorPool(device, pool, 0);
+        if (result != VK_SUCCESS) {
+            LOGGER.warn("Failed to reset compute descriptor pool for frame {}: {}", idx, result);
         }
     }
 
@@ -520,12 +566,12 @@ public class ShaderpackComputeManager {
     }
 
     /**
-     * Records a pipeline barrier between compute shader writes and fragment shader reads.
+     * Records a pipeline barrier after compute dispatch.
      *
      * <p>Reference: Iris CompositeRenderer (Iris Shaders, LGPL-3.0) uses
      * {@code glMemoryBarrier(IMAGE_ACCESS | TEXTURE_FETCH | SHADER_STORAGE)}
-     * after each compute dispatch. The Vulkan equivalent is a VkMemoryBarrier
-     * from COMPUTE_SHADER_BIT to FRAGMENT_SHADER_BIT.</p>
+     * after each compute dispatch. The Vulkan equivalent must make writes
+     * visible to both subsequent compute passes and fragment sampling/reads.</p>
      *
      * @param cmd Active VkCommandBuffer
      */
@@ -534,11 +580,11 @@ public class ShaderpackComputeManager {
             VkMemoryBarrier.Buffer barrier = VkMemoryBarrier.calloc(1, stack)
                     .sType(VK_STRUCTURE_TYPE_MEMORY_BARRIER)
                     .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
-                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
 
             vkCmdPipelineBarrier(cmd,
                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                     0, barrier, null, null);
         }
     }
@@ -577,19 +623,39 @@ public class ShaderpackComputeManager {
     public void destroy() {
         VkDevice device = VulkaniumDevice.getGlobalDevice();
 
-        // Destroy compute pipelines
+        if (device == null) {
+            computePipelines.clear();
+            computePrograms.clear();
+            computeDescriptorPools = new long[0];
+            computePipelineLayout = VK_NULL_HANDLE;
+            computeDescriptorSetLayout = VK_NULL_HANDLE;
+            initialized = false;
+            return;
+        }
+
+        // Ensure GPU is idle before tearing down compute resources to avoid
+        // driver-side crashes when pipelines are still referenced in flight.
+        vkDeviceWaitIdle(device);
+
+        // Destroy compute pipelines (deduplicated by handle).
+        Set<Long> destroyed = new HashSet<>();
         for (long pipeline : computePipelines.values()) {
-            if (pipeline != VK_NULL_HANDLE) {
+            if (pipeline != VK_NULL_HANDLE && destroyed.add(pipeline)) {
                 vkDestroyPipeline(device, pipeline, null);
             }
         }
         computePipelines.clear();
         computePrograms.clear();
 
-        // Destroy descriptor pool (frees all allocated descriptor sets)
-        if (computeDescriptorPool != VK_NULL_HANDLE) {
-            vkDestroyDescriptorPool(device, computeDescriptorPool, null);
-            computeDescriptorPool = VK_NULL_HANDLE;
+        // Destroy descriptor pools (each frees all allocated descriptor sets)
+        if (computeDescriptorPools != null) {
+            for (int i = 0; i < computeDescriptorPools.length; i++) {
+                long pool = computeDescriptorPools[i];
+                if (pool != VK_NULL_HANDLE) {
+                    vkDestroyDescriptorPool(device, pool, null);
+                }
+            }
+            computeDescriptorPools = new long[0];
         }
 
         // Destroy pipeline layout
