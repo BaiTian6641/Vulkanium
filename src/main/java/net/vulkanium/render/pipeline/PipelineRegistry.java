@@ -177,9 +177,9 @@ public class PipelineRegistry {
             void main() {
                 vec4 tex = texture(Sampler0, fragTexCoord);
                 vec4 baseColor = tex * fragColor * fragColorMod;
-                // Discard fully transparent pixels to prevent black backgrounds on
-                // particles (rain splash, etc.) when blending is disabled.
-                if (baseColor.a < 0.004) discard;
+                // Match vanilla: only discard exact-zero alpha.
+                // Keeps soft particle/cloud edges intact with additive blending.
+                if (baseColor.a == 0.0) discard;
                 float fogStart = ubo.FogRange.x;
                 float fogEnd = ubo.FogRange.y;
                 float fogFactor = (fogEnd > fogStart)
@@ -228,21 +228,17 @@ public class PipelineRegistry {
             void main() {
                 vec4 tex = texture(Sampler0, fragTexCoord);
                 vec4 baseColor = tex * fragColorMod;
-                // Discard pixels with very low alpha — prevents:
-                //  · Transparent sun/moon quad edges from rendering as opaque squares
-                //  · Black backgrounds on particle sheets when blending is disabled
-                //  · Near-transparent fog-colored halos around sky objects
-                // Threshold 0.01 (~3/255) catches anti-aliased edges from texture filtering
-                // while preserving genuinely semi-transparent content.
-                if (baseColor.a < 0.01) discard;
-                float fogStart = ubo.FogRange.x;
-                float fogEnd = ubo.FogRange.y;
-                float fogFactor = (fogEnd > fogStart)
-                    ? clamp((fogEnd - vertexDistance) / (fogEnd - fogStart), 0.0, 1.0)
-                    : 1.0;
-                // Only apply fog to RGB; preserve original alpha for correct blending.
-                // For sky objects (sun/moon), fogFactor is typically 1.0 (no fog).
-                outColor = vec4(mix(ubo.FogColor.rgb, baseColor.rgb, fogFactor), baseColor.a);
+                // Match vanilla rendertype_position_tex behavior:
+                // Only discard exact-zero alpha pixels. The sun/moon use additive
+                // blending (SRC_ALPHA, ONE) where even tiny alpha values contribute
+                // to the soft emission glow. A higher threshold clips those soft edges
+                // and creates a hard-edged disk instead of a gradual glow.
+                if (baseColor.a == 0.0) discard;
+                // Vanilla position_tex does NOT apply fog. Sun/moon call setupNoFog()
+                // (fogStart=MAX_VALUE) before rendering. Applying fog here would tint
+                // the sun/moon toward FogColor during sunrise/sunset, making them appear
+                // opaque instead of luminous. Matches vanilla rendertype_position_tex.fsh.
+                outColor = baseColor;
             }
             """;
 

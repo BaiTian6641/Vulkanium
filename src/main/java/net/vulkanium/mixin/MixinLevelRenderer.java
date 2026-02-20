@@ -39,7 +39,12 @@ public abstract class MixinLevelRenderer {
 
     /**
      * Target method descriptors for LevelRenderer injection points.
+     *
+     * <p>Reference from Iris: net.irisshaders.iris.mixin.MixinLevelRenderer
+     * — Sky sub-phase injection (SUN, MOON, STARS, SUNSET, SKY, CUSTOM_SKY, VOID)
+     *   inside renderSky() to set WorldRenderingPhase for shaderpack renderStage uniform.</p>
      */
+    private static final String RENDER_SKY = "Lnet/minecraft/client/renderer/LevelRenderer;renderSky(Lcom/mojang/blaze3d/vertex/PoseStack;Lorg/joml/Matrix4f;FLnet/minecraft/client/Camera;ZLjava/lang/Runnable;)V";
     private static final String RENDER_CLOUDS = "Lnet/minecraft/client/renderer/LevelRenderer;renderClouds(Lcom/mojang/blaze3d/vertex/PoseStack;Lorg/joml/Matrix4f;FDDD)V";
 
     @Shadow @Nullable private ClientLevel level;
@@ -190,6 +195,127 @@ public abstract class MixinLevelRenderer {
                                       CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.NONE);
+    }
+
+    // ─── Sky sub-phase injection ─────────────────────────────────────────────
+    // Reference from Iris: net.irisshaders.iris.mixin.MixinLevelRenderer
+    // Sets WorldRenderingPhase for each sub-phase of renderSky() so that
+    // shaderpacks can distinguish SUN, MOON, STARS, SUNSET, etc. via the
+    // renderStage uniform. Without these, everything inside renderSky is
+    // just "sky" and phase-dependent shader logic won't activate.
+
+    /**
+     * Before renderSky() is invoked in renderLevel(), set CUSTOM_SKY phase.
+     * This catches any custom sky rendering (e.g. FabricSkyboxes) that happens
+     * before the vanilla sky code calls levelFogColor().
+     */
+    @Inject(method = "renderLevel",
+            at = @At(value = "INVOKE", target = RENDER_SKY))
+    private void vulkanium$beginSky(PoseStack poseStack, float partialTick,
+                                     long finishNanoTime, boolean renderBlockOutline,
+                                     Camera camera, GameRenderer gameRenderer,
+                                     LightTexture lightTexture, Matrix4f projectionMatrix,
+                                     CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.CUSTOM_SKY);
+    }
+
+    /**
+     * After renderSky() completes in renderLevel(), reset phase to NONE.
+     */
+    @Inject(method = "renderLevel",
+            at = @At(value = "INVOKE", target = RENDER_SKY, shift = At.Shift.AFTER))
+    private void vulkanium$endSky(PoseStack poseStack, float partialTick,
+                                   long finishNanoTime, boolean renderBlockOutline,
+                                   Camera camera, GameRenderer gameRenderer,
+                                   LightTexture lightTexture, Matrix4f projectionMatrix,
+                                   CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.NONE);
+    }
+
+    /**
+     * Inside renderSky(): when levelFogColor() is called, vanilla sky rendering begins.
+     * Transition from CUSTOM_SKY → SKY.
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "INVOKE",
+                     target = "Lnet/minecraft/client/renderer/FogRenderer;levelFogColor()V"))
+    private void vulkanium$beginNormalSky(PoseStack poseStack, Matrix4f projectionMatrix,
+                                          float f, Camera camera, boolean bl,
+                                          Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.SKY);
+    }
+
+    /**
+     * Inside renderSky(): when SUN_LOCATION field is accessed, sun rendering begins.
+     * Reference from Iris: iris$setSunRenderStage
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "FIELD",
+                     target = "Lnet/minecraft/client/renderer/LevelRenderer;SUN_LOCATION:Lnet/minecraft/resources/ResourceLocation;"))
+    private void vulkanium$beginSun(PoseStack poseStack, Matrix4f projectionMatrix,
+                                     float f, Camera camera, boolean bl,
+                                     Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.SUN);
+    }
+
+    /**
+     * Inside renderSky(): when MOON_LOCATION field is accessed, moon rendering begins.
+     * Reference from Iris: iris$setMoonRenderStage
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "FIELD",
+                     target = "Lnet/minecraft/client/renderer/LevelRenderer;MOON_LOCATION:Lnet/minecraft/resources/ResourceLocation;"))
+    private void vulkanium$beginMoon(PoseStack poseStack, Matrix4f projectionMatrix,
+                                      float f, Camera camera, boolean bl,
+                                      Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.MOON);
+    }
+
+    /**
+     * Inside renderSky(): when getSunriseColor() is invoked, sunset/sunrise rendering begins.
+     * Reference from Iris: iris$setSunsetRenderStage
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "INVOKE",
+                     target = "Lnet/minecraft/client/renderer/DimensionSpecialEffects;getSunriseColor(FF)[F"))
+    private void vulkanium$beginSunset(PoseStack poseStack, Matrix4f projectionMatrix,
+                                        float f, Camera camera, boolean bl,
+                                        Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.SUNSET);
+    }
+
+    /**
+     * Inside renderSky(): when getStarBrightness() is invoked, star rendering begins.
+     * Reference from Iris: iris$setStarRenderStage
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "INVOKE",
+                     target = "Lnet/minecraft/client/multiplayer/ClientLevel;getStarBrightness(F)F"))
+    private void vulkanium$beginStars(PoseStack poseStack, Matrix4f projectionMatrix,
+                                       float f, Camera camera, boolean bl,
+                                       Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.STARS);
+    }
+
+    /**
+     * Inside renderSky(): when getEyePosition() is invoked, void rendering begins.
+     * Reference from Iris: iris$setVoidRenderStage
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "INVOKE",
+                     target = "Lnet/minecraft/client/player/LocalPlayer;getEyePosition(F)Lnet/minecraft/world/phys/Vec3;"))
+    private void vulkanium$beginVoid(PoseStack poseStack, Matrix4f projectionMatrix,
+                                      float f, Camera camera, boolean bl,
+                                      Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.VOID);
     }
 
     /**

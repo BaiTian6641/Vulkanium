@@ -1059,25 +1059,14 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (programSet == null) return true;
 
         // ── Check iris.features.required ──
-        // These are features the pack declares it needs to function properly.
-        // We support some, but not all (e.g., CUSTOM_IMAGES, COMPUTE require Vulkan compute shaders).
+        // Validate required features using the FeatureFlags enum.
+        // Reference: Iris FeatureFlags.isInvalid() / getInvalidStatus() from
+        // net.irisshaders.iris.features.FeatureFlags (Iris Shaders, LGPL-3.0).
         if (properties != null && !properties.getRequiredFeatures().isEmpty()) {
-            // Features Vulkanium currently supports
-            Set<String> supportedFeatures = Set.of(
-                    "HIGHER_SHADOWCOLOR", "PER_BUFFER_BLENDING",
-                    "SEPARATE_HARDWARE_SAMPLERS", "ENTITY_TRANSLUCENT",
-                    "EXTENDED_SHADOW"
-            );
-            List<String> unsupported = new ArrayList<>();
-            for (String feature : properties.getRequiredFeatures()) {
-                if (!supportedFeatures.contains(feature)) {
-                    unsupported.add(feature);
-                }
-            }
+            List<String> unsupported = FeatureFlags.getUnsupportedFeatures(properties.getRequiredFeatures());
             if (!unsupported.isEmpty()) {
                 LOGGER.warn("[COMPAT] Pack requires unsupported features: {}", unsupported);
-                compatibilityIssueMessage = "Required features not supported: " + String.join(", ", unsupported)
-                        + ". Pack may not render correctly.";
+                compatibilityIssueMessage = FeatureFlags.getUnsupportedMessage(properties.getRequiredFeatures());
                 // Don't return false — let the pack try to load anyway
             }
         }
@@ -1283,7 +1272,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             CompiledProgram program = compiledPrograms.get(programId);
             if (program == null || program.vertexModule == 0 || program.fragmentModule == 0) continue;
 
-            if (!shouldExecuteFullscreenProgram(program)) {
+            if (!shouldExecuteFullscreenProgram(programId, program)) {
                 skipped++;
                 continue;
             }
@@ -1437,9 +1426,27 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
     }
 
-    private boolean shouldExecuteFullscreenProgram(CompiledProgram program) {
+    /**
+     * Determines whether a specific fullscreen program should be executed.
+     *
+     * <p>In FULL mode, all programs execute. In SAFE mode, programs are filtered:
+     * compute-associated passes are skipped, and only colortex0-writing passes run.
+     * This allows packs with mixed compute+graphics chains (like iterationRP) to
+     * at least render their non-compute graphics passes.</p>
+     */
+    private boolean shouldExecuteFullscreenProgram(ProgramId programId, CompiledProgram program) {
         if (FULLSCREEN_COMPAT_MODE == FullscreenCompatMode.FULL) {
             return true;
+        }
+
+        // Safe mode: skip compute-associated passes (compute dispatch not yet implemented)
+        ProgramSource source = programSet != null ? programSet.getAllPrograms().get(programId) : null;
+        if (source != null && source.isValidCompute()) {
+            if (warnedUnsafePrograms.add(programId)) {
+                LOGGER.info("[FULLSCREEN] Skipping compute-associated pass {} in safe mode (vkCmdDispatch not implemented)",
+                        programId.getSourceName());
+            }
+            return false;
         }
 
         int[] renderTargets = program.renderTargets;
@@ -1453,11 +1460,29 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 writesColor0 = true;
                 continue;
             }
+            // Non-colortex0 target in safe mode — skip this pass
+            if (warnedUnsafePrograms.add(programId)) {
+                LOGGER.info("[FULLSCREEN] Skipping {} in safe mode (writes to non-colortex0 targets: {})",
+                        programId.getSourceName(), java.util.Arrays.toString(renderTargets));
+            }
             return false;
         }
         return writesColor0;
     }
 
+    /**
+     * Determines whether safe-mode fullscreen execution is allowed.
+     *
+     * <p>In safe mode, compute-only passes are individually skipped during execution
+     * rather than blocking the entire chain. This allows packs like iterationRP
+     * (which mix compute + graphics passes) to still render their graphics passes.</p>
+     *
+     * <p>Reference: Iris {@code CompositeRenderer} (Iris Shaders, LGPL-3.0) iterates
+     * all passes and dispatches compute programs individually via
+     * {@code ComputeProgram.dispatch()}, then runs the associated fragment pass.
+     * Compute-only passes (no fragment shader) are supported as {@code ComputeOnlyPass}.
+     * We skip compute dispatch but still execute graphics fragment passes.</p>
+     */
     private boolean isSafeModeExecutionAllowed() {
         if (safeFullscreenExecutionAllowed != null) {
             return safeFullscreenExecutionAllowed;
@@ -1465,20 +1490,25 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
         boolean hasSafeGraphicsPass = false;
         for (ProgramId programId : FULLSCREEN_PASS_ORDER) {
-            ProgramSource source = programSet != null ? programSet.getAllPrograms().get(programId) : null;
-            if (source != null && source.isValidCompute()) {
-                safeFullscreenExecutionAllowed = false;
-                return false;
-            }
-
             CompiledProgram program = compiledPrograms.get(programId);
             if (program == null || program.vertexModule == 0 || program.fragmentModule == 0) {
                 continue;
             }
+
+            // In safe mode, we skip compute-associated passes at execution time
+            // rather than blocking everything. Check if we have at least one
+            // pure graphics pass that writes to colortex0.
+            ProgramSource source = programSet != null ? programSet.getAllPrograms().get(programId) : null;
+            if (source != null && source.isValidCompute()) {
+                // This pass has compute — will be skipped individually at execution time.
+                // Don't block the entire chain.
+                continue;
+            }
+
             hasSafeGraphicsPass = true;
             if (!writesOnlyColor0(program.renderTargets)) {
-                safeFullscreenExecutionAllowed = false;
-                return false;
+                // In safe mode, non-colortex0 writes are still skipped individually
+                continue;
             }
         }
 

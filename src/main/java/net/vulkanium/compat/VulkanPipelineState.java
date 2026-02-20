@@ -55,18 +55,21 @@ public record VulkanPipelineState(
      * Convert GL blend factor to Vulkan VkBlendFactor.
      */
     public static int glBlendToVk(int glFactor) {
+        // Must match VRenderSystem.glToVkBlendFactor() — GL and VK enum ordinals
+        // do NOT correspond directly for SRC_ALPHA..DST_COLOR range.
+        // Reference: Iris IrisRenderSystem blend conversions.
         return switch (glFactor) {
-            case 0 -> 0;      // GL_ZERO → VK_BLEND_FACTOR_ZERO
-            case 1 -> 1;      // GL_ONE → VK_BLEND_FACTOR_ONE
-            case 0x0300 -> 2;  // GL_SRC_COLOR → VK_BLEND_FACTOR_SRC_COLOR
-            case 0x0301 -> 3;  // GL_ONE_MINUS_SRC_COLOR → VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR
-            case 0x0302 -> 4;  // GL_SRC_ALPHA → VK_BLEND_FACTOR_SRC_ALPHA
-            case 0x0303 -> 5;  // GL_ONE_MINUS_SRC_ALPHA → VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
-            case 0x0304 -> 6;  // GL_DST_ALPHA → VK_BLEND_FACTOR_DST_ALPHA
-            case 0x0305 -> 7;  // GL_ONE_MINUS_DST_ALPHA → VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
-            case 0x0306 -> 8;  // GL_DST_COLOR → VK_BLEND_FACTOR_DST_COLOR
-            case 0x0307 -> 9;  // GL_ONE_MINUS_DST_COLOR → VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
-            case 0x0308 -> 10; // GL_SRC_ALPHA_SATURATE → VK_BLEND_FACTOR_SRC_ALPHA_SATURATE
+            case 0      -> 0;   // GL_ZERO              → VK_BLEND_FACTOR_ZERO
+            case 1      -> 1;   // GL_ONE               → VK_BLEND_FACTOR_ONE
+            case 0x0300 -> 2;   // GL_SRC_COLOR         → VK_BLEND_FACTOR_SRC_COLOR
+            case 0x0301 -> 3;   // GL_ONE_MINUS_SRC_COLOR → VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR
+            case 0x0302 -> 6;   // GL_SRC_ALPHA         → VK_BLEND_FACTOR_SRC_ALPHA
+            case 0x0303 -> 7;   // GL_ONE_MINUS_SRC_ALPHA → VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+            case 0x0304 -> 8;   // GL_DST_ALPHA         → VK_BLEND_FACTOR_DST_ALPHA
+            case 0x0305 -> 9;   // GL_ONE_MINUS_DST_ALPHA → VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+            case 0x0306 -> 4;   // GL_DST_COLOR         → VK_BLEND_FACTOR_DST_COLOR
+            case 0x0307 -> 5;   // GL_ONE_MINUS_DST_COLOR → VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
+            case 0x0308 -> 14;  // GL_SRC_ALPHA_SATURATE → VK_BLEND_FACTOR_SRC_ALPHA_SATURATE
             default -> 0;
         };
     }
