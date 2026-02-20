@@ -1105,14 +1105,22 @@ public class VulkaniumGlslTransformer {
      * Composite vertex transform: fullscreen triangle from gl_VertexIndex.
      */
     private static String transformCompositeVertex(String source) {
+        // The fullscreen triangle position is computed procedurally from
+        // gl_VertexIndex.  We store it in vkm_composite_ClipPos so we can
+        // unconditionally override gl_Position at the END of main(),
+        // preventing camera projection/modelview matrices from distorting
+        // the triangle (those matrices stay available for the fragment
+        // shader's gbufferProjection / gbufferModelView aliases).
         String compute = """
                 // ── Vulkanium Composite Fullscreen Triangle ──
                 vec2 vkm_composite_TexCoord;
+                vec4 vkm_composite_ClipPos;
                 vec4 vkm_composite_Position() {
                     float x = -1.0 + float((gl_VertexIndex & 1) << 2);
                     float y = -1.0 + float((gl_VertexIndex & 2) << 1);
                     vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
-                    return vec4(x, y, 0.0, 1.0);
+                    vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
+                    return vkm_composite_ClipPos;
                 }
                 """;
 
@@ -1132,6 +1140,14 @@ public class VulkaniumGlslTransformer {
         if (source.contains("ftransform")) {
             source = source.replaceAll("\\bftransform\\s*\\(\\s*\\)", "vkm_composite_Position()");
         }
+
+        // Force gl_Position to the procedural clip-space position at the
+        // very end of main().  This overrides any
+        //   gl_Position = iris_ProjectionMatrix * iris_ModelViewMatrix * ...
+        // that the original shader may compute, which would distort the
+        // fullscreen triangle through the camera matrices.
+        source = injectAtEndOfMain(source,
+                "    gl_Position = vkm_composite_ClipPos; // [Vulkanium] force fullscreen clip pos");
 
         return source;
     }
@@ -1215,5 +1231,35 @@ public class VulkaniumGlslTransformer {
         }
 
         return source;
+    }
+
+    /**
+     * Injects a code statement just before the closing brace of main().
+     * Used by composite vertex shaders to override gl_Position at the end.
+     */
+    private static String injectAtEndOfMain(String source, String code) {
+        // Find "void main()" or "void main(void)"
+        int mainIdx = source.indexOf("void main()");
+        if (mainIdx < 0) mainIdx = source.indexOf("void main(void)");
+        if (mainIdx < 0) return source;
+
+        // Find the opening brace of main()
+        int openBrace = source.indexOf('{', mainIdx);
+        if (openBrace < 0) return source;
+
+        // Walk to the matching closing brace
+        int depth = 1;
+        int i = openBrace + 1;
+        while (i < source.length() && depth > 0) {
+            char c = source.charAt(i);
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+            i++;
+        }
+        if (depth != 0) return source; // Unbalanced braces
+
+        // i now points right after the closing brace; insert before it
+        int closeBrace = i - 1;
+        return source.substring(0, closeBrace) + "\n" + code + "\n" + source.substring(closeBrace);
     }
 }

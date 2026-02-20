@@ -619,8 +619,11 @@ public class Vulkanium implements ClientModInitializer {
 
         // Descriptor sets are now updated per-draw in recordDraw()
 
-        if (frameHadWorldRender
-                && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+        // Always call onFrameBegin for shaderpack pipelines so they can
+        // prepare per-frame uniform data.  The previous guard checked
+        // frameHadWorldRender which was just reset to false above — making
+        // this block unreachable.
+        if (getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
                 && shaderpackManager != null
                 && shaderpackManager.getActivePipeline() != null
                 && shaderpackManager.getActivePipeline().isLoaded()) {
@@ -648,18 +651,17 @@ public class Vulkanium implements ClientModInitializer {
                 && shaderpackManager != null
                 && shaderpackManager.getActivePipeline() != null
                 && shaderpackManager.getActivePipeline().isLoaded()) {
-            int imageIndex = frameOrchestrator.getCurrentImageIndex();
-            int width = vulkanSwapchain.getWidth();
-            int height = vulkanSwapchain.getHeight();
 
             if (shaderpackManager
                     .getActivePipeline() instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline) {
+                // Capture scene color/depth into MRT render targets (outside render pass)
                 vkPipeline.prepareFullscreenInputs(cmd, frameOrchestrator.getCurrentFrame());
             }
 
-            mainRenderPass.beginPreserve(cmd, imageIndex, width, height);
+            // Fullscreen passes now manage their own MRT render passes and
+            // blit the final colortex0 result back to the swapchain, so no
+            // beginPreserve/end wrapper is needed.
             shaderpackManager.getActivePipeline().onFrameEnd(cmd, frameOrchestrator.getCurrentFrame());
-            mainRenderPass.end(cmd);
         }
 
         // ── RT pass: feed chunk meshes to RT pipeline, then dispatch ──

@@ -43,6 +43,7 @@ public class BasicPipeline {
 
     private VertexFormat vertexFormat;
     private String name;
+    private int colorAttachmentCount = 1;
 
     /**
      * Creates a pipeline for the given shader sources and vertex format.
@@ -92,6 +93,18 @@ public class BasicPipeline {
                                       long vertShaderModule, long fragShaderModule,
                                       long geomShaderModule,
                                       VertexFormat vertexFormat) {
+        initializeWithModules(device, renderPass, name, vertShaderModule, fragShaderModule,
+                geomShaderModule, vertexFormat, 1);
+    }
+
+    /**
+     * Initializes a pipeline using pre-created shader modules with explicit color attachment count.
+     * Use {@code colorAttachmentCount > 1} for MRT (Multiple Render Targets) render passes.
+     */
+    public void initializeWithModules(VkDevice device, long renderPass, String name,
+                                      long vertShaderModule, long fragShaderModule,
+                                      long geomShaderModule,
+                                      VertexFormat vertexFormat, int colorAttachmentCount) {
         this.device = device;
         this.renderPass = renderPass;
         this.name = name;
@@ -101,6 +114,7 @@ public class BasicPipeline {
         this.vertShaderModule = vertShaderModule;
         this.fragShaderModule = fragShaderModule;
         this.geomShaderModule = geomShaderModule;
+        this.colorAttachmentCount = colorAttachmentCount;
 
         createDescriptorSetLayout();
         createPipelineLayout();
@@ -262,20 +276,23 @@ public class BasicPipeline {
                     .depthBoundsTestEnable(false)
                     .stencilTestEnable(false);
 
-            // Color blend: per-draw blend factors
-            VkPipelineColorBlendAttachmentState.Buffer colorBlendAttachment = VkPipelineColorBlendAttachmentState.calloc(1, stack);
-            colorBlendAttachment.get(0)
-                    .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                    .blendEnable(blendEnabled);
-            if (blendEnabled) {
-                colorBlendAttachment.get(0)
-                        .srcColorBlendFactor(srcColorBlend)
-                        .dstColorBlendFactor(dstColorBlend)
-                        .colorBlendOp(VK_BLEND_OP_ADD)
-                        .srcAlphaBlendFactor(srcAlphaBlend)
-                        .dstAlphaBlendFactor(dstAlphaBlend)
-                        .alphaBlendOp(VK_BLEND_OP_ADD);
+            // Color blend: one attachment state per color attachment in the render pass
+            VkPipelineColorBlendAttachmentState.Buffer colorBlendAttachment =
+                    VkPipelineColorBlendAttachmentState.calloc(colorAttachmentCount, stack);
+            for (int att = 0; att < colorAttachmentCount; att++) {
+                colorBlendAttachment.get(att)
+                        .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+                        .blendEnable(blendEnabled);
+                if (blendEnabled) {
+                    colorBlendAttachment.get(att)
+                            .srcColorBlendFactor(srcColorBlend)
+                            .dstColorBlendFactor(dstColorBlend)
+                            .colorBlendOp(VK_BLEND_OP_ADD)
+                            .srcAlphaBlendFactor(srcAlphaBlend)
+                            .dstAlphaBlendFactor(dstAlphaBlend)
+                            .alphaBlendOp(VK_BLEND_OP_ADD);
+                }
             }
 
             VkPipelineColorBlendStateCreateInfo colorBlend = VkPipelineColorBlendStateCreateInfo.calloc(stack)
