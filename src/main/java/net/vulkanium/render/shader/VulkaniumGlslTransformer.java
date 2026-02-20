@@ -1141,10 +1141,32 @@ public class VulkaniumGlslTransformer {
         private static String applyCompatibilityFallbacks(String source) {
         String result = source;
 
-        result = replaceOutsideDeclarations(result,
-            "MC_RENDER_STAGE_TERRAIN_SOLID", "0.0");
-        result = replaceOutsideDeclarations(result,
-            "MC_RENDER_STAGE_TERRAIN_TRANSLUCENT", "1.0");
+        // Render stage constants — ordinals match Iris WorldRenderingPhase enum
+        // Reference: net.irisshaders.iris.pipeline.WorldRenderingPhase (Iris, LGPL-3.0)
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_NONE", "0");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_SKY", "1");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_SUNSET", "2");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_CUSTOM_SKY", "3");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_SUN", "4");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_MOON", "5");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_STARS", "6");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_VOID", "7");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_TERRAIN_SOLID", "8");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_TERRAIN_CUTOUT_MIPPED", "9");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_TERRAIN_CUTOUT", "10");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_ENTITIES", "11");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_BLOCK_ENTITIES", "12");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_DESTROY", "13");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_OUTLINE", "14");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_DEBUG", "15");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_HAND_SOLID", "16");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_TERRAIN_TRANSLUCENT", "17");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_TRIPWIRE", "18");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_PARTICLES", "19");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_CLOUDS", "20");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_RAIN_SNOW", "21");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_WORLD_BORDER", "22");
+        result = replaceOutsideDeclarations(result, "MC_RENDER_STAGE_HAND_TRANSLUCENT", "23");
 
         result = replaceOutsideDeclarations(result,
             "fsrScreenSize", "vec2(iris_ScreenSize.x, iris_ScreenSize.y)");

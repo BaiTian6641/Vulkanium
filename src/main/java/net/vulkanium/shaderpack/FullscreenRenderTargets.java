@@ -360,6 +360,77 @@ public class FullscreenRenderTargets {
     }
 
     /**
+     * Transitions read-side color targets to VK_IMAGE_LAYOUT_GENERAL for compute
+     * shader storage image (imageLoad/imageStore) access.
+     *
+     * <p>Compute shaders bind colortex images as both combined-image-samplers (read)
+     * and storage images (read-write). VK_IMAGE_LAYOUT_GENERAL is compatible with
+     * both access types. After compute dispatch, call
+     * {@link #transitionReadTargetsFromGeneral(VkCommandBuffer, int)} to restore
+     * SHADER_READ_ONLY_OPTIMAL for subsequent fragment sampling.</p>
+     *
+     * @param cmd    Active command buffer
+     * @param count  Number of targets to transition (from index 0)
+     */
+    public void transitionReadTargetsToGeneral(VkCommandBuffer cmd, int count) {
+        for (int i = 0; i < Math.min(count, MAX_COLOR_TARGETS); i++) {
+            int side = flipped[i] ? 1 : 0; // read side
+            int currentLayout = colorLayouts[i][side];
+            if (currentLayout == VK_IMAGE_LAYOUT_GENERAL) continue;
+
+            RenderTarget read = getReadTarget(i);
+            if (read == null || read.getImage() == VK_NULL_HANDLE) continue;
+
+            int srcAccess = 0;
+            int srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            if (currentLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                srcAccess = VK_ACCESS_SHADER_READ_BIT;
+                srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            } else if (currentLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+                srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            }
+
+            VulkaniumCommand.transitionImageLayout(cmd, read.getImage(),
+                    currentLayout, VK_IMAGE_LAYOUT_GENERAL,
+                    srcAccess,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    srcStage,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT);
+            colorLayouts[i][side] = VK_IMAGE_LAYOUT_GENERAL;
+        }
+    }
+
+    /**
+     * Transitions read-side color targets back from VK_IMAGE_LAYOUT_GENERAL to
+     * VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL after compute dispatch completes.
+     *
+     * @param cmd    Active command buffer
+     * @param count  Number of targets to transition (from index 0)
+     */
+    public void transitionReadTargetsFromGeneral(VkCommandBuffer cmd, int count) {
+        for (int i = 0; i < Math.min(count, MAX_COLOR_TARGETS); i++) {
+            int side = flipped[i] ? 1 : 0; // read side
+            int currentLayout = colorLayouts[i][side];
+            if (currentLayout != VK_IMAGE_LAYOUT_GENERAL) continue;
+
+            RenderTarget read = getReadTarget(i);
+            if (read == null || read.getImage() == VK_NULL_HANDLE) continue;
+
+            VulkaniumCommand.transitionImageLayout(cmd, read.getImage(),
+                    VK_IMAGE_LAYOUT_GENERAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT);
+            colorLayouts[i][side] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+    }
+
+    /**
      * Transitions the read side of colortex0 to TRANSFER_SRC for blitting to swapchain.
      */
     public void transitionReadTarget0ToTransferSrc(VkCommandBuffer cmd) {

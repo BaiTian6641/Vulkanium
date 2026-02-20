@@ -11,6 +11,8 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.LongBuffer;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.vulkan.VK10.*;
@@ -92,6 +94,8 @@ public class ShaderpackComputeManager {
     private boolean initialized = false;
     private int screenWidth;
     private int screenHeight;
+    /** Tracks first dispatch per program for one-time INFO-level logging */
+    private final Set<String> firstDispatchLogged = new HashSet<>();
 
     /**
      * Information about a compiled compute program.
@@ -318,9 +322,12 @@ public class ShaderpackComputeManager {
      *
      * @param programName  Program name (e.g. "composite3", "deferred0")
      * @param shaderModule VkShaderModule handle from ShaderModuleManager
+     * @param glslSource   Raw GLSL compute source — used to parse local_size and
+     *                     workGroups/workGroupsRender directives
      * @return The ComputeProgramInfo, or null on failure
      */
-    public ComputeProgramInfo registerComputeProgram(String programName, long shaderModule) {
+    public ComputeProgramInfo registerComputeProgram(String programName, long shaderModule,
+                                                      String glslSource) {
         if (!initialized) {
             LOGGER.warn("Cannot register compute program '{}' — manager not initialized", programName);
             return null;
@@ -348,13 +355,36 @@ public class ShaderpackComputeManager {
             long pipeline = pPipeline.get(0);
             ComputeProgramInfo info = new ComputeProgramInfo(programName, shaderModule);
             info.pipeline = pipeline;
+
+            // Parse local_size and work group directives from GLSL source
+            // Reference: Iris ComputeProgram + ComputeDirectiveParser (LGPL-3.0)
+            if (glslSource != null) {
+                parseLocalSize(info, glslSource);
+                parseWorkGroupDirectives(info, glslSource);
+            }
+
             computePipelines.put(programName, pipeline);
             computePrograms.put(programName, info);
 
-            LOGGER.info("[COMPUTE] Pipeline created for '{}' (0x{})", programName,
-                    Long.toHexString(pipeline));
+            LOGGER.info("[COMPUTE] Pipeline created for '{}' (0x{}) — localSize=({},{},{}), " +
+                    "workGroups={}, relativeScale=({},{})",
+                    programName, Long.toHexString(pipeline),
+                    info.localSizeX, info.localSizeY, info.localSizeZ,
+                    info.absoluteGroupsX > 0
+                            ? "absolute(" + info.absoluteGroupsX + "," + info.absoluteGroupsY + "," + info.absoluteGroupsZ + ")"
+                            : (info.relativeScaleX > 0
+                                    ? "relative(" + info.relativeScaleX + "," + info.relativeScaleY + ")"
+                                    : "default(screen/localSize)"),
+                    info.relativeScaleX, info.relativeScaleY);
             return info;
         }
+    }
+
+    /**
+     * Backward-compatible overload without GLSL source (uses default local_size=8).
+     */
+    public ComputeProgramInfo registerComputeProgram(String programName, long shaderModule) {
+        return registerComputeProgram(programName, shaderModule, null);
     }
 
     /**
@@ -545,6 +575,18 @@ public class ShaderpackComputeManager {
 
         int[] groups = info.getWorkGroups(screenWidth, screenHeight);
 
+        // Validate dispatch parameters
+        if (groups[0] <= 0 || groups[1] <= 0 || groups[2] <= 0) {
+            LOGGER.error("[COMPUTE] Invalid work groups for '{}': ({},{},{}) — screen={}x{}, " +
+                    "localSize=({},{},{}), absolute=({},{},{}), relativeScale=({},{})",
+                    programName, groups[0], groups[1], groups[2],
+                    screenWidth, screenHeight,
+                    info.localSizeX, info.localSizeY, info.localSizeZ,
+                    info.absoluteGroupsX, info.absoluteGroupsY, info.absoluteGroupsZ,
+                    info.relativeScaleX, info.relativeScaleY);
+            return;
+        }
+
         try (MemoryStack stack = stackPush()) {
             // Bind compute pipeline
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, info.pipeline);
@@ -560,8 +602,24 @@ public class ShaderpackComputeManager {
             // Dispatch compute
             vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
 
-            LOGGER.trace("[COMPUTE] Dispatched '{}' — groups ({}, {}, {})",
-                    programName, groups[0], groups[1], groups[2]);
+            // Log first dispatch per program at INFO level for debugging
+            if (firstDispatchLogged.add(programName)) {
+                LOGGER.info("[COMPUTE] First dispatch '{}' — groups=({},{},{}), screen={}x{}, " +
+                        "localSize=({},{},{}), mode={}, uboOffset={}",
+                        programName, groups[0], groups[1], groups[2],
+                        screenWidth, screenHeight,
+                        info.localSizeX, info.localSizeY, info.localSizeZ,
+                        info.absoluteGroupsX > 0 ? "absolute" :
+                                (info.relativeScaleX > 0 ? "relative" : "default"),
+                        uboOffset);
+            }
+
+            LOGGER.debug("[COMPUTE] Dispatched '{}' — groups=({},{},{}), screen={}x{}, " +
+                    "localSize=({},{},{}), uboOffset={}, descSet=0x{}",
+                    programName, groups[0], groups[1], groups[2],
+                    screenWidth, screenHeight,
+                    info.localSizeX, info.localSizeY, info.localSizeZ,
+                    uboOffset, Long.toHexString(descriptorSet));
         }
     }
 
@@ -617,6 +675,102 @@ public class ShaderpackComputeManager {
     }
 
     // ═══════════════════════════════════════════════════════════════
+    //  GLSL Source Parsing
+    // ═══════════════════════════════════════════════════════════════
+
+    /** Pattern to match layout(local_size_x=N, local_size_y=M, local_size_z=K) in */
+    private static final Pattern LOCAL_SIZE_PATTERN = Pattern.compile(
+            "layout\\s*\\(\\s*local_size_x\\s*=\\s*(\\d+)" +
+            "(?:\\s*,\\s*local_size_y\\s*=\\s*(\\d+))?" +
+            "(?:\\s*,\\s*local_size_z\\s*=\\s*(\\d+))?\\s*\\)\\s*in\\s*;",
+            Pattern.MULTILINE);
+
+    /** Pattern to match const ivec3 workGroups = ivec3(x, y, z); */
+    private static final Pattern WORK_GROUPS_PATTERN = Pattern.compile(
+            "const\\s+ivec3\\s+workGroups\\s*=\\s*ivec3\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)\\s*;",
+            Pattern.MULTILINE);
+
+    /** Pattern to match const vec2 workGroupsRender = vec2(sx, sy); */
+    private static final Pattern WORK_GROUPS_RENDER_PATTERN = Pattern.compile(
+            "const\\s+vec2\\s+workGroupsRender\\s*=\\s*vec2\\s*\\(\\s*([0-9.eE+-]+)\\s*,\\s*([0-9.eE+-]+)\\s*\\)\\s*;",
+            Pattern.MULTILINE);
+
+    /**
+     * Parses {@code layout(local_size_x=N, local_size_y=M, local_size_z=K) in;}
+     * from the GLSL compute source and applies to the info object.
+     *
+     * <p>Reference: Iris ComputeProgram queries {@code GL_COMPUTE_WORK_GROUP_SIZE}
+     * from the driver after compilation. In Vulkan we must parse from source since
+     * SPIR-V reflection is not available via LWJGL.</p>
+     */
+    private void parseLocalSize(ComputeProgramInfo info, String glslSource) {
+        Matcher m = LOCAL_SIZE_PATTERN.matcher(glslSource);
+        if (m.find()) {
+            try {
+                info.localSizeX = Integer.parseInt(m.group(1));
+                if (m.group(2) != null) {
+                    info.localSizeY = Integer.parseInt(m.group(2));
+                } else {
+                    info.localSizeY = 1;
+                }
+                if (m.group(3) != null) {
+                    info.localSizeZ = Integer.parseInt(m.group(3));
+                } else {
+                    info.localSizeZ = 1;
+                }
+                LOGGER.debug("[COMPUTE] '{}' local_size parsed: ({}, {}, {})",
+                        info.name, info.localSizeX, info.localSizeY, info.localSizeZ);
+            } catch (NumberFormatException e) {
+                LOGGER.warn("[COMPUTE] '{}' failed to parse local_size, using defaults (8,8,1): {}",
+                        info.name, e.getMessage());
+            }
+        } else {
+            LOGGER.warn("[COMPUTE] '{}' — no layout(local_size_x=...) found, using defaults (8,8,1)",
+                    info.name);
+        }
+    }
+
+    /**
+     * Parses {@code const ivec3 workGroups} and {@code const vec2 workGroupsRender}
+     * directives from GLSL compute source.
+     *
+     * <p>Reference: Iris ComputeDirectiveParser (Iris Shaders, LGPL-3.0) — parses
+     * these same directives from ComputeSource to set absolute or relative dispatch
+     * sizes.</p>
+     */
+    private void parseWorkGroupDirectives(ComputeProgramInfo info, String glslSource) {
+        // Check absolute work groups first — takes priority over relative
+        Matcher absM = WORK_GROUPS_PATTERN.matcher(glslSource);
+        if (absM.find()) {
+            try {
+                info.absoluteGroupsX = Integer.parseInt(absM.group(1));
+                info.absoluteGroupsY = Integer.parseInt(absM.group(2));
+                info.absoluteGroupsZ = Integer.parseInt(absM.group(3));
+                LOGGER.debug("[COMPUTE] '{}' absolute workGroups: ({}, {}, {})",
+                        info.name, info.absoluteGroupsX, info.absoluteGroupsY, info.absoluteGroupsZ);
+                return;
+            } catch (NumberFormatException e) {
+                LOGGER.warn("[COMPUTE] '{}' failed to parse workGroups directive: {}",
+                        info.name, e.getMessage());
+            }
+        }
+
+        // Check relative work groups
+        Matcher relM = WORK_GROUPS_RENDER_PATTERN.matcher(glslSource);
+        if (relM.find()) {
+            try {
+                info.relativeScaleX = Float.parseFloat(relM.group(1));
+                info.relativeScaleY = Float.parseFloat(relM.group(2));
+                LOGGER.debug("[COMPUTE] '{}' relative workGroupsRender: ({}, {})",
+                        info.name, info.relativeScaleX, info.relativeScaleY);
+            } catch (NumberFormatException e) {
+                LOGGER.warn("[COMPUTE] '{}' failed to parse workGroupsRender directive: {}",
+                        info.name, e.getMessage());
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     //  Lifecycle
     // ═══════════════════════════════════════════════════════════════
 
@@ -626,6 +780,7 @@ public class ShaderpackComputeManager {
         if (device == null) {
             computePipelines.clear();
             computePrograms.clear();
+            firstDispatchLogged.clear();
             computeDescriptorPools = new long[0];
             computePipelineLayout = VK_NULL_HANDLE;
             computeDescriptorSetLayout = VK_NULL_HANDLE;
@@ -646,6 +801,7 @@ public class ShaderpackComputeManager {
         }
         computePipelines.clear();
         computePrograms.clear();
+        firstDispatchLogged.clear();
 
         // Destroy descriptor pools (each frees all allocated descriptor sets)
         if (computeDescriptorPools != null) {

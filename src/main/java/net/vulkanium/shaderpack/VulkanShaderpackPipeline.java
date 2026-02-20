@@ -862,15 +862,16 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
                     LOGGER.info("[COMPILE] [{}/{}] {} — compute shader", index, total, programName);
 
+                    String computeGlslSource = source.computeSource();
                     long module = shaderModuleManager.compileComputeProgram(
-                            programName, source.computeSource(), DEFAULT_SAMPLER_BINDINGS);
+                            programName, computeGlslSource, DEFAULT_SAMPLER_BINDINGS);
                     long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
 
                     if (module != 0) {
                         // Register with compute manager to create a real VkPipeline
                         if (computeManager != null && computeManager.isInitialized()) {
                             ShaderpackComputeManager.ComputeProgramInfo info =
-                                    computeManager.registerComputeProgram(programName, module);
+                                    computeManager.registerComputeProgram(programName, module, computeGlslSource);
                             if (info != null && info.pipeline != VK_NULL_HANDLE) {
                                 // Compute pipelines are owned/destroyed exclusively by
                                 // ShaderpackComputeManager. Keep the generic pipeline map
@@ -1452,6 +1453,14 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     // Allocate and update compute descriptor set
                     long computeDescSet = computeManager.allocateComputeDescriptorSet(frameIndex);
                     if (computeDescSet != VK_NULL_HANDLE) {
+                        // Transition storage image targets to GENERAL for compute imageStore access
+                        // Reference: Vulkan spec requires VK_IMAGE_LAYOUT_GENERAL for storage images
+                        int storageImageCount = Math.min(ShaderpackComputeManager.MAX_STORAGE_IMAGES,
+                                FullscreenRenderTargets.MAX_COLOR_TARGETS);
+                        if (fsTargets != null) {
+                            fsTargets.transitionReadTargetsToGeneral(cmd, storageImageCount);
+                        }
+
                         // Build sampler/image/SSBO arrays for compute descriptor update
                         int maxTex = ShaderpackComputeManager.MAX_SAMPLERS;
                         long[] compViews = new long[maxTex];
@@ -1461,12 +1470,14 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                         // Storage images (colorimgN from G-buffer targets + custom images)
                         long[] storageImageViews = new long[ShaderpackComputeManager.MAX_STORAGE_IMAGES];
                         Arrays.fill(storageImageViews, VK_NULL_HANDLE);
+                        int storageImagesPopulated = 0;
                         if (fsTargets != null) {
                             for (int i = 0; i < Math.min(storageImageViews.length,
                                     FullscreenRenderTargets.MAX_COLOR_TARGETS); i++) {
                                 RenderTarget rt = fsTargets.getReadTarget(i);
                                 if (rt != null && rt.getImageView() != VK_NULL_HANDLE) {
                                     storageImageViews[i] = rt.getImageView();
+                                    storageImagesPopulated++;
                                 }
                             }
                         }
@@ -1486,12 +1497,28 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                         // Set screen dimensions for workgroup calculation
                         computeManager.setScreenDimensions(width, height);
 
+                        // Debug: count non-null sampler bindings
+                        int samplerCount = 0;
+                        for (long v : compViews) { if (v != VK_NULL_HANDLE && v != placeholderView) samplerCount++; }
+                        LOGGER.debug("[FULLSCREEN] Compute '{}' — samplers={}, storageImages={}, " +
+                                "SSBOs={}, uboOffset={}, screen={}x{}",
+                                programName, samplerCount, storageImagesPopulated,
+                                ssboBuffers.length, computeUboOffset, width, height);
+
                         // Dispatch compute
                         computeManager.dispatch(cmd, programName, computeDescSet, computeUboOffset);
 
                         // Pipeline barrier: compute write → fragment read
                         computeManager.recordComputeToFragmentBarrier(cmd);
+
+                        // Transition storage image targets back to SHADER_READ_ONLY_OPTIMAL
+                        if (fsTargets != null) {
+                            fsTargets.transitionReadTargetsFromGeneral(cmd, storageImageCount);
+                        }
+
                         computeDispatched++;
+                    } else {
+                        LOGGER.warn("[FULLSCREEN] Failed to allocate compute descriptor set for '{}'", programName);
                     }
                 } catch (Exception e) {
                     LOGGER.warn("[FULLSCREEN] Compute dispatch failed for '{}': {}", programName, e.getMessage());
