@@ -106,16 +106,24 @@ public class VulkaniumGlslTransformer {
         public final boolean isCompute;
         public final Map<String, Integer> samplerBindings;
         public final int[] renderTargets;
+        public final String programName;
 
         public TransformParams(PassType passType, boolean isVertex, boolean isFragment,
                                boolean isCompute, Map<String, Integer> samplerBindings,
                                int[] renderTargets) {
+            this(passType, isVertex, isFragment, isCompute, samplerBindings, renderTargets, null);
+        }
+
+        public TransformParams(PassType passType, boolean isVertex, boolean isFragment,
+                               boolean isCompute, Map<String, Integer> samplerBindings,
+                               int[] renderTargets, String programName) {
             this.passType = passType;
             this.isVertex = isVertex;
             this.isFragment = isFragment;
             this.isCompute = isCompute;
             this.samplerBindings = samplerBindings != null ? samplerBindings : Collections.emptyMap();
             this.renderTargets = renderTargets != null ? renderTargets : new int[]{0};
+            this.programName = programName;
         }
     }
 
@@ -259,6 +267,14 @@ public class VulkaniumGlslTransformer {
      * <p>Skips declarations that already have {@code layout(} prefix and injected
      * vertex inputs (prefixed with {@code vkm_}).</p>
      */
+    /**
+     * Public entry point for varying location assignment (used by VulkaniumASTTransformer
+     * as a post-print fixup, since the AST approach delegates this to regex).
+     */
+    public static String assignVaryingLocationsOnly(String source, TransformParams params) {
+        return assignVaryingLocations(source, params);
+    }
+
     private static String assignVaryingLocations(String source, TransformParams params) {
         source = splitMultiVaryingDeclarations(source);
 
@@ -292,13 +308,18 @@ public class VulkaniumGlslTransformer {
         Collections.sort(outVaryingNames);
 
         // Build direction-specific name → location maps
+        // mat types consume multiple locations: mat2=2, mat3=3, mat4=4
         Map<String, Integer> inLocationMap = new LinkedHashMap<>();
-        for (int i = 0; i < inVaryingNames.size(); i++) {
-            inLocationMap.put(inVaryingNames.get(i), i);
+        int nextInLoc = 0;
+        for (String name : inVaryingNames) {
+            inLocationMap.put(name, nextInLoc);
+            nextInLoc += getLocationSlotCount(source, name);
         }
         Map<String, Integer> outLocationMap = new LinkedHashMap<>();
-        for (int i = 0; i < outVaryingNames.size(); i++) {
-            outLocationMap.put(outVaryingNames.get(i), i);
+        int nextOutLoc = 0;
+        for (String name : outVaryingNames) {
+            outLocationMap.put(name, nextOutLoc);
+            nextOutLoc += getLocationSlotCount(source, name);
         }
 
         // Replace bare declarations with layout-qualified versions
@@ -336,6 +357,405 @@ public class VulkaniumGlslTransformer {
         }
         m.appendTail(sb);
 
+        return sb.toString();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Cross-stage varying location reconciliation
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Pattern to match layout-qualified in/out varying declarations:
+     *   layout(location = N) [flat|smooth|noperspective] in|out TYPE NAME[array];
+     */
+    private static final Pattern LAYOUT_VARYING_PATTERN = Pattern.compile(
+            "(\\s*)layout\\s*\\(\\s*location\\s*=\\s*(\\d+)\\s*\\)\\s+" +
+            "((?:flat|smooth|noperspective)\\s+)?(in|out)\\s+(\\w+)\\s+(\\w+)(\\s*\\[[^\\]]*\\])?\\s*;",
+            Pattern.MULTILINE);
+
+    /**
+     * Reconciles varying locations between a vertex shader and a fragment shader.
+     *
+     * <p>Many shaderpacks (e.g., iterationRP) use different naming conventions for
+     * vertex outputs (g_color, g_texCoord) and fragment inputs (v_color, v_texCoord).
+     * In OpenGL compatibility mode, drivers match these by declaration position.
+     * In Vulkan SPIR-V, locations MUST match explicitly.</p>
+     *
+     * <p>This method builds a unified location map by matching vertex outputs to
+     * fragment inputs through:</p>
+     * <ol>
+     *   <li>Exact name match</li>
+     *   <li>Normalized name match (strip g_/v_/a_/vs_/fs_/out_/in_ prefixes)</li>
+     *   <li>Type-compatible positional matching for remaining unmatched pairs</li>
+     * </ol>
+     *
+     * @return String[2] with [reconciled_vertex_source, reconciled_fragment_source]
+     */
+    public static String[] reconcileVaryingLocations(String vertexSource, String fragmentSource) {
+        // Extract vertex outputs
+        Map<String, VaryingEntry> vertexOuts = extractLayoutVaryings(vertexSource, "out");
+        // Extract fragment inputs (exclude vertex inputs like vkm_*)
+        Map<String, VaryingEntry> fragmentIns = extractLayoutVaryings(fragmentSource, "in");
+
+        if (vertexOuts.isEmpty() || fragmentIns.isEmpty()) {
+            return new String[]{vertexSource, fragmentSource};
+        }
+
+        // ── Match vertex outputs to fragment inputs ──
+        Map<String, String> vertToFrag = new LinkedHashMap<>(); // vertex name → fragment name
+        Set<String> matchedFragNames = new HashSet<>();
+
+        // Pass 1: exact name match
+        for (String vName : vertexOuts.keySet()) {
+            if (fragmentIns.containsKey(vName)) {
+                vertToFrag.put(vName, vName);
+                matchedFragNames.add(vName);
+            }
+        }
+
+        // Pass 2: normalized name match
+        for (String vName : vertexOuts.keySet()) {
+            if (vertToFrag.containsKey(vName)) continue;
+            String vNorm = normalizeVaryingName(vName);
+            for (String fName : fragmentIns.keySet()) {
+                if (matchedFragNames.contains(fName)) continue;
+                String fNorm = normalizeVaryingName(fName);
+                if (vNorm.equals(fNorm)) {
+                    vertToFrag.put(vName, fName);
+                    matchedFragNames.add(fName);
+                    LOGGER.debug("[VARYING-RECONCILE] Matched by normalized name: {} ↔ {} (norm={})",
+                            vName, fName, vNorm);
+                    break;
+                }
+            }
+        }
+
+        // Pass 3: type-compatible positional matching for remaining
+        List<String> unmatchedVerts = new ArrayList<>();
+        for (String vName : vertexOuts.keySet()) {
+            if (!vertToFrag.containsKey(vName)) unmatchedVerts.add(vName);
+        }
+        List<String> unmatchedFrags = new ArrayList<>();
+        for (String fName : fragmentIns.keySet()) {
+            if (!matchedFragNames.contains(fName)) unmatchedFrags.add(fName);
+        }
+        // Sort unmatched by original location to preserve positional ordering
+        unmatchedVerts.sort(Comparator.comparingInt(n -> vertexOuts.get(n).location));
+        unmatchedFrags.sort(Comparator.comparingInt(n -> fragmentIns.get(n).location));
+        // Match remaining by compatible type in positional order
+        Iterator<String> fragIter = unmatchedFrags.iterator();
+        for (String vName : unmatchedVerts) {
+            if (!fragIter.hasNext()) break;
+            String fName = fragIter.next();
+            if (typesCompatible(vertexOuts.get(vName).type, fragmentIns.get(fName).type)) {
+                vertToFrag.put(vName, fName);
+                matchedFragNames.add(fName);
+                LOGGER.debug("[VARYING-RECONCILE] Matched by position+type: {} ({}) ↔ {} ({})",
+                        vName, vertexOuts.get(vName).type, fName, fragmentIns.get(fName).type);
+            }
+        }
+
+        // Check if reconciliation is needed
+        boolean needsReconciliation = false;
+        for (Map.Entry<String, String> e : vertToFrag.entrySet()) {
+            VaryingEntry ve = vertexOuts.get(e.getKey());
+            VaryingEntry fe = fragmentIns.get(e.getValue());
+            if (ve.location != fe.location) {
+                needsReconciliation = true;
+                break;
+            }
+        }
+        if (!needsReconciliation) {
+            return new String[]{vertexSource, fragmentSource};
+        }
+
+        // ── Build unified location map ──
+        // Matched pairs sorted by normalized name for determinism
+        List<Map.Entry<String, String>> matchedPairs = new ArrayList<>(vertToFrag.entrySet());
+        matchedPairs.sort(Comparator.comparing(e -> normalizeVaryingName(e.getKey())));
+
+        Map<String, Integer> vertexLocMap = new LinkedHashMap<>();
+        Map<String, Integer> fragmentLocMap = new LinkedHashMap<>();
+        int nextLoc = 0;
+
+        // First: matched pairs get same location
+        for (Map.Entry<String, String> pair : matchedPairs) {
+            String vName = pair.getKey();
+            String fName = pair.getValue();
+            int slots = getLocationSlotCountFromType(vertexOuts.get(vName).type);
+            vertexLocMap.put(vName, nextLoc);
+            fragmentLocMap.put(fName, nextLoc);
+            nextLoc += slots;
+        }
+
+        // Then: unmatched vertex outputs
+        for (String vName : vertexOuts.keySet()) {
+            if (!vertexLocMap.containsKey(vName)) {
+                int slots = getLocationSlotCountFromType(vertexOuts.get(vName).type);
+                vertexLocMap.put(vName, nextLoc);
+                nextLoc += slots;
+            }
+        }
+
+        // Then: unmatched fragment inputs
+        for (String fName : fragmentIns.keySet()) {
+            if (!fragmentLocMap.containsKey(fName)) {
+                int slots = getLocationSlotCountFromType(fragmentIns.get(fName).type);
+                fragmentLocMap.put(fName, nextLoc);
+                nextLoc += slots;
+            }
+        }
+
+        LOGGER.info("[VARYING-RECONCILE] Reconciled {} matched pairs, {} vert-only, {} frag-only. " +
+                "Location map: vert={}, frag={}",
+                vertToFrag.size(),
+                vertexOuts.size() - vertToFrag.size(),
+                fragmentIns.size() - matchedFragNames.size(),
+                vertexLocMap, fragmentLocMap);
+
+        // ── Rewrite locations in both shaders ──
+        String newVert = rewriteVaryingLocations(vertexSource, "out", vertexLocMap);
+        String newFrag = rewriteVaryingLocations(fragmentSource, "in", fragmentLocMap);
+
+        // ── Inject vertex outputs for fragment-only inputs ──
+        // When a geometry shader is skipped (common in compatibility mode),
+        // fragment inputs that were supposed to come from the geometry shader
+        // have no vertex output. Without injection, these read undefined values
+        // (often 0.0), which can cause NaN/infinity in division calculations.
+        // Inject vertex out declarations + sensible defaults in main().
+        List<String> unmatchedFragInputs = new ArrayList<>();
+        for (String fName : fragmentIns.keySet()) {
+            if (!matchedFragNames.contains(fName)) {
+                unmatchedFragInputs.add(fName);
+            }
+        }
+        if (!unmatchedFragInputs.isEmpty()) {
+            newVert = injectMissingVertexOutputs(newVert, unmatchedFragInputs,
+                    fragmentIns, fragmentLocMap);
+        }
+
+        return new String[]{newVert, newFrag};
+    }
+
+    /** Simple record for a varying declaration. */
+    private static class VaryingEntry {
+        final String name;
+        final int location;
+        final String type;
+        final String interp; // flat, smooth, noperspective, or ""
+        final String array;  // e.g., "[4]" or ""
+
+        VaryingEntry(String name, int location, String type, String interp, String array) {
+            this.name = name;
+            this.location = location;
+            this.type = type;
+            this.interp = interp;
+            this.array = array;
+        }
+    }
+
+    /**
+     * Injects missing vertex outputs for fragment-only inputs.
+     *
+     * <p>When a geometry shader exists but is skipped in compatibility mode,
+     * the fragment shader may declare inputs that have no corresponding vertex
+     * output. Without injection, these would read undefined values (often 0.0),
+     * causing NaN/infinity in fragment calculations like texture LOD.</p>
+     *
+     * <p>Injects both the output declaration and a default assignment at the
+     * end of main().</p>
+     */
+    private static String injectMissingVertexOutputs(
+            String vertexSource,
+            List<String> unmatchedNames,
+            Map<String, VaryingEntry> fragmentIns,
+            Map<String, Integer> fragmentLocMap) {
+
+        StringBuilder declarations = new StringBuilder();
+        StringBuilder assignments = new StringBuilder();
+
+        for (String fName : unmatchedNames) {
+            VaryingEntry fe = fragmentIns.get(fName);
+            if (fe == null) continue;
+            int loc = fragmentLocMap.getOrDefault(fName, -1);
+            if (loc < 0) continue;
+
+            // Use the same name as the fragment input — after reconciliation
+            // the location will match
+            String interp = fe.interp.isEmpty() ? "" : fe.interp + " ";
+            declarations.append("layout(location = ").append(loc).append(") ")
+                    .append(interp)
+                    .append("out ").append(fe.type).append(" ").append(fName)
+                    .append(fe.array).append("; // injected for geometry-skip\n");
+
+            String defaultValue = getDefaultValueForType(fe.type, fName);
+            assignments.append("    ").append(fName).append(" = ")
+                    .append(defaultValue).append("; // geometry-skip default\n");
+
+            LOGGER.info("[VARYING-RECONCILE] Injected vertex output '{}' ({}) at location {} " +
+                    "with default={} (geometry shader was skipped)",
+                    fName, fe.type, loc, defaultValue);
+        }
+
+        if (declarations.length() == 0) {
+            return vertexSource;
+        }
+
+        // Insert declarations after the last existing layout(location=N) out declaration
+        // Find the last "layout(location = N) ... out ..." line
+        int lastOutEnd = -1;
+        Matcher outMatcher = LAYOUT_VARYING_PATTERN.matcher(vertexSource);
+        while (outMatcher.find()) {
+            if ("out".equals(outMatcher.group(4))) {
+                lastOutEnd = outMatcher.end();
+                // Find end of line
+                int eol = vertexSource.indexOf('\n', lastOutEnd);
+                if (eol >= 0) lastOutEnd = eol + 1;
+            }
+        }
+        if (lastOutEnd < 0) {
+            // Fallback: insert before main()
+            int mainIdx = vertexSource.indexOf("void main()");
+            if (mainIdx < 0) mainIdx = vertexSource.indexOf("void main(void)");
+            if (mainIdx >= 0) lastOutEnd = mainIdx;
+            else return vertexSource; // can't find insertion point
+        }
+        String result = vertexSource.substring(0, lastOutEnd)
+                + declarations
+                + vertexSource.substring(lastOutEnd);
+
+        // Insert assignments before the closing brace of main()
+        // Find the LAST '}' — which closes main()
+        int lastCloseBrace = result.lastIndexOf('}');
+        if (lastCloseBrace > 0) {
+            result = result.substring(0, lastCloseBrace)
+                    + assignments
+                    + result.substring(lastCloseBrace);
+        }
+
+        return result;
+    }
+
+    /**
+     * Returns a sensible default value for a GLSL type.
+     * Special-cases known varying names for better defaults.
+     */
+    private static String getDefaultValueForType(String type, String name) {
+        // Special-case known varyings for better defaults
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.contains("textureresolution") || lower.contains("texresolution")) {
+            return "16.0"; // Common block texture resolution
+        }
+        if (lower.contains("scale") || lower.contains("resolution")) {
+            return "1.0";
+        }
+
+        return switch (type) {
+            case "float" -> "1.0";
+            case "int" -> "0";
+            case "vec2" -> "vec2(0.0)";
+            case "vec3" -> "vec3(0.0)";
+            case "vec4" -> "vec4(0.0)";
+            case "ivec2" -> "ivec2(0)";
+            case "ivec3" -> "ivec3(0)";
+            case "ivec4" -> "ivec4(0)";
+            case "mat2" -> "mat2(1.0)";
+            case "mat3" -> "mat3(1.0)";
+            case "mat4" -> "mat4(1.0)";
+            default -> "0";
+        };
+    }
+
+    /**
+     * Extracts layout-qualified in/out declarations from shader source.
+     * Skips vertex-attribute inputs (vkm_*, gl_*) and fragment outputs (framebuffer*).
+     */
+    private static Map<String, VaryingEntry> extractLayoutVaryings(String source, String direction) {
+        Map<String, VaryingEntry> result = new LinkedHashMap<>();
+        Matcher m = LAYOUT_VARYING_PATTERN.matcher(source);
+        while (m.find()) {
+            String dir = m.group(4);
+            if (!direction.equals(dir)) continue;
+            String name = m.group(6);
+            // Skip injected vertex inputs and fragment outputs
+            if (name.startsWith("vkm_") || name.startsWith("gl_") || name.startsWith("framebuffer")) continue;
+            int loc = Integer.parseInt(m.group(2));
+            String type = m.group(5);
+            String interp = m.group(3) != null ? m.group(3).trim() : "";
+            String array = m.group(7) != null ? m.group(7).trim() : "";
+            result.put(name, new VaryingEntry(name, loc, type, interp, array));
+        }
+        return result;
+    }
+
+    /**
+     * Normalizes a varying name by stripping common stage-specific prefixes.
+     * Many shaderpacks use g_/v_/a_ or vs_/fs_ or out_/in_ prefixes.
+     */
+    private static String normalizeVaryingName(String name) {
+        // 2-char prefixes: g_, v_, a_
+        if (name.length() > 2 && name.charAt(1) == '_'
+                && (name.charAt(0) == 'g' || name.charAt(0) == 'v' || name.charAt(0) == 'a')) {
+            return name.substring(2);
+        }
+        // 3-char prefixes: vs_, fs_
+        if (name.startsWith("vs_") || name.startsWith("fs_")) {
+            return name.substring(3);
+        }
+        // 3-4 char prefixes: in_, out_
+        if (name.startsWith("out_")) return name.substring(4);
+        if (name.startsWith("in_")) return name.substring(3);
+        return name;
+    }
+
+    /**
+     * Checks if two GLSL types are compatible for varying matching.
+     * Allows minor mismatches like vec3/vec4 (padded) but not vec3/float.
+     */
+    private static boolean typesCompatible(String t1, String t2) {
+        if (t1.equals(t2)) return true;
+        // Allow vecN size differences (vec3 ↔ vec4) — common in normals
+        if (t1.startsWith("vec") && t2.startsWith("vec")) return true;
+        if (t1.startsWith("ivec") && t2.startsWith("ivec")) return true;
+        if (t1.startsWith("mat") && t2.startsWith("mat")) return true;
+        return false;
+    }
+
+    /**
+     * Returns the number of location slots for a GLSL type.
+     */
+    private static int getLocationSlotCountFromType(String type) {
+        if (type.startsWith("mat")) {
+            try {
+                int cols = Character.digit(type.charAt(3), 10);
+                if (cols >= 2 && cols <= 4) return cols;
+            } catch (Exception ignored) {}
+        }
+        return 1;
+    }
+
+    /**
+     * Rewrites layout(location = N) values for the specified direction (in/out)
+     * using the provided name→location map.
+     */
+    private static String rewriteVaryingLocations(String source, String direction,
+                                                    Map<String, Integer> locMap) {
+        StringBuffer sb = new StringBuffer();
+        Matcher m = LAYOUT_VARYING_PATTERN.matcher(source);
+        while (m.find()) {
+            String dir = m.group(4);
+            String name = m.group(6);
+            if (!direction.equals(dir) || !locMap.containsKey(name)) continue;
+            int newLoc = locMap.get(name);
+            String indent = m.group(1);
+            String interp = m.group(3) != null ? m.group(3) : "";
+            String type = m.group(5);
+            String array = m.group(7) != null ? m.group(7) : "";
+            String replacement = indent + "layout(location = " + newLoc + ") "
+                    + interp + dir + " " + type + " " + name + array + ";";
+            m.appendReplacement(sb, Matcher.quoteReplacement(replacement));
+        }
+        m.appendTail(sb);
         return sb.toString();
     }
 
@@ -377,6 +797,29 @@ public class VulkaniumGlslTransformer {
 
         matcher.appendTail(out);
         return out.toString();
+    }
+
+    /**
+     * Returns the number of location slots consumed by a variable's type.
+     * mat2=2, mat3=3, mat4=4, mat2xN=2, mat3xN=3, mat4xN=4, all others=1.
+     * Looks up the type from the source by finding the declaration of the given name.
+     */
+    private static int getLocationSlotCount(String source, String name) {
+        // Find the declaration line for this variable: (in|out) TYPE NAME
+        Pattern p = Pattern.compile("(?:in|out)\\s+(\\w+)\\s+" + Pattern.quote(name));
+        Matcher m = p.matcher(source);
+        if (m.find()) {
+            String type = m.group(1);
+            if (type.startsWith("mat")) {
+                // mat2, mat3, mat4, mat2x2, mat3x3, mat4x4, etc.
+                // Number of columns = first digit after "mat"
+                try {
+                    int cols = Character.digit(type.charAt(3), 10);
+                    if (cols >= 2 && cols <= 4) return cols;
+                } catch (Exception ignored) {}
+            }
+        }
+        return 1;
     }
 
     // ═══════════════════════════════════════════════════════════════

@@ -572,6 +572,124 @@ public class FullscreenRenderTargets {
     }
 
     /**
+     * Copies a G-buffer color target (already in SHADER_READ_ONLY_OPTIMAL) into a
+     * fullscreen colortex slot, then flips so subsequent reads see the captured data.
+     *
+     * @param cmd            Active command buffer (outside any render pass)
+     * @param srcImage       G-buffer image handle (must be in SHADER_READ_ONLY_OPTIMAL)
+     * @param colortexIndex  Destination colortex slot (0–15)
+     */
+    public void captureGBufferColorTarget(VkCommandBuffer cmd, long srcImage, int colortexIndex) {
+        if (colortexIndex < 0 || colortexIndex >= MAX_COLOR_TARGETS) return;
+
+        RenderTarget write = getWriteTarget(colortexIndex);
+        int writeSide = flipped[colortexIndex] ? 0 : 1;
+
+        // Transition GBuffer image: SHADER_READ_ONLY → TRANSFER_SRC
+        VulkaniumCommand.transitionImageLayout(cmd, srcImage,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Transition fsTargets write side → TRANSFER_DST
+        VulkaniumCommand.transitionImageLayout(cmd, write.getImage(),
+                colorLayouts[colortexIndex][writeSide], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Copy
+        try (var stack = stackPush()) {
+            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+            region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.srcOffset().set(0, 0, 0);
+            region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.dstOffset().set(0, 0, 0);
+            region.extent().set(width, height, 1);
+
+            vkCmdCopyImage(cmd,
+                    srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    write.getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    region);
+        }
+
+        // Transition fsTargets write → SHADER_READ_ONLY
+        VulkaniumCommand.transitionImageLayout(cmd, write.getImage(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+        colorLayouts[colortexIndex][writeSide] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        // Transition GBuffer image back: TRANSFER_SRC → SHADER_READ_ONLY
+        VulkaniumCommand.transitionImageLayout(cmd, srcImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Flip so reads of this colortex see the captured G-buffer data
+        flip(colortexIndex);
+    }
+
+    /**
+     * Copies a G-buffer depth target (already in SHADER_READ_ONLY_OPTIMAL) into
+     * all depthtex slots (0, 1, 2).
+     */
+    public void captureGBufferDepthTarget(VkCommandBuffer cmd, long srcDepthImage) {
+        for (int i = 0; i < MAX_DEPTH_TARGETS; i++) {
+            RenderTarget dst = depthTargets[i];
+
+            // Transition GBuffer depth: SHADER_READ_ONLY → TRANSFER_SRC
+            VulkaniumCommand.transitionImageLayout(cmd, srcDepthImage,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            VulkaniumCommand.transitionImageLayout(cmd, dst.getImage(),
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            try (var stack = stackPush()) {
+                VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+                region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                region.srcOffset().set(0, 0, 0);
+                region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1);
+                region.dstOffset().set(0, 0, 0);
+                region.extent().set(width, height, 1);
+
+                vkCmdCopyImage(cmd,
+                        srcDepthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        dst.getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        region);
+            }
+
+            VulkaniumCommand.transitionImageLayout(cmd, dst.getImage(),
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            // Transition GBuffer depth back: TRANSFER_SRC → SHADER_READ_ONLY
+            VulkaniumCommand.transitionImageLayout(cmd, srcDepthImage,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+    }
+
+    /**
      * Blits the current colortex0 READ side to the swapchain image.
      */
     public void blitColorTarget0ToSwapchain(VkCommandBuffer cmd,

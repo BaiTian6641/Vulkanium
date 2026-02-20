@@ -35,7 +35,8 @@
     "core.MixinScreenshotRecorder",
     "core.MixinOptionsScreen",
     "core.MixinGlUtil",
-    "core.MixinGui"
+    "core.MixinGui",
+    "sky.MixinOptions_CloudsOverride"
   ],
   "injectors": {
     "defaultRequire": 1

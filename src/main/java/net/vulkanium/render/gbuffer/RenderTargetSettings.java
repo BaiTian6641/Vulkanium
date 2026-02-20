@@ -72,7 +72,7 @@ public class RenderTargetSettings {
         public boolean isLinearFiltering() { return linearFiltering; }
         public boolean isUsed() { return used; }
 
-        void setVkFormat(int format) { this.vkFormat = format; }
+        public void setVkFormat(int format) { this.vkFormat = format; }
         void setClear(boolean clear) { this.clear = clear; }
         void setClearColor(float[] color) { this.clearColor = color; }
         void setMipmapEnabled(boolean enabled) { this.mipmapEnabled = enabled; }

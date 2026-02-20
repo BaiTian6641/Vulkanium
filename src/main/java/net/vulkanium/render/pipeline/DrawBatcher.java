@@ -510,6 +510,80 @@ public class DrawBatcher {
         // Safe default alpha test reference (offset 1264)
         MemoryUtil.memPutFloat(ptr + net.vulkanium.render.shader.UniformBridge.OFF_ALPHA_TEST_REF, 0.1f);
 
+        // ── Screen size (offset 1024): vec4(viewWidth, viewHeight, 1/w, 1/h) ──
+        float screenW, screenH;
+        if (net.vulkanium.Vulkanium.getVulkanSwapchain() != null) {
+            screenW = (float) net.vulkanium.Vulkanium.getVulkanSwapchain().getWidth();
+            screenH = (float) net.vulkanium.Vulkanium.getVulkanSwapchain().getHeight();
+        } else {
+            screenW = Math.max(net.vulkanium.compat.VRenderSystem.getViewportWidth(), 1);
+            screenH = Math.max(net.vulkanium.compat.VRenderSystem.getViewportHeight(), 1);
+        }
+        if (screenW < 1) screenW = 1;
+        if (screenH < 1) screenH = 1;
+        long screenPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SCREEN_SIZE;
+        MemoryUtil.memPutFloat(screenPtr, screenW);
+        MemoryUtil.memPutFloat(screenPtr + 4, screenH);
+        MemoryUtil.memPutFloat(screenPtr + 8, 1.0f / screenW);
+        MemoryUtil.memPutFloat(screenPtr + 12, 1.0f / screenH);
+
+        // ── View params (offset 1040): vec4(aspectRatio, near, far, fov) ──
+        long viewParamsPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_VIEW_PARAMS;
+        MemoryUtil.memPutFloat(viewParamsPtr, screenW / screenH);  // aspectRatio
+        MemoryUtil.memPutFloat(viewParamsPtr + 4, 0.05f);          // near (MC default)
+        float farPlane = 256.0f; // safe default
+        try {
+            net.minecraft.client.Minecraft mc0 = net.minecraft.client.Minecraft.getInstance();
+            if (mc0 != null && mc0.options != null) {
+                farPlane = mc0.options.getEffectiveRenderDistance() * 16.0f;
+            }
+        } catch (Exception ignored) {}
+        MemoryUtil.memPutFloat(viewParamsPtr + 8, farPlane);       // far
+        MemoryUtil.memPutFloat(viewParamsPtr + 12, 70.0f);         // fov (approx)
+
+        // ── Time (offset 1056): vec4(frameTimeCounter, worldTime, frameCounter, sunAngle) ──
+        long timePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_TIME;
+        float frameTimeCounter = (System.nanoTime() % 3_600_000_000_000L) / 1_000_000_000.0f;
+        float worldTime = 0.0f;
+        float sunAngle = 0.0f;
+        try {
+            net.minecraft.client.Minecraft mc1 = net.minecraft.client.Minecraft.getInstance();
+            if (mc1 != null && mc1.level != null) {
+                worldTime = mc1.level.getDayTime() % 24000L;
+                sunAngle = worldTime / 24000.0f;
+            }
+        } catch (Exception ignored) {}
+        MemoryUtil.memPutFloat(timePtr, frameTimeCounter);
+        MemoryUtil.memPutFloat(timePtr + 4, worldTime);
+        MemoryUtil.memPutFloat(timePtr + 8, (float) net.vulkanium.Vulkanium.getFrameCounter());
+        MemoryUtil.memPutFloat(timePtr + 12, sunAngle);
+
+        // ── Camera position (offset 768): vec4(x, y, z, 0) ──
+        try {
+            net.minecraft.client.Minecraft mc2 = net.minecraft.client.Minecraft.getInstance();
+            if (mc2 != null && mc2.gameRenderer != null && mc2.gameRenderer.getMainCamera() != null) {
+                net.minecraft.world.phys.Vec3 camPos = mc2.gameRenderer.getMainCamera().getPosition();
+                long camPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_CAMERA_POS;
+                MemoryUtil.memPutFloat(camPtr, (float) camPos.x);
+                MemoryUtil.memPutFloat(camPtr + 4, (float) camPos.y);
+                MemoryUtil.memPutFloat(camPtr + 8, (float) camPos.z);
+                MemoryUtil.memPutFloat(camPtr + 12, 0.0f);
+            }
+        } catch (Exception ignored) {}
+
+        // ── Normal matrix (offset 640): mat4 = transpose(inverse(modelView)) ──
+        if (modelViewMatrix.length >= 16) {
+            org.joml.Matrix4f mv = new org.joml.Matrix4f();
+            mv.set(modelViewMatrix);
+            org.joml.Matrix4f normalMat = new org.joml.Matrix4f(mv).invert().transpose();
+            float[] normalArr = new float[16];
+            normalMat.get(normalArr);
+            long normalPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_NORMAL_MAT4;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(normalPtr + i * 4L, normalArr[i]);
+            }
+        }
+
         uniformOffsets[frameIndex] = alignedOffset + totalSize;
         return alignedOffset;
     }

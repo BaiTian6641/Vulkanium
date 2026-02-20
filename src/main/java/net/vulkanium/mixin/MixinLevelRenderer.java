@@ -9,6 +9,7 @@ import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.RenderType;
 import net.vulkanium.Vulkanium;
+import net.vulkanium.render.program.WorldRenderingPhase;
 import net.vulkanium.world.VulkaniumWorldRenderer;
 import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.Mixin;
@@ -35,6 +36,11 @@ import javax.annotation.Nullable;
  */
 @Mixin(LevelRenderer.class)
 public abstract class MixinLevelRenderer {
+
+    /**
+     * Target method descriptors for LevelRenderer injection points.
+     */
+    private static final String RENDER_CLOUDS = "Lnet/minecraft/client/renderer/LevelRenderer;renderClouds(Lcom/mojang/blaze3d/vertex/PoseStack;Lorg/joml/Matrix4f;FDDD)V";
 
     @Shadow @Nullable private ClientLevel level;
 
@@ -153,6 +159,37 @@ public abstract class MixinLevelRenderer {
         // Begin the main render pass for this frame
         // The actual draw commands are recorded in renderSectionLayer and entity rendering
         Vulkanium.LOGGER.trace("renderLevel: begin");
+    }
+
+    /**
+     * Set CLOUDS phase before vanilla renderClouds() is called inside renderLevel().
+     *
+     * <p>This allows {@code mapShaderNameToProgramId()} to know we're in the
+     * cloud rendering phase and route draws to {@code gbuffers_clouds}.</p>
+     */
+    @Inject(method = "renderLevel",
+            at = @At(value = "INVOKE", target = RENDER_CLOUDS))
+    private void vulkanium$beginClouds(PoseStack poseStack, float partialTick,
+                                        long finishNanoTime, boolean renderBlockOutline,
+                                        Camera camera, GameRenderer gameRenderer,
+                                        LightTexture lightTexture, Matrix4f projectionMatrix,
+                                        CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.CLOUDS);
+    }
+
+    /**
+     * Reset phase after vanilla renderClouds() completes.
+     */
+    @Inject(method = "renderLevel",
+            at = @At(value = "INVOKE", target = RENDER_CLOUDS, shift = At.Shift.AFTER))
+    private void vulkanium$endClouds(PoseStack poseStack, float partialTick,
+                                      long finishNanoTime, boolean renderBlockOutline,
+                                      Camera camera, GameRenderer gameRenderer,
+                                      LightTexture lightTexture, Matrix4f projectionMatrix,
+                                      CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.NONE);
     }
 
     /**

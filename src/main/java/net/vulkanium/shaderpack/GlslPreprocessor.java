@@ -89,8 +89,19 @@ public class GlslPreprocessor {
             String value = entry.getValue();
             if (key == null || key.isBlank() || value == null || value.isBlank()) continue;
 
-            String replacement = "#define " + key + " " + value;
-            updated = updated.replaceAll("(?m)^\\s*#\\s*define\\s+" + Pattern.quote(key) + "\\b.*$", replacement);
+            // 1. #define style: replace active AND commented-out defines
+            //    "#define KEY old"  →  "#define KEY new"
+            //    "// #define KEY"   →  "#define KEY new"  (re-enables toggle defines)
+            String defineReplacement = "#define " + key + " " + value;
+            updated = updated.replaceAll(
+                    "(?m)^\\s*(?://\\s*)?#\\s*define\\s+" + Pattern.quote(key) + "\\b.*$",
+                    Matcher.quoteReplacement(defineReplacement));
+
+            // 2. const style: replace the value in "const TYPE KEY = VALUE; ..."
+            //    "const float KEY = 1.0; // [0.5 1.0 2.0]"  →  "const float KEY = 2.0; // [0.5 1.0 2.0]"
+            updated = updated.replaceAll(
+                    "(?m)(^\\s*const\\s+(?:bool|int|float)\\s+" + Pattern.quote(key) + "\\s*=\\s*)[^;]+(;.*$)",
+                    "$1" + Matcher.quoteReplacement(value) + "$2");
         }
         return updated;
     }

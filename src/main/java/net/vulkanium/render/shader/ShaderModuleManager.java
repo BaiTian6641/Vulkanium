@@ -111,7 +111,7 @@ public class ShaderModuleManager {
     /** Per-pack transformed GLSL cache */
     private Path translatedCacheDir;
 
-    private static final String TRANSLATED_CACHE_VERSION = "v4";
+    private static final String TRANSLATED_CACHE_VERSION = "v17-mrt-gbuffers";
 
     @FunctionalInterface
     public interface CompileStageListener {
@@ -182,36 +182,43 @@ public class ShaderModuleManager {
             OptiFineGlslPreprocessor.PreprocessResult fragPP =
                     OptiFineGlslPreprocessor.preprocess(fragmentSource, false);
 
-                int[] effectiveRenderTargets = fragPP.renderTargets;
-                final boolean forceSingleCompatTarget = programName != null && programName.startsWith("gbuffers_");
-                if (forceSingleCompatTarget
-                    && (effectiveRenderTargets.length != 1 || effectiveRenderTargets[0] != 0)) {
-                LOGGER.info("Forcing single render target [0] for compatibility program '{}' (pack targets={})",
-                    programName, Arrays.toString(effectiveRenderTargets));
-                effectiveRenderTargets = new int[]{0};
-                }
-                    final int[] finalRenderTargets = effectiveRenderTargets;
+                // Keep the pack's full render targets — we need all iris_FragDataN
+                // variables declared so the shader compiles.  Since Vulkanium currently
+                // has only 1 color attachment, non-zero targets are declared as dummy
+                // local vec4 variables (writes compile but are discarded at runtime).
+                final int[] finalRenderTargets = fragPP.renderTargets;
 
             // ── Stage 2: Transform ──
                 emitStage(programName, "transform", "Transforming GLSL to Vulkan-compatible form");
             TransformParams vertParams = new TransformParams(
-                    passType, true, false, false, samplerBindings, finalRenderTargets);
+                    passType, true, false, false, samplerBindings, finalRenderTargets, programName);
             TransformParams fragParams = new TransformParams(
-                    passType, false, true, false, samplerBindings, finalRenderTargets);
+                    passType, false, true, false, samplerBindings, finalRenderTargets, programName);
 
                 String transformedVert = getOrCreateTranslatedSource(
                     programName, "vert", vertPP.source, vertParams,
-                    () -> VulkaniumGlslTransformer.transform(vertPP.source, vertParams));
+                    () -> transformWithAST(vertPP.source, vertParams));
                 String transformedFrag = getOrCreateTranslatedSource(
                     programName, "frag", fragPP.source, fragParams,
                     () -> {
-                    String transformed = VulkaniumGlslTransformer.transform(fragPP.source, fragParams);
+                    String transformed = transformWithAST(fragPP.source, fragParams);
+                    // Inject fragment output declarations for all render targets.
+                    // With MRT G-buffer rendering, ALL targets are real 'out' variables
+                    // with proper layout(location=N) declarations.
                     transformed = OptiFineGlslPreprocessor.injectFragmentOutputs(transformed, finalRenderTargets);
-                    if (forceSingleCompatTarget) {
-                        transformed = collapseFragmentOutputsToZero(transformed);
-                    }
                     return transformed;
                     });
+
+            // ── Stage 2.5: Reconcile varying locations across stages ──
+            // Many shaderpacks use different naming conventions for vertex outputs
+            // (e.g., g_color) and fragment inputs (e.g., v_color). The per-stage
+            // location assignment uses alphabetical order, which produces mismatches
+            // when names differ. This reconciliation step matches them by normalized
+            // name and assigns consistent locations across both stages.
+            String[] reconciled = VulkaniumGlslTransformer.reconcileVaryingLocations(
+                    transformedVert, transformedFrag);
+            transformedVert = reconciled[0];
+            transformedFrag = reconciled[1];
 
             // ── Stage 3: Compile to SPIR-V ──
                 emitStage(programName, "compile-vert", "Compiling vertex shader to SPIR-V");
@@ -247,7 +254,7 @@ public class ShaderModuleManager {
                 emitStage(programName, "geometry-transform", "Transforming geometry shader");
                 String transformedGeom = getOrCreateTranslatedSource(
                     programName, "geom", geomPP.source, geomParams,
-                    () -> VulkaniumGlslTransformer.transform(geomPP.source, geomParams));
+                    () -> transformWithAST(geomPP.source, geomParams));
                 emitStage(programName, "geometry-compile", "Compiling geometry shader to SPIR-V");
                 ShaderCompiler.CompilationResult geomResult = compiler.compile(
                         transformedGeom, ShaderCompiler.ShaderStage.GEOMETRY, programName + ".geom");
@@ -302,7 +309,7 @@ public class ShaderModuleManager {
                 emitStage(programName, "compute-transform", "Transforming compute shader");
                 String transformed = getOrCreateTranslatedSource(
                     programName, "comp", pp.source, params,
-                    () -> VulkaniumGlslTransformer.transform(pp.source, params));
+                    () -> transformWithAST(pp.source, params));
 
             emitStage(programName, "compute-compile", "Compiling compute shader to SPIR-V");
             ShaderCompiler.CompilationResult result = compiler.compileCompute(
@@ -477,6 +484,24 @@ public class ShaderModuleManager {
     // ═══════════════════════════════════════════════════════════════
 
     /**
+     * Transforms GLSL source using the full pipeline:
+     *   1. jcpp C-preprocessor resolution (resolve #ifdef/#else/#endif)
+     *   2. AST-based transformation (UBO injection, uniform remap, etc.)
+     *   3. Post-print regex fixups (varying locations, legacy qualifiers)
+     */
+    private static String transformWithAST(String source, TransformParams params) {
+        // Step 1: Resolve all preprocessor conditionals with jcpp
+        String resolved = GlslCPreprocessor.preprocess(source);
+
+        // Step 2: AST-based transformation
+        String result = VulkaniumASTTransformer.transform(resolved, params);
+
+        // Step 3: Post-print regex fixups
+        result = VulkaniumASTTransformer.postPrintFixups(result, params);
+        return result;
+    }
+
+    /**
      * Creates a VkShaderModule from SPIR-V binary data.
      */
     private long createShaderModule(ByteBuffer spirvBinary) {
@@ -604,9 +629,9 @@ public class ShaderModuleManager {
         return name.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 
-    private static String collapseFragmentOutputsToZero(String source) {
-        return source.replaceAll("\\biris_FragData\\d+\\b", "iris_FragData0");
-    }
+    // collapseFragmentOutputsToZero removed — replaced by
+    // injectFragmentOutputsSingleAttachment which declares non-zero targets
+    // as dummy local vec4 variables instead of outputs.
 
     private static String computeHash(String input) {
         try {

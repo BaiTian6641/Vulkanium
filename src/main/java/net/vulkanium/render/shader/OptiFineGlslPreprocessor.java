@@ -399,6 +399,62 @@ public class OptiFineGlslPreprocessor {
      * @param renderTargets Target indices from DRAWBUFFERS/RENDERTARGETS
      * @return Source with output declarations injected
      */
+    /**
+     * Injects fragment output declarations for single-attachment rendering.
+     *
+     * <p>When Vulkanium only has one color attachment (the swapchain image),
+     * only the first render target (index 0 in the DRAWBUFFERS array) is a real
+     * {@code out} variable.  All other targets are declared as plain {@code vec4}
+     * variables so the shader compiles but their writes are discarded.</p>
+     *
+     * <p>This avoids the Vulkan validation issue of declaring more fragment
+     * outputs than the render pass has color attachments, while letting the
+     * shader's MRT code compile unchanged.</p>
+     *
+     * @param source        AST-transformed source
+     * @param renderTargets Target indices from DRAWBUFFERS/RENDERTARGETS
+     * @return Source with output/dummy declarations injected
+     */
+    public static String injectFragmentOutputsSingleAttachment(String source, int[] renderTargets) {
+        if (renderTargets == null || renderTargets.length == 0) {
+            return source;
+        }
+
+        boolean hasIrisFragDataRefs = source.contains("iris_FragData");
+        Pattern explicitOutPattern = Pattern.compile(
+                "(?m)^\\s*layout\\s*\\([^)]*location\\s*=\\s*\\d+[^)]*\\)\\s*out\\s+\\w+\\s+\\w+\\s*;");
+        boolean hasExplicitLocationOutputs = explicitOutPattern.matcher(source).find();
+
+        if (hasExplicitLocationOutputs && !hasIrisFragDataRefs) {
+            return source;
+        }
+
+        StringBuilder outputs = new StringBuilder();
+        outputs.append("// ── Vulkanium Fragment Outputs (single-attachment mode) ──\n");
+
+        // Determine which target index maps to the real output (colortex0 if present, else first)
+        int realOutputIdx = 0;
+        for (int i = 0; i < renderTargets.length; i++) {
+            if (renderTargets[i] == 0) { realOutputIdx = i; break; }
+        }
+
+        for (int i = 0; i < renderTargets.length; i++) {
+            int target = renderTargets[i];
+            if (i == realOutputIdx) {
+                // Real fragment output — goes to the single color attachment
+                outputs.append("layout(location = 0) out vec4 iris_FragData")
+                        .append(target).append(";\n");
+            } else {
+                // Dummy local variable — shader writes compile but data is discarded
+                outputs.append("vec4 iris_FragData").append(target)
+                        .append(" = vec4(0.0); // dummy (no attachment)\n");
+            }
+        }
+
+        int insertPos = findInsertionPoint(source);
+        return source.substring(0, insertPos) + outputs + source.substring(insertPos);
+    }
+
     public static String injectFragmentOutputs(String source, int[] renderTargets) {
         if (renderTargets == null || renderTargets.length == 0) {
             return source;
@@ -420,7 +476,10 @@ public class OptiFineGlslPreprocessor {
         outputs.append("// ── Vulkanium Fragment Outputs ──\n");
         for (int i = 0; i < renderTargets.length; i++) {
             int target = renderTargets[i];
-            outputs.append("layout(location = ").append(i)
+            // Use the colortex index as the layout location so it maps directly
+            // to the MRT render pass subpass color attachment reference at that index.
+            // The render pass uses VK_ATTACHMENT_UNUSED for gap indices.
+            outputs.append("layout(location = ").append(target)
                     .append(") out vec4 iris_FragData").append(target).append(";\n");
         }
 

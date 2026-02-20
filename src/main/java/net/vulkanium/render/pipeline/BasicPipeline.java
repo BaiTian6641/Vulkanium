@@ -416,8 +416,9 @@ public class BasicPipeline {
                 }
                 case COLOR -> {
                     if (!colorDone && hasColor) {
-                        // Color is location 1 for position_color, location 2 for tex-color variants
-                        loc = hasUV ? 2 : 1;
+                        // Shaderpack shaders always expect Color at location 2.
+                        // Vanilla shaders (ownsShaderModules) use location 1 when no UV.
+                        loc = (!ownsShaderModules || hasUV) ? 2 : 1;
                         colorDone = true;
                     }
                 }

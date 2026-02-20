@@ -5,6 +5,8 @@ import net.vulkanium.VulkaniumGameOptions;
 import net.vulkanium.compat.GlStateInterceptor;
 import net.vulkanium.compat.VRenderSystem;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import net.vulkanium.render.gbuffer.GBufferManager;
+import net.vulkanium.render.gbuffer.RenderTargetSettings;
 import net.vulkanium.render.pipeline.BasicPipeline;
 import net.vulkanium.render.pipeline.DrawBatcher;
 import net.vulkanium.render.shader.ShaderCompiler;
@@ -210,6 +212,12 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     private Boolean safeFullscreenExecutionAllowed = null;
     /** MRT render targets for fullscreen composite/deferred/final passes (double-buffered ping-pong). */
     private FullscreenRenderTargets fsTargets;
+
+    /** G-buffer manager: MRT render targets + render pass for gbuffers world rendering. */
+    private GBufferManager gbufferManager;
+
+    /** Per-target format/clear settings parsed from shaderpack source. */
+    private RenderTargetSettings renderTargetSettings;
 
     /** Cached MRT pipelines: keyed by ProgramId + attachment count to match MRT render pass. */
     private final Map<String, BasicPipeline> mrtPipelines = new HashMap<>();
@@ -423,6 +431,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 properties.parse(propsContent);
                 LOGGER.info("[LOAD]   shaders.properties: {} entries parsed", properties.getAll().size());
                 LOGGER.info("[LOAD]   Shadow resolution: {}x{}", properties.getShadowResolution(), properties.getShadowResolution());
+                LOGGER.info("[LOAD]   Cloud setting: {}", properties.getCloudSetting());
             } else {
                 LOGGER.info("[LOAD]   No shaders.properties found (using defaults)");
             }
@@ -480,6 +489,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             }
 
             loaded = true;
+
+            // ── Phase 6: Initialize G-buffer render targets for MRT gbuffers ──
+            initializeGBuffer();
 
             // Report module creation phase
             reportProgress(new LoadProgress(
@@ -889,12 +901,75 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             fsTargets = null;
         }
 
+        // Destroy G-buffer manager
+        if (gbufferManager != null) {
+            gbufferManager.destroy();
+            gbufferManager = null;
+        }
+        renderTargetSettings = null;
+
         for (BasicPipeline mrtP : mrtPipelines.values()) {
             if (mrtP != null) mrtP.destroy();
         }
         mrtPipelines.clear();
 
         LOGGER.info("Shaderpack pipeline unloaded: {}", packName);
+    }
+
+    /**
+     * Initializes G-buffer render targets for MRT gbuffers rendering.
+     *
+     * <p>Scans all compiled gbuffers programs to find the union of all color targets
+     * they write to, then creates the MRT render pass and framebuffer accordingly.</p>
+     */
+    private void initializeGBuffer() {
+        // Collect all color targets used by any gbuffers program
+        Set<Integer> allGbufferTargets = new TreeSet<>();
+        for (Map.Entry<ProgramId, CompiledProgram> entry : compiledPrograms.entrySet()) {
+            ProgramId id = entry.getKey();
+            if (!id.getSourceName().startsWith("gbuffers_")) continue;
+            CompiledProgram prog = entry.getValue();
+            if (prog.renderTargets != null) {
+                for (int t : prog.renderTargets) {
+                    allGbufferTargets.add(t);
+                }
+            }
+        }
+
+        if (allGbufferTargets.isEmpty()) {
+            LOGGER.info("[MRT] No gbuffers programs with render targets — MRT disabled");
+            return;
+        }
+
+        // Build RenderTargetSettings from shaderpack properties
+        renderTargetSettings = new RenderTargetSettings();
+        for (int idx : allGbufferTargets) {
+            renderTargetSettings.markUsed(idx);
+        }
+
+        // Apply format overrides from shaders.properties
+        if (properties != null) {
+            for (int i = 0; i < RenderTargetSettings.MAX_COLOR_TARGETS; i++) {
+                String format = properties.getColorTexFormat(i);
+                if (format != null && !format.isEmpty()) {
+                    int vkFormat = RenderTargetSettings.resolveFormat(format);
+                    renderTargetSettings.getColorSettings(i).setVkFormat(vkFormat);
+                }
+            }
+        }
+
+        // Create G-buffer manager
+        VkDevice device = Vulkanium.getVulkanDevice().getLogicalDevice();
+        int swapchainW = Vulkanium.getVulkanSwapchain().getWidth();
+        int swapchainH = Vulkanium.getVulkanSwapchain().getHeight();
+        int depthFormat = Vulkanium.getVulkanSwapchain().getDepthFormat();
+
+        gbufferManager = new GBufferManager();
+        gbufferManager.initialize(device, Vulkanium.getVulkanMemory(),
+                swapchainW, swapchainH, renderTargetSettings, allGbufferTargets, depthFormat);
+
+        LOGGER.info("[MRT] G-buffer initialized for {} color targets: {}",
+                allGbufferTargets.size(), allGbufferTargets);
     }
 
     /**
@@ -924,15 +999,27 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 LOGGER.info("[COMPAT] Ignoring geometry stage for {} in compatibility gbuffers path", requestedProgram.getSourceName());
             }
 
+            // Use MRT render pass for gbuffers programs when G-buffer is active
+            long renderPassHandle;
+            int colorAttachmentCount;
+            if (gbufferManager != null && !requestedProgram.isFullscreenPass()) {
+                renderPassHandle = gbufferManager.getRenderPass();
+                colorAttachmentCount = gbufferManager.getSubpassColorRefCount();
+            } else {
+                renderPassHandle = Vulkanium.getMainRenderPass().getRenderPass();
+                colorAttachmentCount = 1;
+            }
+
             BasicPipeline pipeline = new BasicPipeline();
             pipeline.initializeWithModules(
                     Vulkanium.getVulkanDevice().getLogicalDevice(),
-                    Vulkanium.getMainRenderPass().getRenderPass(),
+                    renderPassHandle,
                     "shaderpack_" + requestedProgram.getSourceName(),
                     program.vertexModule,
                     program.fragmentModule,
                     geometryModule,
-                    format
+                    format,
+                    colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
             return pipeline;
@@ -1014,6 +1101,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     @Override
     public boolean isLoaded() { return loaded; }
 
+    /** Returns the G-buffer manager, or null if MRT is not initialized. */
+    public GBufferManager getGBufferManager() { return gbufferManager; }
+
     @Override
     public void onFrameBegin(VkCommandBuffer cmd, int frameIndex) {
         if (!loaded) return;
@@ -1033,8 +1123,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
      * Captures the current color + depth scene inputs for fullscreen shaderpack passes.
      * Must be called outside any active render pass.
      *
-     * <p>Copies the swapchain color → colortex0 and depth → depthtex0/1/2,
-     * initializing the MRT ping-pong targets for the upcoming fullscreen pass chain.</p>
+     * <p>When the G-buffer MRT manager is active, copies G-buffer color and depth
+     * targets into the fullscreen ping-pong targets. Otherwise falls back to
+     * capturing from the swapchain color/depth.</p>
      */
     public void prepareFullscreenInputs(VkCommandBuffer cmd, int frameIndex) {
         if (!loaded) return;
@@ -1056,18 +1147,35 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         fsTargets.initializeImageLayouts(cmd); // transition UNDEFINED → SHADER_READ on first use
         fsTargets.resetFlips();
 
-        // Capture swapchain color → colortex0
-        long[] swapchainImages = Vulkanium.getVulkanSwapchain().getImages();
-        int imageIndex = Vulkanium.getFrameOrchestrator().getCurrentImageIndex();
-        if (swapchainImages != null && imageIndex >= 0 && imageIndex < swapchainImages.length) {
-            fsTargets.captureSceneToColorTarget0(cmd, swapchainImages[imageIndex],
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        }
+        // ── G-buffer MRT path: copy all G-buffer targets into fsTargets ──
+        if (gbufferManager != null && gbufferManager.isInitialized()) {
+            // Copy each used G-buffer color target into the corresponding fsTargets colortex
+            for (int colortexIdx : gbufferManager.getUsedColorTargets()) {
+                RenderTarget gbufTarget = gbufferManager.getColorTarget(colortexIdx);
+                if (gbufTarget != null && gbufTarget.getImage() != VK_NULL_HANDLE) {
+                    fsTargets.captureGBufferColorTarget(cmd, gbufTarget.getImage(), colortexIdx);
+                }
+            }
 
-        // Capture depth → depthtex0/1/2
-        long srcDepthImage = Vulkanium.getVulkanSwapchain().getDepthImage();
-        if (srcDepthImage != VK_NULL_HANDLE) {
-            fsTargets.captureDepthToTarget0(cmd, srcDepthImage);
+            // Copy G-buffer depth into depthtex0/1/2
+            RenderTarget gbufDepth = gbufferManager.getDepthTarget();
+            if (gbufDepth != null && gbufDepth.getImage() != VK_NULL_HANDLE) {
+                fsTargets.captureGBufferDepthTarget(cmd, gbufDepth.getImage());
+            }
+        } else {
+            // ── Fallback: capture from swapchain (no G-buffer) ──
+            long[] swapchainImages = Vulkanium.getVulkanSwapchain().getImages();
+            int imageIndex = Vulkanium.getFrameOrchestrator().getCurrentImageIndex();
+            if (swapchainImages != null && imageIndex >= 0 && imageIndex < swapchainImages.length) {
+                fsTargets.captureSceneToColorTarget0(cmd, swapchainImages[imageIndex],
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+            }
+
+            // Capture depth → depthtex0/1/2
+            long srcDepthImage = Vulkanium.getVulkanSwapchain().getDepthImage();
+            if (srcDepthImage != VK_NULL_HANDLE) {
+                fsTargets.captureDepthToTarget0(cmd, srcDepthImage);
+            }
         }
     }
 
@@ -1235,7 +1343,12 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
 
         // ── Blit colortex0 → swapchain ──
-        if (executed > 0) {
+        // When MRT G-buffer is active, the fullscreen pass chain can produce meaningful
+        // output because colortex0-N were populated by gbuffers world rendering.
+        // Auto-enabled when gbufferManager is initialized, or via -Dvulkanium.mrt.enabled=true.
+        boolean mrtGbuffersAvailable = (gbufferManager != null && gbufferManager.isInitialized())
+                || Boolean.getBoolean("vulkanium.mrt.enabled");
+        if (executed > 0 && mrtGbuffersAvailable) {
             long[] swapchainImages = Vulkanium.getVulkanSwapchain().getImages();
             int imageIndex = Vulkanium.getFrameOrchestrator().getCurrentImageIndex();
             if (swapchainImages != null && imageIndex >= 0 && imageIndex < swapchainImages.length) {
@@ -1245,8 +1358,14 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
 
         if (executed > 0 && !loggedFullscreenExecution) {
-            LOGGER.info("[FULLSCREEN] Executed {} deferred/composite/final passes with MRT ping-pong (mode={}, skipped={})",
-                    executed, FULLSCREEN_COMPAT_MODE.name().toLowerCase(Locale.ROOT), skipped);
+            LOGGER.info("[FULLSCREEN] Executed {} deferred/composite/final passes (mode={}, skipped={}, blit={})",
+                    executed, FULLSCREEN_COMPAT_MODE.name().toLowerCase(Locale.ROOT), skipped,
+                    mrtGbuffersAvailable ? "enabled (MRT G-buffer active)" : "disabled (no MRT gbuffers)");
+            if (!mrtGbuffersAvailable) {
+                LOGGER.info("[FULLSCREEN] Blit disabled: colortex1-7 are empty without MRT gbuffers. "
+                        + "Swapchain retains basic rendered scene. "
+                        + "Enable with -Dvulkanium.mrt.enabled=true to test blit.");
+            }
             loggedFullscreenExecution = true;
         } else if (executed == 0 && !loggedFullscreenSkipped) {
             LOGGER.info("[FULLSCREEN] No compatible fullscreen pass executed in mode={} (skipped={})",
@@ -1496,6 +1615,16 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
     @Override
     public ShaderpackProperties getProperties() { return properties; }
+
+    /**
+     * Returns the cloud rendering setting from the shaderpack's {@code shaders.properties}.
+     *
+     * <p>Used by {@code MixinOptions_CloudsOverride} to disable vanilla cloud
+     * rendering when the shaderpack renders its own volumetric clouds.</p>
+     */
+    public CloudSetting getCloudSetting() {
+        return properties != null ? properties.getCloudSetting() : CloudSetting.DEFAULT;
+    }
 
     /**
      * Returns the compiled program for a given ProgramId (for pipeline creation).

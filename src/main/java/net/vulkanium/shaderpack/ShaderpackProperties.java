@@ -142,6 +142,20 @@ public class ShaderpackProperties {
     public boolean isOldLighting() { return getBoolean("oldLighting", false); }
 
     /**
+     * Returns the cloud rendering setting from {@code shaders.properties}.
+     *
+     * <p>Shaderpacks like iterationT, iterationRP set {@code clouds = off} because
+     * they render volumetric clouds in composite/deferred passes. Complementary
+     * Unbound conditionally discards in gbuffers_clouds but still renders vanilla
+     * geometry as a base.</p>
+     *
+     * @return The cloud setting (OFF, FAST, FANCY, or DEFAULT)
+     */
+    public CloudSetting getCloudSetting() {
+        return CloudSetting.fromString(get("clouds"));
+    }
+
+    /**
      * Gets the VkFormat-equivalent format string for a color texture attachment.
      *
      * @param index Color texture index (0–15)

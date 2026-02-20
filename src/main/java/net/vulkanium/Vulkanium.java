@@ -605,6 +605,7 @@ public class Vulkanium implements ClientModInitializer {
         lastScH = -1;
         diagFrameDrawCount = 0;
         frameHadWorldRender = false;
+        fullscreenPassesExecuted = false;
 
         // Log frame-start state for diagnostic frames
         if (isDebugLogging() && (frameCounter < 15 || (frameCounter >= 295 && frameCounter <= 305))) {
@@ -643,6 +644,24 @@ public class Vulkanium implements ClientModInitializer {
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
 
+        // Safety: if the MRT G-buffer pass is still active (onWorldRenderEnd never ran),
+        // end it now to avoid leaving the command buffer in an inconsistent state.
+        if (getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                && shaderpackManager != null
+                && shaderpackManager.getActivePipeline() instanceof
+                        net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline
+                && vkPipeline.isLoaded()) {
+            var gbuf = vkPipeline.getGBufferManager();
+            if (gbuf != null && gbuf.isWorldPassActive()) {
+                LOGGER.warn("[MRT] G-buffer pass still active at frame end — forcing cleanup");
+                gbuf.endWorldPass(cmd);
+                // Restart main pass so the end() call below succeeds
+                int imageIndex = frameOrchestrator.getCurrentImageIndex();
+                mainRenderPass.beginPreserve(cmd, imageIndex,
+                        vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
+            }
+        }
+
         // End render pass
         mainRenderPass.end(cmd);
 
@@ -650,19 +669,19 @@ public class Vulkanium implements ClientModInitializer {
                 && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
                 && shaderpackManager != null
                 && shaderpackManager.getActivePipeline() != null
-                && shaderpackManager.getActivePipeline().isLoaded()) {
-
+                && shaderpackManager.getActivePipeline().isLoaded()
+                && !fullscreenPassesExecuted) {
+            // Only run fullscreen passes here if they weren't already executed
+            // in onWorldRenderEnd (which runs them before GUI so the composite
+            // blit doesn't overwrite HUD/menu elements).
             if (shaderpackManager
                     .getActivePipeline() instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline) {
-                // Capture scene color/depth into MRT render targets (outside render pass)
                 vkPipeline.prepareFullscreenInputs(cmd, frameOrchestrator.getCurrentFrame());
             }
 
-            // Fullscreen passes now manage their own MRT render passes and
-            // blit the final colortex0 result back to the swapchain, so no
-            // beginPreserve/end wrapper is needed.
             shaderpackManager.getActivePipeline().onFrameEnd(cmd, frameOrchestrator.getCurrentFrame());
         }
+        fullscreenPassesExecuted = false;
 
         // ── RT pass: feed chunk meshes to RT pipeline, then dispatch ──
         // Run RT whenever it's enabled in config (SSAO works in any render mode)
@@ -746,13 +765,60 @@ public class Vulkanium implements ClientModInitializer {
         return new org.joml.Matrix4f(glProjection);
     }
 
+    /** Whether the fullscreen composite/deferred passes already executed this frame. */
+    private static boolean fullscreenPassesExecuted = false;
+
     public static void onWorldRenderStart() {
         worldRenderActive = true;
         frameHadWorldRender = true;
+
+        // Begin MRT G-buffer pass if a shaderpack with MRT is active
+        if (vulkanReady && frameStarted
+                && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                && shaderpackManager != null
+                && shaderpackManager.getActivePipeline() instanceof
+                        net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline
+                && vkPipeline.isLoaded()) {
+            var gbuf = vkPipeline.getGBufferManager();
+            if (gbuf != null) {
+                VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
+                gbuf.beginWorldPass(cmd, mainRenderPass);
+            }
+        }
     }
 
     public static void onWorldRenderEnd() {
         worldRenderActive = false;
+
+        // End MRT G-buffer pass → run composite/deferred/final → blit → restart main pass for GUI
+        if (vulkanReady && frameStarted
+                && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                && shaderpackManager != null
+                && shaderpackManager.getActivePipeline() instanceof
+                        net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline
+                && vkPipeline.isLoaded()) {
+            var gbuf = vkPipeline.getGBufferManager();
+            if (gbuf != null && gbuf.isWorldPassActive()) {
+                VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
+                int imageIndex = frameOrchestrator.getCurrentImageIndex();
+
+                // 1. End MRT pass, transition all targets to SHADER_READ
+                gbuf.endWorldPass(cmd);
+
+                // 2. Copy G-buffer data into fullscreen ping-pong targets
+                vkPipeline.prepareFullscreenInputs(cmd, frameOrchestrator.getCurrentFrame());
+
+                // 3. Run composite/deferred/final passes (produces final image in colortex0)
+                vkPipeline.onFrameEnd(cmd, frameOrchestrator.getCurrentFrame());
+                fullscreenPassesExecuted = true;
+
+                // 4. Restart main render pass for GUI/HUD rendering
+                //    The fullscreen blit already wrote the composite result to swapchain;
+                //    beginPreserve loads existing content so GUI draws on top.
+                mainRenderPass.beginPreserve(cmd, imageIndex,
+                        vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
+            }
+        }
     }
 
     public static void onTerrainLayerStart(String renderTypeName) {
@@ -780,6 +846,15 @@ public class Vulkanium implements ClientModInitializer {
             return null;
 
         if (getRenderMode() != net.vulkanium.render.RenderMode.SHADERPACK) {
+            return fallback;
+        }
+
+        // When MRT G-buffer is active, shaderpack pipelines are created against the
+        // MRT render pass (N color attachments). After world rendering ends, the main
+        // render pass (1 attachment) is active for GUI/HUD/menu. Using an MRT pipeline
+        // with the main render pass is a Vulkan spec violation. Fall back to vanilla
+        // pipelines for all non-world draws.
+        if (!worldRenderActive) {
             return fallback;
         }
 
@@ -831,6 +906,11 @@ public class Vulkanium implements ClientModInitializer {
             return null;
         }
 
+        // Block selection outline and debug lines
+        if (name.contains("lines") || name.equals("rendertype_lines")) {
+            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_LINE;
+        }
+
         if (name.contains("cloud")) {
             return net.vulkanium.shaderpack.ProgramId.GBUFFERS_CLOUDS;
         }
@@ -864,7 +944,13 @@ public class Vulkanium implements ClientModInitializer {
                 || name.startsWith("rendertype_eyes")
                 || name.startsWith("rendertype_glint")
                 || name.contains("armor_glint")) {
-            // Keep entities/glint on the stable fallback path for now.
+            // Route hand rendering through shaderpack HAND pipeline
+            if (net.vulkanium.render.program.WorldRenderingPhase.isHand()) {
+                return name.contains("translucent")
+                        ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_HAND_WATER
+                        : net.vulkanium.shaderpack.ProgramId.GBUFFERS_HAND;
+            }
+            // Keep other entities/glint on the stable fallback path for now.
             // iterationRP entity compatibility requires tighter parity for overlays,
             // lightmaps and material conventions than this bridge currently provides.
             return null;
@@ -884,6 +970,12 @@ public class Vulkanium implements ClientModInitializer {
             if (activeTerrainLayerName.contains("translucent")
                     || activeTerrainLayerName.contains("tripwire")
                     || activeTerrainLayerName.contains("water")) {
+                // Without MRT, gbuffers_water writes packed G-buffer data to location 0
+                // instead of albedo → produces visual garbage. Fall back to vanilla
+                // translucent rendering until MRT support is implemented.
+                if (!Boolean.getBoolean("vulkanium.mrt.enabled")) {
+                    return null;
+                }
                 return net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER;
             }
             if (activeTerrainLayerName.contains("solid")) {
@@ -892,9 +984,12 @@ public class Vulkanium implements ClientModInitializer {
         }
 
         if (name.isEmpty()) {
-            return net.vulkanium.compat.VRenderSystem.isBlendEnabled()
-                    ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER
-                    : net.vulkanium.shaderpack.ProgramId.GBUFFERS_TERRAIN_SOLID;
+            if (net.vulkanium.compat.VRenderSystem.isBlendEnabled()) {
+                return Boolean.getBoolean("vulkanium.mrt.enabled")
+                        ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER
+                        : null;
+            }
+            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_TERRAIN_SOLID;
         }
 
         // Only remap actual terrain/world chunk layer shader names.

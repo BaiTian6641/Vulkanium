@@ -53,6 +53,9 @@ public class WorldRenderingPhase {
         STARS,
         VOID,
 
+        // Clouds (between sky and terrain — vanilla renderClouds() call)
+        CLOUDS,
+
         // Opaque gbuffers
         TERRAIN_SOLID,
         TERRAIN_CUTOUT,
@@ -119,6 +122,13 @@ public class WorldRenderingPhase {
      */
     public static boolean isShadow() {
         return currentPhase == Phase.SHADOW;
+    }
+
+    /**
+     * Returns true if the current phase is rendering clouds.
+     */
+    public static boolean isClouds() {
+        return currentPhase == Phase.CLOUDS;
     }
 
     /**
