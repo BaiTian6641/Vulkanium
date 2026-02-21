@@ -366,6 +366,15 @@ public class HdrConfig {
     public static ColorSpaceTarget getColorSpaceTarget() { return colorSpaceTarget; }
 
     /**
+     * Sets the color space target for shader uniform reporting.
+     * Called when the user changes the color space setting in Video Settings.
+     */
+    public static void setColorSpaceTarget(ColorSpaceTarget target) {
+        colorSpaceTarget = target;
+        LOGGER.info("Color space target set to: {} (index {})", target.name(), target.index);
+    }
+
+    /**
      * Returns whether the current HDR mode uses a floating-point swapchain format.
      * This is relevant for blend state and clear color precision.
      */

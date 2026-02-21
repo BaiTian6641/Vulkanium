@@ -203,22 +203,56 @@ public class ShaderModuleManager {
                     () -> {
                     String transformed = transformWithAST(fragPP.source, fragParams);
                     // Inject fragment output declarations for all render targets.
-                    // With MRT G-buffer rendering, ALL targets are real 'out' variables
-                    // with proper layout(location=N) declarations.
-                    transformed = OptiFineGlslPreprocessor.injectFragmentOutputs(transformed, finalRenderTargets);
+                    // Fullscreen/composite passes use compact locations (0,1,2...)
+                    // because each pass creates its own render pass with exactly
+                    // renderTargets.length color attachments — targets like [8,9]
+                    // would exceed maxColorAttachments (8) with sparse locations.
+                    // GBuffer (world) programs share one render pass and use sparse
+                    // locations (the colortex index itself) so all programs' outputs
+                    // map correctly to the union render pass.
+                    boolean compactMode = (passType == PassType.COMPOSITE);
+                    transformed = OptiFineGlslPreprocessor.injectFragmentOutputs(
+                            transformed, finalRenderTargets, compactMode);
                     return transformed;
                     });
 
-            // ── Stage 2.5: Reconcile varying locations across stages ──
+            // ── Stage 2.5: Geometry shader preprocessing + transform (before reconciliation) ──
+            String transformedGeom = null;
+            if (geometrySource != null) {
+                emitStage(programName, "geometry-preprocess", "Preprocessing geometry shader");
+                final OptiFineGlslPreprocessor.PreprocessResult geomPP =
+                        OptiFineGlslPreprocessor.preprocess(geometrySource, false);
+                final TransformParams geomParams = new TransformParams(
+                    passType, false, false, false, samplerBindings, finalRenderTargets);
+                emitStage(programName, "geometry-transform", "Transforming geometry shader");
+                transformedGeom = getOrCreateTranslatedSource(
+                    programName, "geom", geomPP.source, geomParams,
+                    () -> transformWithAST(geomPP.source, geomParams));
+            }
+
+            // ── Stage 2.6: Reconcile varying locations across stages ──
             // Many shaderpacks use different naming conventions for vertex outputs
             // (e.g., g_color) and fragment inputs (e.g., v_color). The per-stage
             // location assignment uses alphabetical order, which produces mismatches
             // when names differ. This reconciliation step matches them by normalized
             // name and assigns consistent locations across both stages.
-            String[] reconciled = VulkaniumGlslTransformer.reconcileVaryingLocations(
-                    transformedVert, transformedFrag);
-            transformedVert = reconciled[0];
-            transformedFrag = reconciled[1];
+            if (transformedGeom != null) {
+                // 3-stage reconciliation: vertex→geometry, geometry→fragment
+                String[] reconciledVG = VulkaniumGlslTransformer.reconcileVaryingLocations(
+                        transformedVert, transformedGeom);
+                transformedVert = reconciledVG[0];
+                transformedGeom = reconciledVG[1];
+                String[] reconciledGF = VulkaniumGlslTransformer.reconcileVaryingLocations(
+                        transformedGeom, transformedFrag);
+                transformedGeom = reconciledGF[0];
+                transformedFrag = reconciledGF[1];
+                LOGGER.debug("[GEOM] 3-stage varying reconciliation for '{}'", programName);
+            } else {
+                String[] reconciled = VulkaniumGlslTransformer.reconcileVaryingLocations(
+                        transformedVert, transformedFrag);
+                transformedVert = reconciled[0];
+                transformedFrag = reconciled[1];
+            }
 
             // ── Stage 3: Compile to SPIR-V ──
                 emitStage(programName, "compile-vert", "Compiling vertex shader to SPIR-V");
@@ -243,18 +277,9 @@ public class ShaderModuleManager {
             modules.put(new ProgramKey(programName, ShaderCompiler.ShaderStage.VERTEX), vertModule);
             modules.put(new ProgramKey(programName, ShaderCompiler.ShaderStage.FRAGMENT), fragModule);
 
-            // Geometry shader (optional)
+            // Geometry shader compilation (preprocessing + transform already done in Stage 2.5)
             long geomModule = 0;
-            if (geometrySource != null) {
-                emitStage(programName, "geometry-preprocess", "Preprocessing geometry shader");
-                OptiFineGlslPreprocessor.PreprocessResult geomPP =
-                        OptiFineGlslPreprocessor.preprocess(geometrySource, false);
-                TransformParams geomParams = new TransformParams(
-                    passType, false, false, false, samplerBindings, finalRenderTargets);
-                emitStage(programName, "geometry-transform", "Transforming geometry shader");
-                String transformedGeom = getOrCreateTranslatedSource(
-                    programName, "geom", geomPP.source, geomParams,
-                    () -> transformWithAST(geomPP.source, geomParams));
+            if (transformedGeom != null) {
                 emitStage(programName, "geometry-compile", "Compiling geometry shader to SPIR-V");
                 ShaderCompiler.CompilationResult geomResult = compiler.compile(
                         transformedGeom, ShaderCompiler.ShaderStage.GEOMETRY, programName + ".geom");
@@ -262,6 +287,7 @@ public class ShaderModuleManager {
                     emitStage(programName, "geometry-module", "Creating geometry shader module");
                     geomModule = createShaderModule(geomResult.spirvBinary);
                     modules.put(new ProgramKey(programName, ShaderCompiler.ShaderStage.GEOMETRY), geomModule);
+                    org.lwjgl.system.MemoryUtil.memFree(geomResult.spirvBinary);
                 } else {
                     LOGGER.warn("Geometry shader for '{}' failed, skipping: {}", programName, geomResult.errorMessage);
                 }

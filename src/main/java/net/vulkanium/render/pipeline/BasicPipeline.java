@@ -36,6 +36,7 @@ public class BasicPipeline {
     private long fragShaderModule = VK_NULL_HANDLE;
     private long geomShaderModule = VK_NULL_HANDLE;
     private boolean ownsShaderModules = true;
+    private boolean ownsDescriptorSetLayout = true;
 
     // Pipeline cache keyed by state hash
     private final Map<Long, Long> pipelineCache = new ConcurrentHashMap<>();
@@ -94,7 +95,7 @@ public class BasicPipeline {
                                       long geomShaderModule,
                                       VertexFormat vertexFormat) {
         initializeWithModules(device, renderPass, name, vertShaderModule, fragShaderModule,
-                geomShaderModule, vertexFormat, 1);
+            geomShaderModule, vertexFormat, 1, VK_NULL_HANDLE);
     }
 
     /**
@@ -105,6 +106,21 @@ public class BasicPipeline {
                                       long vertShaderModule, long fragShaderModule,
                                       long geomShaderModule,
                                       VertexFormat vertexFormat, int colorAttachmentCount) {
+        initializeWithModules(device, renderPass, name, vertShaderModule, fragShaderModule,
+            geomShaderModule, vertexFormat, colorAttachmentCount, VK_NULL_HANDLE);
+        }
+
+        /**
+         * Initializes a pipeline using pre-created shader modules, with optional external descriptor set layout reuse.
+         *
+         * <p>If {@code sharedDescriptorSetLayout != VK_NULL_HANDLE}, the pipeline layout will be created
+         * using that descriptor set layout and this pipeline will not destroy it.</p>
+         */
+        public void initializeWithModules(VkDevice device, long renderPass, String name,
+                          long vertShaderModule, long fragShaderModule,
+                          long geomShaderModule,
+                          VertexFormat vertexFormat, int colorAttachmentCount,
+                          long sharedDescriptorSetLayout) {
         this.device = device;
         this.renderPass = renderPass;
         this.name = name;
@@ -116,7 +132,13 @@ public class BasicPipeline {
         this.geomShaderModule = geomShaderModule;
         this.colorAttachmentCount = colorAttachmentCount;
 
-        createDescriptorSetLayout();
+        if (sharedDescriptorSetLayout != VK_NULL_HANDLE) {
+            this.descriptorSetLayout = sharedDescriptorSetLayout;
+            this.ownsDescriptorSetLayout = false;
+        } else {
+            this.ownsDescriptorSetLayout = true;
+            createDescriptorSetLayout();
+        }
         createPipelineLayout();
 
         LOGGER.info("Pipeline '{}' initialized from external modules (vert=0x{}, frag=0x{}, geom=0x{})",
@@ -130,12 +152,20 @@ public class BasicPipeline {
         try (MemoryStack stack = stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(1 + MAX_TEXTURE_BINDINGS, stack);
 
+            // Include geometry stage in descriptor visibility when geometry shader is present
+            int uboStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            int samplerStages = VK_SHADER_STAGE_FRAGMENT_BIT;
+            if (geomShaderModule != VK_NULL_HANDLE) {
+                uboStages |= VK_SHADER_STAGE_GEOMETRY_BIT;
+                samplerStages |= VK_SHADER_STAGE_GEOMETRY_BIT;
+            }
+
             // Binding 0: Combined UBO (MVP + ColorModulator) — DYNAMIC for per-draw offset
             bindings.get(0)
                     .binding(0)
                     .descriptorType(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)
                     .descriptorCount(1)
-                    .stageFlags(VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+                    .stageFlags(uboStages);
 
                 // Bindings 1..N: Texture samplers
                 for (int binding = 1; binding <= MAX_TEXTURE_BINDINGS; binding++) {
@@ -143,7 +173,7 @@ public class BasicPipeline {
                     .binding(binding)
                     .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1)
-                    .stageFlags(VK_SHADER_STAGE_FRAGMENT_BIT);
+                    .stageFlags(samplerStages);
                 }
 
             VkDescriptorSetLayoutCreateInfo layoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
@@ -276,15 +306,22 @@ public class BasicPipeline {
                     .depthBoundsTestEnable(false)
                     .stencilTestEnable(false);
 
-            // Color blend: one attachment state per color attachment in the render pass
+            // Color blend: one attachment state per color attachment in the render pass.
+            // For MRT G-buffer pipelines (colorAttachmentCount > 1), only the first
+            // attachment (colortex0 / albedo) uses the requested blend state. All other
+            // G-buffer targets (normals, specular, etc.) write through without blending,
+            // so translucent geometry (water, ice) doesn't zero-out encoded G-buffer data.
             VkPipelineColorBlendAttachmentState.Buffer colorBlendAttachment =
                     VkPipelineColorBlendAttachmentState.calloc(colorAttachmentCount, stack);
             for (int att = 0; att < colorAttachmentCount; att++) {
                 colorBlendAttachment.get(att)
                         .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                        .blendEnable(blendEnabled);
-                if (blendEnabled) {
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+
+                // Only blend attachment 0 (colortex0); disable for other MRT targets
+                boolean attachBlend = blendEnabled && (att == 0 || colorAttachmentCount == 1);
+                colorBlendAttachment.get(att).blendEnable(attachBlend);
+                if (attachBlend) {
                     colorBlendAttachment.get(att)
                             .srcColorBlendFactor(srcColorBlend)
                             .dstColorBlendFactor(dstColorBlend)
@@ -416,9 +453,11 @@ public class BasicPipeline {
                 }
                 case COLOR -> {
                     if (!colorDone && hasColor) {
-                        // Shaderpack shaders always expect Color at location 2.
-                        // Vanilla shaders (ownsShaderModules) use location 1 when no UV.
-                        loc = (!ownsShaderModules || hasUV) ? 2 : 1;
+                        // Color at location 2 when UV0 occupies location 1,
+                        // otherwise Color at location 1 (e.g., sky POSITION_COLOR format).
+                        // This matches the shader transforms: terrain declares Color at
+                        // location 2, sky declares Color at location 1.
+                        loc = hasUV ? 2 : 1;
                         colorDone = true;
                     }
                 }
@@ -514,6 +553,8 @@ public class BasicPipeline {
             if (geomShaderModule != VK_NULL_HANDLE) vkDestroyShaderModule(device, geomShaderModule, null);
         }
         if (pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipelineLayout, null);
-        if (descriptorSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorSetLayout, null);
+        if (ownsDescriptorSetLayout && descriptorSetLayout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(device, descriptorSetLayout, null);
+        }
     }
 }

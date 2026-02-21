@@ -1,6 +1,8 @@
 package net.vulkanium.render.terrain;
 
 import net.vulkanium.Vulkanium;
+import net.vulkanium.compat.GlStateInterceptor;
+import net.vulkanium.compat.VRenderSystem;
 import net.vulkanium.core.*;
 import net.vulkanium.render.terrain.build.ChunkBuildScheduler;
 import net.vulkanium.render.terrain.build.ChunkBuildWorkerPool;
@@ -13,7 +15,10 @@ import net.vulkanium.render.terrain.region.RenderRegionManager;
 import net.vulkanium.render.terrain.section.RenderSection;
 import net.vulkanium.render.terrain.section.SectionVisibility;
 import net.vulkanium.render.terrain.upload.ChunkUploadManager;
+import net.vulkanium.render.pipeline.BasicPipeline;
+import net.vulkanium.render.pipeline.DrawBatcher;
 import net.vulkanium.render.shadow.ShadowRenderer;
+import net.vulkanium.render.texture.VulkanTexture;
 import net.vulkanium.resource.StagingRing;
 import org.joml.Matrix4f;
 import org.lwjgl.vulkan.VkCommandBuffer;
@@ -21,7 +26,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+
+import static org.lwjgl.vulkan.VK10.VK_NULL_HANDLE;
 
 /**
  * Main terrain rendering orchestrator — the centerpiece of Vulkanium's rendering engine.
@@ -93,6 +101,10 @@ public class ChunkRenderer {
     private int sectionsUploadedThisFrame;
     private int totalDrawCommands;
     private int totalRegionsDrawn;
+
+    // Shadow terrain pipeline (set externally for shadow pass, reset after)
+    private long shadowTerrainPipeline = 0;
+    private long shadowTerrainPipelineLayout = 0;
 
     public ChunkRenderer(VulkaniumMemory memory, VulkaniumQueues queues, StagingRing stagingRing) {
         this.regionManager = new RenderRegionManager();
@@ -289,6 +301,16 @@ public class ChunkRenderer {
     }
 
     /**
+     * Sets an override shadow terrain pipeline for shadow pass rendering.
+     * When set, {@link #recordShadowLayers} binds this pipeline instead of
+     * the per-pass terrain pipelines. Pass (0, 0) to clear.
+     */
+    public void setShadowTerrainPipeline(long pipeline, long layout) {
+        this.shadowTerrainPipeline = pipeline;
+        this.shadowTerrainPipelineLayout = layout;
+    }
+
+    /**
      * Records shadow-pass draw commands for the specified terrain layers.
      *
      * @param commandBuffer Active command buffer handle
@@ -347,18 +369,145 @@ public class ChunkRenderer {
     }
 
     private void recordShadowLayers(VkCommandBuffer cmd, int layerMask) {
+        // If a shadow-specific pipeline is set, bind it once for all layers
+        if (shadowTerrainPipeline != 0) {
+            org.lwjgl.vulkan.VK10.vkCmdBindPipeline(cmd,
+                    org.lwjgl.vulkan.VK10.VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    shadowTerrainPipeline);
+
+            // Bind descriptor set with shadow uniforms — REQUIRED before any draw calls.
+            // The shadow pipeline layout declares UBO + 64 sampler bindings; without a
+            // valid descriptor set bound, the GPU reads garbage pointers → SIGSEGV.
+            bindShadowDescriptors(cmd);
+        }
+
         if ((layerMask & LAYER_SOLID) != 0) {
-            renderPasses[TerrainPassType.SOLID.ordinal()].record(cmd, regionManager, null);
+            if (shadowTerrainPipeline != 0) {
+                // Draw regions directly without rebinding per-pass pipeline
+                recordShadowRegions(cmd, TerrainPassType.SOLID);
+            } else {
+                renderPasses[TerrainPassType.SOLID.ordinal()].record(cmd, regionManager, null);
+            }
         }
         if ((layerMask & LAYER_CUTOUT) != 0) {
-            renderPasses[TerrainPassType.CUTOUT.ordinal()].record(cmd, regionManager, null);
+            if (shadowTerrainPipeline != 0) {
+                recordShadowRegions(cmd, TerrainPassType.CUTOUT);
+            } else {
+                renderPasses[TerrainPassType.CUTOUT.ordinal()].record(cmd, regionManager, null);
+            }
         }
         if ((layerMask & LAYER_CUTOUT_MIPPED) != 0) {
-            renderPasses[TerrainPassType.CUTOUT_MIPPED.ordinal()].record(cmd, regionManager, null);
+            if (shadowTerrainPipeline != 0) {
+                recordShadowRegions(cmd, TerrainPassType.CUTOUT_MIPPED);
+            } else {
+                renderPasses[TerrainPassType.CUTOUT_MIPPED.ordinal()].record(cmd, regionManager, null);
+            }
         }
         if ((layerMask & LAYER_TRANSLUCENT) != 0) {
-            renderPasses[TerrainPassType.TRANSLUCENT.ordinal()].record(cmd, regionManager, null);
-            renderPasses[TerrainPassType.TRIPWIRE.ordinal()].record(cmd, regionManager, null);
+            if (shadowTerrainPipeline != 0) {
+                recordShadowRegions(cmd, TerrainPassType.TRANSLUCENT);
+                recordShadowRegions(cmd, TerrainPassType.TRIPWIRE);
+            } else {
+                renderPasses[TerrainPassType.TRANSLUCENT.ordinal()].record(cmd, regionManager, null);
+                renderPasses[TerrainPassType.TRIPWIRE.ordinal()].record(cmd, regionManager, null);
+            }
+        }
+    }
+
+    /**
+     * Binds a descriptor set with shadow-specific uniform data for shadow terrain draws.
+     *
+     * <p>The shadow pipeline (BasicPipeline) declares a descriptor set layout with:
+     * <ul>
+     *   <li>Binding 0: UBO_DYNAMIC — MVP matrices, fog, color modulator, chunk offset</li>
+     *   <li>Bindings 1-64: COMBINED_IMAGE_SAMPLER — texture samplers</li>
+     * </ul>
+     * Without a valid descriptor set bound, any draw call triggers undefined behavior
+     * (typically SIGSEGV on AMD RADV as the GPU dereferences null/garbage descriptor pointers).
+     *
+     * <p>Shadow matrices are read from {@link ShadowRenderer#MODELVIEW} and
+     * {@link ShadowRenderer#PROJECTION}, which are populated in
+     * {@code ShadowRenderer.renderShadows()} step 2 before terrain draws begin.
+     *
+     * <p>Texture bindings use 1×1 white placeholder textures. For cutout alpha testing,
+     * the block atlas should be bound at binding 1 in a future refinement.
+     */
+    private void bindShadowDescriptors(VkCommandBuffer cmd) {
+        if (shadowTerrainPipelineLayout == 0) return;
+
+        DrawBatcher drawBatcher = Vulkanium.getDrawBatcher();
+        if (drawBatcher == null) return;
+
+        int frameIndex = Vulkanium.getFrameOrchestrator().getCurrentFrame();
+
+        // Shadow matrices (already computed by ShadowRenderer.renderShadows() step 2)
+        Matrix4f shadowMV = ShadowRenderer.MODELVIEW;
+        Matrix4f shadowProj = ShadowRenderer.PROJECTION;
+
+        float[] modelView = new float[16];
+        float[] modelViewInv = new float[16];
+        float[] projection = new float[16];
+        float[] projectionInv = new float[16];
+
+        shadowMV.get(modelView);
+        new Matrix4f(shadowMV).invert().get(modelViewInv);
+        shadowProj.get(projection);
+        new Matrix4f(shadowProj).invert().get(projectionInv);
+
+        float[] colorMod = {1.0f, 1.0f, 1.0f, 1.0f};
+        float[] fogParams = {1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 10000.0f}; // no fog in shadow pass
+        float[] chunkOffset = {0.0f, 0.0f, 0.0f};
+
+        int uboOffset = drawBatcher.uploadUniformsShaderpack(frameIndex,
+                modelView, modelViewInv, projection, projectionInv,
+                colorMod, fogParams, null, chunkOffset);
+
+        // Fill all sampler bindings with placeholder textures to satisfy the layout.
+        int maxTex = BasicPipeline.getMaxTextureBindings();
+        long placeholderView = Vulkanium.getPlaceholderImageView();
+        long placeholderSampler = Vulkanium.getPlaceholderSampler();
+        long[] views = new long[maxTex];
+        long[] samplers = new long[maxTex];
+        Arrays.fill(views, placeholderView);
+        Arrays.fill(samplers, placeholderSampler);
+
+        // Bind MC block atlas at gtexture (binding 0) for cutout alpha testing.
+        // Shadow shaders sample gtexture to discard transparent pixels (leaves, grass).
+        int atlasId = VRenderSystem.getBoundTextureId(0);
+        if (atlasId > 0) {
+            VulkanTexture atlasTex = GlStateInterceptor.getVulkanTexture(atlasId);
+            if (atlasTex != null && atlasTex.isAllocated()
+                    && atlasTex.getImageView() != VK_NULL_HANDLE
+                    && atlasTex.getSampler() != VK_NULL_HANDLE) {
+                views[0] = atlasTex.getImageView();
+                samplers[0] = atlasTex.getSampler();
+            }
+        }
+
+        // Bind MC lightmap at lightmap binding (1) — used by some shadow shaders.
+        int lmId = VRenderSystem.getBoundTextureId(2); // MC lightmap GL unit
+        if (lmId > 0) {
+            VulkanTexture lmTex = GlStateInterceptor.getVulkanTexture(lmId);
+            if (lmTex != null && lmTex.isAllocated()
+                    && lmTex.getImageView() != VK_NULL_HANDLE
+                    && lmTex.getSampler() != VK_NULL_HANDLE) {
+                views[1] = lmTex.getImageView();
+                samplers[1] = lmTex.getSampler();
+            }
+        }
+
+        int setIdx = drawBatcher.updateDescriptorSet(frameIndex, views, samplers);
+        drawBatcher.bindDescriptorSet(cmd, shadowTerrainPipelineLayout, setIdx, uboOffset);
+    }
+
+    /**
+     * Records draw commands for shadow rendering with the already-bound shadow pipeline.
+     * Does not rebind the pipeline (it's already bound in recordShadowLayers).
+     */
+    private void recordShadowRegions(VkCommandBuffer cmd, TerrainPassType passType) {
+        for (net.vulkanium.render.terrain.region.RenderRegion region : regionManager.getActiveRegions()) {
+            if (region.isEmpty()) continue;
+            net.vulkanium.render.terrain.region.RegionDrawBatch.buildAndDraw(cmd, region, passType);
         }
     }
 

@@ -224,6 +224,17 @@ public class VulkaniumOptionsScreen {
                 config.dumpShaders = this.options.shader.dumpShadersOnError;
                 config.debugLogging = this.options.debug.debugLogging;
 
+                // Apply color space setting to HdrConfig
+                net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget csTarget =
+                    switch (this.options.video.colorSpace) {
+                        case SRGB -> net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget.SRGB;
+                        case DCI_P3 -> net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget.DCI_P3;
+                        case DISPLAY_P3 -> net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget.DISPLAY_P3;
+                        case REC2020 -> net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget.REC2020;
+                        case ADOBE_RGB -> net.vulkanium.render.hdr.HdrConfig.ColorSpaceTarget.ADOBE_RGB;
+                    };
+                net.vulkanium.render.hdr.HdrConfig.setColorSpaceTarget(csTarget);
+
                 config.save();
                 LOGGER.info("Synced options to live VulkaniumConfig");
 

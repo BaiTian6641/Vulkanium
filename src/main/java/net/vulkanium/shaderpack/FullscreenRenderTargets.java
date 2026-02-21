@@ -54,8 +54,8 @@ public class FullscreenRenderTargets {
     // [targetIndex][0=main, 1=alt]
     private final int[][] colorLayouts = new int[MAX_COLOR_TARGETS][2];
 
-    // ── MRT render pass cache: keyed by attachment count ──
-    private final Map<Integer, Long> mrtRenderPasses = new HashMap<>();
+    // ── MRT render pass cache: keyed by target configuration string ──
+    private final Map<String, Long> mrtRenderPasses = new HashMap<>();
 
     // ── Per-pass framebuffer cache: keyed by "targets_flipstate_width_height" ──
     private final Map<String, Long> framebufferCache = new HashMap<>();
@@ -67,6 +67,32 @@ public class FullscreenRenderTargets {
     private int colorFormat;
     private int depthFormat;
     private boolean initialized = false;
+
+    /** Per-target VkFormat overrides (from shaderpack const int colortexNFormat directives).
+     *  Index i = VkFormat for colortex_i. 0 = use default colorFormat. */
+    private final int[] targetFormats = new int[MAX_COLOR_TARGETS];
+
+    /**
+     * Sets a per-target Vulkan format override. Call BEFORE ensureSize().
+     * @param index  colortex index (0-15)
+     * @param vkFormat VK_FORMAT_* constant (0 to use default)
+     */
+    public void setTargetFormat(int index, int vkFormat) {
+        if (index >= 0 && index < MAX_COLOR_TARGETS) {
+            targetFormats[index] = vkFormat;
+        }
+    }
+
+    /**
+     * Returns the effective VkFormat for the given colortex index,
+     * considering per-target overrides and the default colorFormat.
+     */
+    public int getEffectiveFormat(int index) {
+        if (index >= 0 && index < MAX_COLOR_TARGETS && targetFormats[index] != 0) {
+            return targetFormats[index];
+        }
+        return colorFormat;
+    }
 
     /**
      * Initializes or resizes all render targets to the given dimensions.
@@ -90,6 +116,7 @@ public class FullscreenRenderTargets {
 
         // Create/resize color targets (double-buffered)
         for (int i = 0; i < MAX_COLOR_TARGETS; i++) {
+            int fmt = getEffectiveFormat(i);
             for (int side = 0; side < 2; side++) {
                 if (colorTargets[i][side] != null) {
                     colorTargets[i][side].destroy();
@@ -97,7 +124,7 @@ public class FullscreenRenderTargets {
                 colorTargets[i][side] = new RenderTarget();
                 colorTargets[i][side].initialize(device, memory,
                         "colortex" + i + (side == 0 ? "_main" : "_alt"),
-                        width, height, colorFormat, false);
+                        width, height, fmt, false);
                 colorLayouts[i][side] = VK_IMAGE_LAYOUT_UNDEFINED;
             }
         }
@@ -195,31 +222,48 @@ public class FullscreenRenderTargets {
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * Gets or creates a VkRenderPass for the given number of color attachments.
-     * No depth attachment — fullscreen passes don't write depth.
+     * Gets or creates a VkRenderPass for the given render target indices.
+     * Handles non-contiguous targets (e.g., DRAWBUFFERS:0567) by using
+     * VK_ATTACHMENT_UNUSED for gap locations, so fragment shader outputs
+     * at layout(location=5) correctly map to the colortex5 attachment.
+     *
+     * <p>Reference: Iris {@code IrisRenderingPipeline} maps DRAWBUFFERS digits
+     * directly to framebuffer attachment indices. Pipeline color attachment
+     * count equals {@code max_target + 1}, with VK_ATTACHMENT_UNUSED for gaps.</p>
      */
-    public long getOrCreateMrtRenderPass(int colorAttachmentCount) {
-        Long cached = mrtRenderPasses.get(colorAttachmentCount);
+    public long getOrCreateMrtRenderPass(int[] renderTargets) {
+        String key = Arrays.toString(renderTargets);
+        Long cached = mrtRenderPasses.get(key);
         if (cached != null) return cached;
 
+        // Compact layout: attachment count == renderTargets.length.
+        // Fragment shader uses layout(location=i) where i is the index into
+        // renderTargets[], NOT the colortex index.  This ensures we never
+        // exceed maxColorAttachments (typically 8).
+        int attachmentCount = renderTargets.length;
+
         try (MemoryStack stack = stackPush()) {
+            // One attachment description per target (compact 1:1)
             VkAttachmentDescription.Buffer attachments =
-                    VkAttachmentDescription.calloc(colorAttachmentCount, stack);
-
-            VkAttachmentReference.Buffer colorRefs =
-                    VkAttachmentReference.calloc(colorAttachmentCount, stack);
-
-            for (int i = 0; i < colorAttachmentCount; i++) {
+                    VkAttachmentDescription.calloc(attachmentCount, stack);
+            for (int i = 0; i < attachmentCount; i++) {
                 attachments.get(i)
-                        .format(colorFormat)
+                        .format(getEffectiveFormat(renderTargets[i]))
                         .samples(VK_SAMPLE_COUNT_1_BIT)
-                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)      // Preserve existing content
+                        .loadOp(VK_ATTACHMENT_LOAD_OP_LOAD)
                         .storeOp(VK_ATTACHMENT_STORE_OP_STORE)
                         .stencilLoadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
                         .stencilStoreOp(VK_ATTACHMENT_STORE_OP_DONT_CARE)
                         .initialLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                         .finalLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            }
 
+            // Compact color attachment references: location i → attachment i
+            // Fragment shader layout(location=0) → attachment 0 → colortex[renderTargets[0]]
+            // Fragment shader layout(location=1) → attachment 1 → colortex[renderTargets[1]]
+            VkAttachmentReference.Buffer colorRefs =
+                    VkAttachmentReference.calloc(attachmentCount, stack);
+            for (int i = 0; i < attachmentCount; i++) {
                 colorRefs.get(i)
                         .attachment(i)
                         .layout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -227,7 +271,7 @@ public class FullscreenRenderTargets {
 
             VkSubpassDescription.Buffer subpass = VkSubpassDescription.calloc(1, stack)
                     .pipelineBindPoint(VK_PIPELINE_BIND_POINT_GRAPHICS)
-                    .colorAttachmentCount(colorAttachmentCount)
+                    .colorAttachmentCount(attachmentCount)
                     .pColorAttachments(colorRefs)
                     .pDepthStencilAttachment(null);
 
@@ -248,13 +292,22 @@ public class FullscreenRenderTargets {
 
             LongBuffer pRenderPass = stack.longs(VK_NULL_HANDLE);
             int result = vkCreateRenderPass(device, rpInfo, null, pRenderPass);
-            checkResult(result, "Failed to create MRT render pass (" + colorAttachmentCount + " attachments)");
+            checkResult(result, "Failed to create MRT render pass for targets " + key);
 
             long rp = pRenderPass.get(0);
-            mrtRenderPasses.put(colorAttachmentCount, rp);
-            LOGGER.info("Created MRT render pass: {} color attachments", colorAttachmentCount);
+            mrtRenderPasses.put(key, rp);
+            LOGGER.info("Created compact MRT render pass: targets={}, attachments={}",
+                    key, attachmentCount);
             return rp;
         }
+    }
+
+    /**
+     * Returns the subpass color attachment count for the given render targets.
+     * Uses compact mapping: count == renderTargets.length (always ≤ maxColorAttachments).
+     */
+    public static int getSubpassColorCount(int[] renderTargets) {
+        return renderTargets.length;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -670,21 +723,24 @@ public class FullscreenRenderTargets {
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT);
 
-        // Copy
+        // Blit (not copy!) — vkCmdBlitImage performs format conversion between
+        // differing formats (e.g. GBuffer R8G8B8A8 → fsTargets B8G8R8A8).
+        // vkCmdCopyImage does raw byte copy which swaps red↔blue channels.
         try (var stack = stackPush()) {
-            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+            VkImageBlit.Buffer region = VkImageBlit.calloc(1, stack);
             region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                     .mipLevel(0).baseArrayLayer(0).layerCount(1);
-            region.srcOffset().set(0, 0, 0);
+            region.srcOffsets(0).set(0, 0, 0);
+            region.srcOffsets(1).set(width, height, 1);
             region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                     .mipLevel(0).baseArrayLayer(0).layerCount(1);
-            region.dstOffset().set(0, 0, 0);
-            region.extent().set(width, height, 1);
+            region.dstOffsets(0).set(0, 0, 0);
+            region.dstOffsets(1).set(width, height, 1);
 
-            vkCmdCopyImage(cmd,
+            vkCmdBlitImage(cmd,
                     srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     write.getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    region);
+                    region, VK_FILTER_NEAREST);
         }
 
         // Transition fsTargets write → SHADER_READ_ONLY
@@ -762,9 +818,16 @@ public class FullscreenRenderTargets {
 
     /**
      * Blits the current colortex0 READ side to the swapchain image.
+     *
+     * @param cmd             Active command buffer
+     * @param swapchainImage  Swapchain image handle
+     * @param swapchainLayout Current layout of the swapchain image
+     * @param dstWidth        Swapchain image width (may differ from fsTargets width during resize)
+     * @param dstHeight       Swapchain image height
      */
     public void blitColorTarget0ToSwapchain(VkCommandBuffer cmd,
-                                            long swapchainImage, int swapchainLayout) {
+                                            long swapchainImage, int swapchainLayout,
+                                            int dstWidth, int dstHeight) {
         RenderTarget read0 = getReadTarget(0);
 
         // colortex0 read → TRANSFER_SRC
@@ -777,7 +840,7 @@ public class FullscreenRenderTargets {
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT);
 
-        // Blit (handles format conversion if needed)
+        // Blit (handles format conversion + rescale if src/dst sizes differ)
         try (var stack = stackPush()) {
             VkImageBlit.Buffer blitRegion = VkImageBlit.calloc(1, stack);
             blitRegion.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
@@ -787,12 +850,12 @@ public class FullscreenRenderTargets {
             blitRegion.dstSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                     .mipLevel(0).baseArrayLayer(0).layerCount(1);
             blitRegion.dstOffsets(0).set(0, 0, 0);
-            blitRegion.dstOffsets(1).set(width, height, 1);
+            blitRegion.dstOffsets(1).set(dstWidth, dstHeight, 1);
 
             vkCmdBlitImage(cmd,
                     read0.getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    blitRegion, VK_FILTER_NEAREST);
+                    blitRegion, VK_FILTER_LINEAR);
         }
 
         // colortex0 → back to SHADER_READ
@@ -804,6 +867,15 @@ public class FullscreenRenderTargets {
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+
+    /**
+     * @deprecated Use {@link #blitColorTarget0ToSwapchain(VkCommandBuffer, long, int, int, int)} instead.
+     */
+    @Deprecated
+    public void blitColorTarget0ToSwapchain(VkCommandBuffer cmd,
+                                            long swapchainImage, int swapchainLayout) {
+        blitColorTarget0ToSwapchain(cmd, swapchainImage, swapchainLayout, width, height);
     }
 
     // ═══════════════════════════════════════════════════════════════

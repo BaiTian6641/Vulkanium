@@ -89,6 +89,24 @@ public class GlslPreprocessor {
             String value = entry.getValue();
             if (key == null || key.isBlank() || value == null || value.isBlank()) continue;
 
+            // Handle boolean ON/OFF toggle defines:
+            //   ON  → uncomment / keep  #define KEY
+            //   OFF → comment out       // #define KEY
+            if ("OFF".equalsIgnoreCase(value)) {
+                // Comment out the define (disable the toggle)
+                updated = updated.replaceAll(
+                        "(?m)^(\\s*)(?://\\s*)?#\\s*define\\s+" + Pattern.quote(key) + "\\b.*$",
+                        "$1// #define " + key);
+                continue;
+            }
+            if ("ON".equalsIgnoreCase(value)) {
+                // Uncomment / ensure the define is active (bare, no value)
+                updated = updated.replaceAll(
+                        "(?m)^\\s*(?://\\s*)?#\\s*define\\s+" + Pattern.quote(key) + "\\b.*$",
+                        Matcher.quoteReplacement("#define " + key));
+                continue;
+            }
+
             // 1. #define style: replace active AND commented-out defines
             //    "#define KEY old"  →  "#define KEY new"
             //    "// #define KEY"   →  "#define KEY new"  (re-enables toggle defines)

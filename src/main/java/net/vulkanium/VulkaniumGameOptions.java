@@ -62,6 +62,16 @@ public class VulkaniumGameOptions {
         /** Enable HDR output if display supports it */
         public boolean hdrOutput = false;
 
+        /** Screen-space color space target for final output */
+        @SerializedName("color_space")
+        public ScreenColorSpace colorSpace = ScreenColorSpace.SRGB;
+
+        /** Full-screen gamma correction value (1.0 = linear, 2.2 = sRGB standard) */
+        public float outputGamma = 2.2f;
+
+        /** Enable dithering on final output to reduce color banding */
+        public boolean ditheringEnabled = true;
+
         public enum PresentMode implements TextProvider {
             FIFO("VSync"),
             MAILBOX("Mailbox (Triple Buffer)"),
@@ -78,6 +88,31 @@ public class VulkaniumGameOptions {
                     case FIFO -> 2;       // VK_PRESENT_MODE_FIFO_KHR
                     case MAILBOX -> 1;    // VK_PRESENT_MODE_MAILBOX_KHR
                     case IMMEDIATE -> 0;  // VK_PRESENT_MODE_IMMEDIATE_KHR
+                };
+            }
+        }
+
+        public enum ScreenColorSpace implements TextProvider {
+            SRGB("sRGB"),
+            DCI_P3("DCI-P3"),
+            DISPLAY_P3("Display P3"),
+            REC2020("Rec. 2020"),
+            ADOBE_RGB("Adobe RGB");
+
+            private final String name;
+            ScreenColorSpace(String name) { this.name = name; }
+
+            @Override
+            public String getLocalizedName() { return name; }
+
+            /** Maps to HdrConfig.ColorSpaceTarget index */
+            public int toColorSpaceIndex() {
+                return switch (this) {
+                    case SRGB -> 0;
+                    case DCI_P3 -> 1;
+                    case DISPLAY_P3 -> 2;
+                    case REC2020 -> 3;
+                    case ADOBE_RGB -> 4;
                 };
             }
         }

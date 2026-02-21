@@ -300,6 +300,56 @@ public class VRenderSystem {
     private static final Matrix4f mvpMat = new Matrix4f();
     private static VertexSorting vertexSorting = VertexSorting.DISTANCE_TO_ORIGIN;
 
+    // ─── World-Render Matrix Snapshots ─────────────────────────────────
+    // Captures the camera projection/modelView at world-render time before
+    // GUI rendering overwrites the global matrices.  Fullscreen composite
+    // passes must use these instead of the live (possibly GUI-overwritten) values.
+    private static final Matrix4f worldRenderModelView = new Matrix4f();
+    private static final Matrix4f worldRenderProjection = new Matrix4f();
+    private static final Matrix4f prevWorldRenderModelView = new Matrix4f();
+    private static final Matrix4f prevWorldRenderProjection = new Matrix4f();
+    private static boolean hasWorldSnapshot = false;
+    private static boolean hasPrevWorldSnapshot = false;
+
+    /**
+     * Snapshots the camera matrices captured from renderLevel parameters.
+     * Uses the actual poseStack modelView and projection from MC's render call,
+     * matching Iris's CapturedRenderingState approach for correct gbufferModelView.
+     *
+     * @param poseStackModelView the modelView matrix from poseStack.last().pose()
+     * @param projectionMatrix   the projection matrix from renderLevel parameter
+     */
+    public static void snapshotWorldRenderMatrices(Matrix4f poseStackModelView,
+                                                    Matrix4f projectionMatrix) {
+        // Save previous world snapshot
+        if (hasWorldSnapshot) {
+            prevWorldRenderModelView.set(worldRenderModelView);
+            prevWorldRenderProjection.set(worldRenderProjection);
+            hasPrevWorldSnapshot = true;
+        }
+        worldRenderModelView.set(poseStackModelView);
+        worldRenderProjection.set(projectionMatrix);
+        hasWorldSnapshot = true;
+    }
+
+    public static Matrix4f getWorldRenderModelView() {
+        return hasWorldSnapshot ? worldRenderModelView : modelViewMat;
+    }
+
+    public static Matrix4f getWorldRenderProjection() {
+        return hasWorldSnapshot ? worldRenderProjection : projectionMat;
+    }
+
+    public static Matrix4f getPrevWorldRenderModelView() {
+        return hasPrevWorldSnapshot ? prevWorldRenderModelView
+                : (hasWorldSnapshot ? worldRenderModelView : modelViewMat);
+    }
+
+    public static Matrix4f getPrevWorldRenderProjection() {
+        return hasPrevWorldSnapshot ? prevWorldRenderProjection
+                : (hasWorldSnapshot ? worldRenderProjection : projectionMat);
+    }
+
     public static void setProjectionMatrix(Matrix4f matrix, VertexSorting sorting) {
         projectionMat.set(matrix);
         // DO NOT overwrite savedProjectionMat here — it's only set by backupProjectionMatrix().

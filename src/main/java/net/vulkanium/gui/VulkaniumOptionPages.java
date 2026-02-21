@@ -311,6 +311,25 @@ public class VulkaniumOptionPages {
                         .setBinding((opts, v) -> opts.video.hdrOutput = v, opts -> opts.video.hdrOutput)
                         .setFlags(OptionFlag.REQUIRES_SWAPCHAIN_RECREATE)
                         .build())
+                .add(OptionImpl.createBuilder(VideoSettings.ScreenColorSpace.class, storage)
+                        .setName("Color Space")
+                        .setTooltip("Screen-space color space for final output.\n" +
+                                "• sRGB — Standard for most displays\n" +
+                                "• DCI-P3 — Wider gamut, common on HDR displays\n" +
+                                "• Display P3 — Apple/mobile wide gamut\n" +
+                                "• Rec. 2020 — Ultra-wide gamut (HDR TVs)\n" +
+                                "• Adobe RGB — Photography standard")
+                        .setControl(opt -> new CyclingControl<>(opt, VideoSettings.ScreenColorSpace.class))
+                        .setBinding((opts, v) -> opts.video.colorSpace = v, opts -> opts.video.colorSpace)
+                        .setImpact(OptionImpact.LOW)
+                        .setFlags(OptionFlag.REQUIRES_SHADER_RELOAD)
+                        .build())
+                .add(OptionImpl.createBuilder(boolean.class, storage)
+                        .setName("Output Dithering")
+                        .setTooltip("Apply dithering to final output to reduce visible color banding in gradients (especially in dark scenes).")
+                        .setControl(TickBoxControl::new)
+                        .setBinding((opts, v) -> opts.video.ditheringEnabled = v, opts -> opts.video.ditheringEnabled)
+                        .build())
                 .build());
 
         groups.add(OptionGroup.createBuilder()

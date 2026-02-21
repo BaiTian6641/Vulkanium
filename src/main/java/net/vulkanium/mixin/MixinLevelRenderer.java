@@ -160,7 +160,8 @@ public abstract class MixinLevelRenderer {
                                      LightTexture lightTexture, Matrix4f projectionMatrix,
                                      CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
-        Vulkanium.onWorldRenderStart();
+        Vulkanium.onWorldRenderStart(
+                poseStack.last().pose(), projectionMatrix, partialTick);
         // Begin the main render pass for this frame
         // The actual draw commands are recorded in renderSectionLayer and entity rendering
         Vulkanium.LOGGER.trace("renderLevel: begin");

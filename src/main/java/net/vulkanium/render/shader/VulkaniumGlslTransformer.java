@@ -1429,7 +1429,7 @@ public class VulkaniumGlslTransformer {
                     iris_vk_Vertex = vec4(vkm_Position + iris_ChunkOffset.xyz, 1.0);
                     iris_vk_Color = vkm_Color;
                     iris_vk_TexCoord0 = vkm_TexCoord;
-                    iris_vk_LightCoord = vec2(vkm_LightCoord);
+                    iris_vk_LightCoord = vec2(vkm_LightCoord) / 256.0;
 
                     vec3 rawNormal = vkm_NormalPacked.xyz;
                     float normalLen = length(rawNormal);
@@ -1556,18 +1556,34 @@ public class VulkaniumGlslTransformer {
 
     /**
      * Sky vertex transform.
+     * <p>
+     * MC sky draws use two different vertex formats:
+     *   - {@code DefaultVertexFormat.POSITION} — sky dome (no Color data, 12-byte stride)
+     *   - {@code DefaultVertexFormat.POSITION_COLOR} — sunset/sunrise gradient (has Color)
+     * Both map to {@code gbuffers_skybasic}, so the compiled shader must handle
+     * POSITION-only safely.  We do NOT declare a Color vertex input because it
+     * would read garbage when Color data is absent.  Instead, {@code gl_Color} is
+     * replaced with the {@code iris_ColorModulator} UBO uniform, which MC sets to
+     * the correct sky tint per draw.  (Iris solves this with two separate
+     * ShaderKey entries; our single-shader approach sacrifices per-vertex sky
+     * gradient colour for a correct and stable sky dome.)
+     * </p>
      */
     private static String transformSkyVertex(String source) {
         String inputs = """
                 // ── Vulkanium Sky Vertex Inputs ──
+                // Only Position — Color is NOT a vertex attribute for sky because
+                // POSITION-only draws (sky dome) have no Color data in the buffer.
                 layout(location = 0) in vec3 vkm_Sky_Position;
-                layout(location = 1) in vec4 vkm_Sky_Color;
                 """;
 
         source = insertAfterUBO(source, inputs);
 
         source = source.replaceAll("\\bgl_Vertex\\b", "vec4(vkm_Sky_Position, 1.0)");
-        source = source.replaceAll("\\bgl_Color\\b", "vkm_Sky_Color");
+        // Use ColorModulator uniform instead of vertex Color to avoid reading
+        // garbage from an unbound attribute (Iris equivalent: ColorModulator
+        // fallback when inputs.hasColor() == false).
+        source = source.replaceAll("\\bgl_Color\\b", "iris_ColorModulator");
         source = source.replaceAll("\\bgl_Normal\\b", "vec3(0.0, 1.0, 0.0)");
         source = source.replaceAll("\\bgl_MultiTexCoord0\\b", "vec4(0.0)");
         source = source.replaceAll("\\bgl_MultiTexCoord1\\b", "vec4(1.0, 1.0, 0.0, 1.0)");

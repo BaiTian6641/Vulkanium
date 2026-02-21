@@ -476,6 +476,20 @@ public class OptiFineGlslPreprocessor {
     }
 
     public static String injectFragmentOutputs(String source, int[] renderTargets) {
+        return injectFragmentOutputs(source, renderTargets, false);
+    }
+
+    /**
+     * Injects fragment output declarations.
+     *
+     * @param compactMode If true, uses sequential compact locations (0, 1, 2...) instead of
+     *                    colortex indices.  Compact mode is required for fullscreen passes whose
+     *                    render targets can exceed index 7 (Vulkan maxColorAttachments).  GBuffer
+     *                    programs should use sparse mode (compactMode=false) because all programs
+     *                    share one render pass and the colortex index maps directly to the
+     *                    subpass color attachment reference location.
+     */
+    public static String injectFragmentOutputs(String source, int[] renderTargets, boolean compactMode) {
         if (renderTargets == null || renderTargets.length == 0) {
             return source;
         }
@@ -493,18 +507,21 @@ public class OptiFineGlslPreprocessor {
         }
 
         StringBuilder outputs = new StringBuilder();
-        outputs.append("// ── Vulkanium Fragment Outputs ──\n");
+        outputs.append("// ── Vulkanium Fragment Outputs");
+        if (compactMode) outputs.append(" (compact)");
+        outputs.append(" ──\n");
         for (int i = 0; i < renderTargets.length; i++) {
             int target = renderTargets[i];
-            // Use the colortex index as the layout location so it maps directly
-            // to the MRT render pass subpass color attachment reference at that index.
-            // The render pass uses VK_ATTACHMENT_UNUSED for gap indices.
-            outputs.append("layout(location = ").append(target)
+            // In compact mode: layout(location=i) — sequential index, render pass has
+            //   attachmentCount == renderTargets.length (always ≤ maxColorAttachments).
+            // In sparse mode:  layout(location=target) — colortex index, render pass has
+            //   pColorAttachments[0..maxTarget] with VK_ATTACHMENT_UNUSED for gaps.
+            int location = compactMode ? i : target;
+            outputs.append("layout(location = ").append(location)
                     .append(") out vec4 iris_FragData").append(target).append(";\n");
         }
 
         // Insert after #version and defines block
-        // Find the end of the defines section (look for first non-#define, non-comment, non-empty line)
         int insertPos = findInsertionPoint(source);
         return source.substring(0, insertPos) + outputs + source.substring(insertPos);
     }

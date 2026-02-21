@@ -78,6 +78,31 @@ public class DrawBatcher {
     private boolean loggedUniformOverflow = false;
     private boolean loggedDescriptorOverflow = false;
 
+    // ── Shadow parameters (fed from ShadowDirectives) ──
+    private float shadowSunPathRotation = 0.0f;
+    private float shadowDistance = 128.0f;
+    private float shadowIntervalSize = 4.0f;
+    private float shadowNearPlane = -100.05f;
+    private float shadowFarPlane = 156.0f;
+    private float shadowDistanceRenderMul = -1.0f;
+    private int shadowMapResolution = 1024;
+
+    /**
+     * Updates shadow parameters from parsed directives.
+     * Call after shadow infrastructure initialization.
+     */
+    public void setShadowParams(float sunPathRotation, float distance, float intervalSize,
+                                float nearPlane, float farPlane, float distRenderMul,
+                                int resolution) {
+        this.shadowSunPathRotation = sunPathRotation;
+        this.shadowDistance = distance;
+        this.shadowIntervalSize = intervalSize;
+        this.shadowNearPlane = nearPlane;
+        this.shadowFarPlane = farPlane;
+        this.shadowDistanceRenderMul = distRenderMul;
+        this.shadowMapResolution = resolution;
+    }
+
     public void initialize(VkDevice device, VulkaniumMemory memory, int framesInFlight,
                            long descriptorSetLayout) {
         this.device = device;
@@ -564,12 +589,17 @@ public class DrawBatcher {
         long timePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_TIME;
         float frameTimeCounter = (System.nanoTime() % 3_600_000_000_000L) / 1_000_000_000.0f;
         float worldTime = 0.0f;
+        float skyAngle = 0.0f;
         float sunAngle = 0.0f;
         try {
             net.minecraft.client.Minecraft mc1 = net.minecraft.client.Minecraft.getInstance();
             if (mc1 != null && mc1.level != null) {
                 worldTime = mc1.level.getDayTime() % 24000L;
-                sunAngle = worldTime / 24000.0f;
+                // Use getTimeOfDay(partialTick) for smooth interpolation, matching Iris
+                float partialTick = net.vulkanium.Vulkanium.getCurrentPartialTick();
+                skyAngle = mc1.level.getTimeOfDay(partialTick);
+                // Iris conversion: skyAngle → sunAngle (0 = noon, 0.5 = midnight)
+                sunAngle = skyAngle < 0.75f ? skyAngle + 0.25f : skyAngle - 0.75f;
             }
         } catch (Exception ignored) {}
         MemoryUtil.memPutFloat(timePtr, frameTimeCounter);
@@ -603,6 +633,181 @@ public class DrawBatcher {
             }
         }
 
+        // ── Previous-frame matrices (offsets 256, 320) ──
+        {
+            org.joml.Matrix4f prevMV = net.vulkanium.compat.VRenderSystem.getPrevWorldRenderModelView();
+            org.joml.Matrix4f prevProj = net.vulkanium.compat.VRenderSystem.getPrevWorldRenderProjection();
+            float[] prevMVArr = new float[16];
+            float[] prevProjArr = new float[16];
+            prevMV.get(prevMVArr);
+            prevProj.get(prevProjArr);
+            long prevMVPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_MODEL_VIEW;
+            long prevProjPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_PROJECTION;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(prevMVPtr + i * 4L, prevMVArr[i]);
+                MemoryUtil.memPutFloat(prevProjPtr + i * 4L, prevProjArr[i]);
+            }
+        }
+
+        // ── Sun / Moon / Shadow Light positions (offsets 800, 816, 832) ──
+        // Match Iris CelestialUniforms: start with (0, y, 0), apply
+        // gbufferModelView * rotateY(-90°) * rotateZ(sunPathRotation) * rotateX(skyAngle * 360°)
+        {
+            // Build celestial rotation matrix matching Iris's getCelestialPosition()
+            org.joml.Matrix4f mvMat = net.vulkanium.compat.VRenderSystem.getWorldRenderModelView();
+            org.joml.Matrix4f celestial = new org.joml.Matrix4f(mvMat);
+            // Same rotations MC applies in renderSky
+            celestial.rotate((float) Math.toRadians(-90.0f),  0.0f, 1.0f, 0.0f); // Y(-90°)
+            // sunPathRotation from shaderpack
+            celestial.rotate((float) Math.toRadians(shadowSunPathRotation), 0.0f, 0.0f, 1.0f); // Z(sunPathRotation)
+            celestial.rotate((float) Math.toRadians(skyAngle * 360.0f), 1.0f, 0.0f, 0.0f); // X(skyAngle*360)
+
+            // Sun position: transform (0, 100, 0) by celestial matrix
+            org.joml.Vector4f sunPos = new org.joml.Vector4f(0.0f, 100.0f, 0.0f, 0.0f);
+            celestial.transform(sunPos);
+
+            long sunPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SUN_POS;
+            MemoryUtil.memPutFloat(sunPtr, sunPos.x);
+            MemoryUtil.memPutFloat(sunPtr + 4, sunPos.y);
+            MemoryUtil.memPutFloat(sunPtr + 8, sunPos.z);
+            MemoryUtil.memPutFloat(sunPtr + 12, 0.0f);
+
+            // Moon position: transform (0, -100, 0)
+            org.joml.Vector4f moonPos = new org.joml.Vector4f(0.0f, -100.0f, 0.0f, 0.0f);
+            celestial.transform(moonPos);
+
+            long moonPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_MOON_POS;
+            MemoryUtil.memPutFloat(moonPtr, moonPos.x);
+            MemoryUtil.memPutFloat(moonPtr + 4, moonPos.y);
+            MemoryUtil.memPutFloat(moonPtr + 8, moonPos.z);
+            MemoryUtil.memPutFloat(moonPtr + 12, 0.0f);
+
+            // Shadow light = sun during day (sunAngle <= 0.5), moon during night
+            long shadowPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_LIGHT_POS;
+            if (sunAngle <= 0.5f) {
+                MemoryUtil.memPutFloat(shadowPtr, sunPos.x);
+                MemoryUtil.memPutFloat(shadowPtr + 4, sunPos.y);
+                MemoryUtil.memPutFloat(shadowPtr + 8, sunPos.z);
+            } else {
+                MemoryUtil.memPutFloat(shadowPtr, moonPos.x);
+                MemoryUtil.memPutFloat(shadowPtr + 4, moonPos.y);
+                MemoryUtil.memPutFloat(shadowPtr + 8, moonPos.z);
+            }
+            MemoryUtil.memPutFloat(shadowPtr + 12, 0.0f);
+
+            // Up position: (0, 100, 0) transformed by gbufferModelView * rotateY(-90°) only
+            // (no skyAngle rotation — matches Iris's getUpPosition())
+            org.joml.Matrix4f preCelestial = new org.joml.Matrix4f(mvMat);
+            preCelestial.rotate((float) Math.toRadians(-90.0f), 0.0f, 1.0f, 0.0f);
+            org.joml.Vector4f upPos = new org.joml.Vector4f(0.0f, 100.0f, 0.0f, 0.0f);
+            preCelestial.transform(upPos);
+
+            long upPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_UP_POS;
+            MemoryUtil.memPutFloat(upPtr, upPos.x);
+            MemoryUtil.memPutFloat(upPtr + 4, upPos.y);
+            MemoryUtil.memPutFloat(upPtr + 8, upPos.z);
+            MemoryUtil.memPutFloat(upPtr + 12, 0.0f);
+        }
+
+        // ── Shadow matrices (offsets 384, 448, 512, 576) ──
+        // Use the EXACT shadow matrices that were used during shadow map rendering.
+        // Recomputing from parameters risks subtle mismatches (timing, precision)
+        // that cause shadow depth comparison failures → everything appears in shadow.
+        {
+            org.joml.Matrix4f shadowMV = new org.joml.Matrix4f(
+                    net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW);
+            org.joml.Matrix4f shadowProj = new org.joml.Matrix4f(
+                    net.vulkanium.render.shadow.ShadowRenderer.PROJECTION);
+
+            float[] sMV = new float[16], sP = new float[16];
+            shadowMV.get(sMV);
+            shadowProj.get(sP);
+            float[] sMVInv = new float[16], sPInv = new float[16];
+            new org.joml.Matrix4f(shadowMV).invert().get(sMVInv);
+            new org.joml.Matrix4f(shadowProj).invert().get(sPInv);
+
+            long smvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_MODEL_VIEW;
+            long spPtr  = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_PROJECTION;
+            long smviPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_MODEL_VIEW_INV;
+            long spiPtr  = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_PROJECTION_INV;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(smvPtr + i * 4L, sMV[i]);
+                MemoryUtil.memPutFloat(spPtr + i * 4L, sP[i]);
+                MemoryUtil.memPutFloat(smviPtr + i * 4L, sMVInv[i]);
+                MemoryUtil.memPutFloat(spiPtr + i * 4L, sPInv[i]);
+            }
+
+            // Shadow params: vec4(shadowMapResolution, shadowDistance, distanceRenderMul, 0)
+            long spParamsPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_PARAMS;
+            MemoryUtil.memPutFloat(spParamsPtr, (float) shadowMapResolution);
+            MemoryUtil.memPutFloat(spParamsPtr + 4, shadowDistance);
+            MemoryUtil.memPutFloat(spParamsPtr + 8, shadowDistanceRenderMul);
+            MemoryUtil.memPutFloat(spParamsPtr + 12, 0.0f);
+        }
+
+        // ── Weather (offset 1088): vec4(rainStrength, wetness, thunderStrength, 0) ──
+        try {
+            net.minecraft.client.Minecraft mc3 = net.minecraft.client.Minecraft.getInstance();
+            if (mc3 != null && mc3.level != null) {
+                float rain = mc3.level.getRainLevel(1.0f);
+                float thunder = mc3.level.getThunderLevel(1.0f);
+                long weatherPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_WEATHER;
+                MemoryUtil.memPutFloat(weatherPtr, rain);
+                MemoryUtil.memPutFloat(weatherPtr + 4, rain);       // wetness ≈ rain (simplified)
+                MemoryUtil.memPutFloat(weatherPtr + 8, thunder);
+                MemoryUtil.memPutFloat(weatherPtr + 12, 0.0f);
+            }
+        } catch (Exception ignored) {}
+
+        // ── Eye Brightness (offset 1120): vec4(blockLight, skyLight, blockSmooth, skySmooth) ──
+        try {
+            net.minecraft.client.Minecraft mc4 = net.minecraft.client.Minecraft.getInstance();
+            if (mc4 != null && mc4.player != null) {
+                int packedLight = mc4.player.getBlockX(); // placeholder — read actual brightness below
+                int blockLight = mc4.player.level().getMaxLocalRawBrightness(mc4.player.blockPosition());
+                int skyLight = 15; // approximation when no proper sky light query
+                // Use getBrightness for actual combined light
+                blockLight = Math.min(15, Math.max(0, blockLight));
+                long eyePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_EYE_BRIGHTNESS;
+                MemoryUtil.memPutFloat(eyePtr, blockLight * 16.0f);       // block (0-240 range like OptiFine)
+                MemoryUtil.memPutFloat(eyePtr + 4, skyLight * 16.0f);     // sky
+                MemoryUtil.memPutFloat(eyePtr + 8, blockLight * 16.0f);   // smoothed (TODO: proper smoothing)
+                MemoryUtil.memPutFloat(eyePtr + 12, skyLight * 16.0f);
+            }
+        } catch (Exception ignored) {}
+
+        // ── World State (offset 1136): vec4(moonPhase, isEyeInWater, biomeTemp, biomeRainfall) ──
+        try {
+            net.minecraft.client.Minecraft mc5 = net.minecraft.client.Minecraft.getInstance();
+            if (mc5 != null && mc5.level != null) {
+                int moonPhase = mc5.level.getMoonPhase();
+                int isEyeInWater = 0;
+                if (mc5.gameRenderer != null && mc5.gameRenderer.getMainCamera() != null) {
+                    isEyeInWater = mc5.gameRenderer.getMainCamera().getFluidInCamera()
+                            != net.minecraft.world.level.material.FogType.NONE ? 1 : 0;
+                }
+                long worldPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_WORLD_STATE;
+                MemoryUtil.memPutFloat(worldPtr, (float) moonPhase);
+                MemoryUtil.memPutFloat(worldPtr + 4, (float) isEyeInWater);
+                MemoryUtil.memPutFloat(worldPtr + 8, 0.5f);   // biomeTemp (default temperate)
+                MemoryUtil.memPutFloat(worldPtr + 12, 0.5f);  // biomeRainfall (default moderate)
+            }
+        } catch (Exception ignored) {}
+
+        // ── Previous camera position (offset 784): vec4(x, y, z, 0) ──
+        // For now, use current camera pos as prev (motion blur will be minimal)
+        try {
+            net.minecraft.client.Minecraft mc6 = net.minecraft.client.Minecraft.getInstance();
+            if (mc6 != null && mc6.gameRenderer != null && mc6.gameRenderer.getMainCamera() != null) {
+                net.minecraft.world.phys.Vec3 camPos = mc6.gameRenderer.getMainCamera().getPosition();
+                long prevCamPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_CAMERA_POS;
+                MemoryUtil.memPutFloat(prevCamPtr, (float) camPos.x);
+                MemoryUtil.memPutFloat(prevCamPtr + 4, (float) camPos.y);
+                MemoryUtil.memPutFloat(prevCamPtr + 8, (float) camPos.z);
+                MemoryUtil.memPutFloat(prevCamPtr + 12, 0.0f);
+            }
+        } catch (Exception ignored) {}
+
         uniformOffsets[frameIndex] = alignedOffset + totalSize;
         return alignedOffset;
     }
@@ -614,6 +819,19 @@ public class DrawBatcher {
     public int updateDescriptorSet(int frameIndex,
                                    long[] textureImageViews,
                                    long[] textureSamplers) {
+        return updateDescriptorSet(frameIndex, textureImageViews, textureSamplers, null);
+    }
+
+    /**
+     * Updates a descriptor set with per-texture image layout overrides.
+     * {@code imageLayouts} may be null (defaults to SHADER_READ_ONLY_OPTIMAL for all)
+     * or a sparse array where non-zero entries override the default layout.
+     * Use VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL for depth/shadow textures.
+     */
+    public int updateDescriptorSet(int frameIndex,
+                                   long[] textureImageViews,
+                                   long[] textureSamplers,
+                                   int[] imageLayouts) {
         if (descriptorSetIndex >= MAX_DESCRIPTOR_SETS_PER_FRAME) {
             if (!loggedDescriptorOverflow) {
                 LOGGER.warn("Descriptor set overflow (max {})", MAX_DESCRIPTOR_SETS_PER_FRAME);
@@ -647,8 +865,14 @@ public class DrawBatcher {
                 long sampler = (textureSamplers != null && i < textureSamplers.length)
                     ? textureSamplers[i] : VK_NULL_HANDLE;
 
+                // Use per-texture layout if provided, otherwise default to SHADER_READ_ONLY
+                int layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                if (imageLayouts != null && i < imageLayouts.length && imageLayouts[i] != 0) {
+                    layout = imageLayouts[i];
+                }
+
                 VkDescriptorImageInfo.Buffer imageInfo = VkDescriptorImageInfo.calloc(1, stack)
-                    .imageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .imageLayout(layout)
                     .imageView(imageView)
                     .sampler(sampler);
 

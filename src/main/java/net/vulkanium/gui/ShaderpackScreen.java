@@ -791,7 +791,8 @@ public class ShaderpackScreen extends Screen {
                 String currentValue = pendingOverrides.getOrDefault(opt.name(), opt.currentValue());
                 boolean isModified = !currentValue.equals(opt.defaultValue());
                 boolean isBoolean = opt.allowedValues().size() == 2
-                        && opt.allowedValues().containsAll(List.of("true", "false"));
+                        && (opt.allowedValues().containsAll(List.of("true", "false"))
+                            || opt.allowedValues().containsAll(List.of("ON", "OFF")));
                 boolean isSlider = packProperties != null && packProperties.isSlider(opt.name())
                         && !isBoolean && opt.allowedValues().size() > 2;
 
@@ -841,7 +842,8 @@ public class ShaderpackScreen extends Screen {
                     String valueStr;
                     int valueColor;
                     if (isBoolean) {
-                        boolean boolVal = "true".equalsIgnoreCase(currentValue);
+                        boolean boolVal = "true".equalsIgnoreCase(currentValue)
+                                || "ON".equalsIgnoreCase(currentValue);
                         valueStr = boolVal ? "ON" : "OFF";
                         valueColor = isModified
                                 ? (boolVal ? 0x55FF55 : 0xFF5555)

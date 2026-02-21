@@ -72,6 +72,7 @@ public class ShadowRenderer {
 
     /** Optional externally-created shadow render pass integration. */
     private long shadowRenderPass = VK_NULL_HANDLE;
+    private long shadowRenderPassLoad = VK_NULL_HANDLE;
     private long shadowFramebuffer = VK_NULL_HANDLE;
     private int shadowColorAttachmentCount = 0;
 
@@ -281,7 +282,9 @@ public class ShadowRenderer {
     }
 
     private boolean beginShadowRenderPass(long commandBuffer, boolean clearDepth) {
-        if (shadowRenderPass == VK_NULL_HANDLE || shadowFramebuffer == VK_NULL_HANDLE) {
+        long rp = clearDepth ? shadowRenderPass : shadowRenderPassLoad;
+        if (rp == VK_NULL_HANDLE) rp = shadowRenderPass; // fallback to clear variant
+        if (rp == VK_NULL_HANDLE || shadowFramebuffer == VK_NULL_HANDLE) {
             return false;
         }
 
@@ -305,7 +308,7 @@ public class ShadowRenderer {
 
             VkRenderPassBeginInfo beginInfo = VkRenderPassBeginInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
-                    .renderPass(shadowRenderPass)
+                    .renderPass(rp)
                     .framebuffer(shadowFramebuffer)
                     .pClearValues(clearDepth ? clearValues : null);
 
@@ -331,8 +334,10 @@ public class ShadowRenderer {
     public void setShadowCompositeUniformDescriptorSet(long descriptorSet) {
         this.shadowCompositeUniformDescriptorSet = descriptorSet;
     }
-    public void setShadowRenderTargets(long renderPass, long framebuffer, int colorAttachmentCount) {
-        this.shadowRenderPass = renderPass;
+    public void setShadowRenderTargets(long renderPassClear, long renderPassLoad,
+                                         long framebuffer, int colorAttachmentCount) {
+        this.shadowRenderPass = renderPassClear;
+        this.shadowRenderPassLoad = renderPassLoad;
         this.shadowFramebuffer = framebuffer;
         this.shadowColorAttachmentCount = Math.max(0, colorAttachmentCount);
     }

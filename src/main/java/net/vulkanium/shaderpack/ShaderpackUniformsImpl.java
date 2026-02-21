@@ -81,7 +81,11 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
 
         worldTime = (int) (level.getDayTime() % 24000L);
         worldDay = (int) (level.getDayTime() / 24000L);
-        sunAngle = level.getTimeOfDay(1.0f); // 0.0 = noon, 0.5 = midnight
+        // Use partial tick from world render start for smooth interpolation
+        float partialTick = net.vulkanium.Vulkanium.getCurrentPartialTick();
+        float skyAngle = level.getTimeOfDay(partialTick);
+        // Iris conversion: skyAngle → sunAngle (0 = noon, 0.5 = midnight)
+        sunAngle = skyAngle < 0.75f ? skyAngle + 0.25f : skyAngle - 0.75f;
         shadowAngle = sunAngle < 0.5f ? sunAngle : sunAngle - 0.5f;
 
         // Camera position
@@ -91,20 +95,53 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
                 (float) camera.getPosition().y,
                 (float) camera.getPosition().z);
 
-        // Sun/Moon position (computed from celestial angle)
-        float celestialAngle = sunAngle * 2.0f * (float) Math.PI;
-        sunPosition.set(
-                (float) (-Math.cos(celestialAngle)),
-                (float) (Math.sin(celestialAngle)),
-                0.0f).normalize();
-        moonPosition.set(-sunPosition.x, -sunPosition.y, -sunPosition.z);
+        // Matrices from VRenderSystem — capture BEFORE sun position calculation
+        // so we have the correct modelView for eye-space transform.
+        // Use world-render snapshots to avoid GUI-overwritten matrices.
+        prevModelViewMatrix.set(modelViewMatrix);
+        prevProjectionMatrix.set(projectionMatrix);
+        modelViewMatrix.set(net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
+        projectionMatrix.set(net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
 
-        // Shadow matrices (orthographic from sun direction)
-        float shadowDist = 128.0f; // configurable
+        // Sun/Moon position — use Iris CelestialUniforms algorithm:
+        // Start with (0, 100, 0), transform by gbufferModelView * rotateY(-90°) *
+        // rotateZ(sunPathRotation) * rotateX(skyAngle * 360°)
+        Matrix4f celestial = new Matrix4f(modelViewMatrix);
+        celestial.rotate((float) Math.toRadians(-90.0f), 0.0f, 1.0f, 0.0f);
+        // sunPathRotation: default 0.0f, TODO: parse from shaderpack properties
+        celestial.rotate((float) Math.toRadians(0.0f), 0.0f, 0.0f, 1.0f);
+        celestial.rotate((float) Math.toRadians(skyAngle * 360.0f), 1.0f, 0.0f, 0.0f);
+
+        org.joml.Vector4f sunVec = new org.joml.Vector4f(0.0f, 100.0f, 0.0f, 0.0f);
+        celestial.transform(sunVec);
+        sunPosition.set(sunVec.x, sunVec.y, sunVec.z);
+
+        org.joml.Vector4f moonVec = new org.joml.Vector4f(0.0f, -100.0f, 0.0f, 0.0f);
+        celestial.transform(moonVec);
+        moonPosition.set(moonVec.x, moonVec.y, moonVec.z);
+
+        // Up position: gbufferModelView * rotateY(-90°) only (no skyAngle rotation)
+        Matrix4f preCelestial = new Matrix4f(modelViewMatrix);
+        preCelestial.rotate((float) Math.toRadians(-90.0f), 0.0f, 1.0f, 0.0f);
+        org.joml.Vector4f upVec = new org.joml.Vector4f(0.0f, 100.0f, 0.0f, 0.0f);
+        preCelestial.transform(upVec);
+        upPosition.set(upVec.x, upVec.y, upVec.z);
+
+        // Shadow matrices (orthographic from sun/moon world-space direction)
+        // Use celestial rotation WITHOUT gbufferModelView for world-space direction
+        Matrix4f celestialWorld = new Matrix4f();
+        celestialWorld.rotate((float) Math.toRadians(-90.0f), 0.0f, 1.0f, 0.0f);
+        celestialWorld.rotate((float) Math.toRadians(skyAngle * 360.0f), 1.0f, 0.0f, 0.0f);
+        org.joml.Vector4f shadowDir = new org.joml.Vector4f(0.0f, 1.0f, 0.0f, 0.0f);
+        celestialWorld.transform(shadowDir);
+        float sDirX = sunAngle <= 0.5f ? shadowDir.x : -shadowDir.x;
+        float sDirY = sunAngle <= 0.5f ? shadowDir.y : -shadowDir.y;
+        float sDirZ = sunAngle <= 0.5f ? shadowDir.z : -shadowDir.z;
+        float shadowDist = 128.0f;
         shadowProjectionMatrix.identity().ortho(-shadowDist, shadowDist,
                 -shadowDist, shadowDist, -shadowDist * 2, shadowDist * 2);
         shadowModelViewMatrix.identity().lookAt(
-                sunPosition.x * shadowDist, sunPosition.y * shadowDist, sunPosition.z * shadowDist,
+                sDirX * shadowDist, sDirY * shadowDist, sDirZ * shadowDist,
                 0, 0, 0,
                 0, 1, 0);
 
@@ -120,12 +157,6 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
 
         // Eye status
         isEyeInWater = camera.getFluidInCamera() != net.minecraft.world.level.material.FogType.NONE ? 1 : 0;
-
-        // Matrices from VRenderSystem
-        prevModelViewMatrix.set(modelViewMatrix);
-        prevProjectionMatrix.set(projectionMatrix);
-        modelViewMatrix.set(net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
-        projectionMatrix.set(net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
     }
 
     // ─── Matrix getters ──────────────────────────────────────────────

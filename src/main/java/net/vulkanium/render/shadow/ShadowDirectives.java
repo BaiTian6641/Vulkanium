@@ -34,6 +34,7 @@ public class ShadowDirectives {
 
     // ── Iris-compatible defaults ──
     public static final int DEFAULT_RESOLUTION = 1024;
+    public static final int MAX_SAFE_RESOLUTION = 4096;
     public static final float DEFAULT_DISTANCE = 160.0f;
     public static final float DEFAULT_NEAR = -100.05f;
     public static final float DEFAULT_FAR = 156.0f;
@@ -117,6 +118,14 @@ public class ShadowDirectives {
 
         // Per-color-buffer settings
         parseColorSettings(directives);
+
+        if (resolution < 64) {
+            LOGGER.warn("Shadow resolution {} is invalid; using default {}", resolution, DEFAULT_RESOLUTION);
+            resolution = DEFAULT_RESOLUTION;
+        } else if (resolution > MAX_SAFE_RESOLUTION) {
+            LOGGER.warn("Shadow resolution {} is too high; clamping to {}", resolution, MAX_SAFE_RESOLUTION);
+            resolution = MAX_SAFE_RESOLUTION;
+        }
 
         LOGGER.debug("Shadow directives: {}x{}, dist={}, interval={}, fov={}",
                 resolution, resolution, distance, intervalSize, fov);

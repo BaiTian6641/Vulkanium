@@ -111,7 +111,8 @@ public class ShadowMap {
 
             // ── shadowtex0 — main depth ──
             mainDepthImage = createImage(stack, allocator, depthFormat, resolution, resolution, mips0,
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                    | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     depthAllocations, 0);
             mainDepthView = createImageView(stack, vkDevice, mainDepthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, mips0);
 
@@ -341,7 +342,7 @@ public class ShadowMap {
                     .dstAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
             barriers.get(1)
                     .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                    .newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
                     .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
                     .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
 
@@ -478,6 +479,7 @@ public class ShadowMap {
 
     public long getNoTranslucentsDepthView() { return noTranslucentsDepthView; }
     public long getNoTranslucentsDepthSampler() { return noTranslucentsDepthSampler; }
+    public long getNoTranslucentsDepthImage() { return noTranslucentsDepthImage; }
 
     /** Hardware comparison sampler for shadowtex0 (PCF-compatible) */
     public long getMainDepthHwSampler() { return mainDepthHwSampler; }

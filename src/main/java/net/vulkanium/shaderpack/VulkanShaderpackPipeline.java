@@ -9,6 +9,10 @@ import net.vulkanium.render.gbuffer.GBufferManager;
 import net.vulkanium.render.gbuffer.RenderTargetSettings;
 import net.vulkanium.render.pipeline.BasicPipeline;
 import net.vulkanium.render.pipeline.DrawBatcher;
+import net.vulkanium.render.shadow.ShadowDirectives;
+import net.vulkanium.render.shadow.ShadowMap;
+import net.vulkanium.render.shadow.ShadowMatrices;
+import net.vulkanium.render.shadow.ShadowRenderer;
 import net.vulkanium.render.shader.ShaderCompiler;
 import net.vulkanium.render.shader.ShaderModuleManager;
 import net.vulkanium.render.shader.ShaderModuleManager.CompiledProgram;
@@ -16,16 +20,20 @@ import net.vulkanium.render.shader.VulkaniumGlslTransformer.PassType;
 import net.vulkanium.render.texture.VulkanTexture;
 import net.vulkanium.resource.RenderTarget;
 import net.vulkanium.core.VulkaniumCommand;
+import net.vulkanium.core.VulkaniumMemory;
 import net.vulkanium.shaderpack.compute.ShaderpackComputeManager;
 import net.vulkanium.shaderpack.compute.ShaderpackSSBOManager;
 import net.vulkanium.shaderpack.compute.ShaderpackImageManager;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
+import java.nio.LongBuffer;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.function.Consumer;
@@ -240,6 +248,39 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
      * <p>Reference: Iris IrisImages/GlImage (Iris Shaders, LGPL-3.0)</p>
      */
     private ShaderpackImageManager imageManager;
+
+    // ── Shadow rendering infrastructure ──
+    /** Shadow directives parsed from shader source (resolution, distance, etc.) */
+    private ShadowDirectives shadowDirectives;
+
+    /** Shadow map render targets (depth + color attachments) */
+    private ShadowMap shadowMap;
+
+    /** Shadow renderer orchestrating the shadow pass */
+    private ShadowRenderer shadowRenderer;
+
+    /** Shadow render pass handle — CLEAR variant (depth-only, loadOp=CLEAR) */
+    private long shadowRenderPass = VK_NULL_HANDLE;
+
+    /** Shadow render pass handle — LOAD variant (depth-only, loadOp=LOAD for translucent) */
+    private long shadowRenderPassLoad = VK_NULL_HANDLE;
+
+    /** Shadow framebuffer handle */
+    private long shadowFramebuffer = VK_NULL_HANDLE;
+
+    /** Shadow terrain pipeline (depth-only, for rendering shadow geometry) */
+    private BasicPipeline shadowTerrainPipeline;
+
+    /** Whether shadow depth images have been initialized (transitioned to readable layout) */
+    private boolean shadowImagesInitialized = false;
+
+    // ── Noise texture ──
+    /** 256x256 RGBA noise texture for shaderpack noisetex sampler */
+    private long noiseImage = VK_NULL_HANDLE;
+    private long noiseImageAllocation = 0L;
+    private long noiseImageView = VK_NULL_HANDLE;
+    private long noiseSampler = VK_NULL_HANDLE;
+    private static final int NOISE_TEXTURE_SIZE = 256;
 
     /** Cached MRT pipelines: keyed by ProgramId + attachment count to match MRT render pass. */
     private final Map<String, BasicPipeline> mrtPipelines = new HashMap<>();
@@ -535,6 +576,12 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
             // ── Phase 6: Initialize G-buffer render targets for MRT gbuffers ──
             initializeGBuffer();
+
+            // ── Phase 7: Initialize shadow rendering infrastructure ──
+            initializeShadow();
+
+            // ── Phase 8: Create noise texture ──
+            initializeNoiseTexture();
 
             // Report module creation phase
             reportProgress(new LoadProgress(
@@ -1067,6 +1114,38 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
         renderTargetSettings = null;
 
+        // Destroy shadow infrastructure
+        if (shadowRenderer != null) {
+            shadowRenderer.destroy();
+            shadowRenderer = null;
+        }
+        if (shadowMap != null) {
+            long shadowAllocator = Vulkanium.getVulkanMemory() != null
+                    ? Vulkanium.getVulkanMemory().getAllocator() : 0L;
+            shadowMap.destroy(0L, shadowAllocator);
+            shadowMap = null;
+        }
+        if (device != null) {
+            if (shadowFramebuffer != VK_NULL_HANDLE) {
+                vkDestroyFramebuffer(device, shadowFramebuffer, null);
+            }
+            if (shadowRenderPass != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(device, shadowRenderPass, null);
+            }
+            if (shadowRenderPassLoad != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(device, shadowRenderPassLoad, null);
+            }
+        }
+        shadowFramebuffer = VK_NULL_HANDLE;
+        shadowRenderPass = VK_NULL_HANDLE;
+        shadowRenderPassLoad = VK_NULL_HANDLE;
+        shadowDirectives = null;
+        shadowImagesInitialized = false;
+        if (shadowTerrainPipeline != null) {
+            shadowTerrainPipeline.destroy();
+            shadowTerrainPipeline = null;
+        }
+
         // Destroy compute infrastructure
         // Reference: Iris CompositeRenderer cleanup (Iris Shaders, LGPL-3.0)
         if (computeManager != null) {
@@ -1081,6 +1160,25 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             imageManager.destroy();
             imageManager = null;
         }
+
+        // Destroy noise texture
+        if (device != null) {
+            if (noiseImageView != VK_NULL_HANDLE) {
+                vkDestroyImageView(device, noiseImageView, null);
+            }
+            if (noiseSampler != VK_NULL_HANDLE) {
+                vkDestroySampler(device, noiseSampler, null);
+            }
+        }
+        if (noiseImage != VK_NULL_HANDLE && noiseImageAllocation != 0L && Vulkanium.getVulkanMemory() != null) {
+            Vulkanium.getVulkanMemory().freeImageImmediate(
+                    new VulkaniumMemory.ImageAllocation(noiseImage, noiseImageAllocation,
+                            NOISE_TEXTURE_SIZE, NOISE_TEXTURE_SIZE, VK_FORMAT_R8G8B8A8_UNORM, 1));
+        }
+        noiseImage = VK_NULL_HANDLE;
+        noiseImageAllocation = 0L;
+        noiseImageView = VK_NULL_HANDLE;
+        noiseSampler = VK_NULL_HANDLE;
 
         for (BasicPipeline mrtP : mrtPipelines.values()) {
             if (mrtP != null) mrtP.destroy();
@@ -1147,6 +1245,578 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     }
 
     /**
+     * Initializes the shadow rendering infrastructure.
+     *
+     * <p>Collects shadow directives from all compiled programs, creates the
+     * shadow map render targets, builds a depth-only render pass, and
+     * creates the shadow framebuffer.</p>
+     *
+     * <p>The depth images are left in UNDEFINED layout after creation. On first
+     * use in {@link #onFrameBegin}, they are transitioned to
+     * DEPTH_STENCIL_READ_ONLY_OPTIMAL with depth cleared to 1.0 so that
+     * shaderpacks sampling shadowtex0/1 see "no shadow" rather than black.</p>
+     */
+    private void initializeShadow() {
+        // ── Step 1: Collect shadow directives from all compiled programs ──
+        Map<String, String> mergedDirectives = new HashMap<>();
+        for (Map.Entry<ProgramId, CompiledProgram> entry : compiledPrograms.entrySet()) {
+            CompiledProgram prog = entry.getValue();
+            if (prog.packDirectives != null) {
+                for (Map.Entry<String, Number> d : prog.packDirectives.entrySet()) {
+                    mergedDirectives.putIfAbsent(d.getKey(), d.getValue().toString());
+                }
+            }
+        }
+
+        // Also apply shadow resolution from shaders.properties if set
+        if (properties != null) {
+            int propRes = properties.getShadowResolution();
+            if (propRes > 0 && propRes != 1024) {
+                mergedDirectives.put("shadowMapResolution", String.valueOf(propRes));
+            }
+            float propDist = properties.getShadowDistance();
+            if (propDist > 0 && propDist != 128.0f) {
+                mergedDirectives.put("shadowDistance", String.valueOf(propDist));
+            }
+        }
+
+        shadowDirectives = new ShadowDirectives();
+        shadowDirectives.acceptDirectives(mergedDirectives);
+
+        // ── Step 2: Determine sunPathRotation from shaderpack ──
+        float sunPathRotation = 0.0f;
+        String sprValue = mergedDirectives.get("sunPathRotation");
+        if (sprValue != null) {
+            try { sunPathRotation = Float.parseFloat(sprValue); } catch (NumberFormatException ignored) {}
+        }
+
+        int resolution = shadowDirectives.getResolution();
+        LOGGER.info("[SHADOW] Initializing shadow map: {}x{}, distance={}, interval={}",
+                resolution, resolution, shadowDirectives.getDistance(), shadowDirectives.getIntervalSize());
+
+        // ── Step 3: Create ShadowMap (allocates depth images) ──
+        VkDevice device = Vulkanium.getVulkanDevice().getLogicalDevice();
+        long allocator = Vulkanium.getVulkanMemory().getAllocator();
+        shadowMap = new ShadowMap(shadowDirectives);
+        shadowMap.create(0L, allocator); // device param unused — ShadowMap uses global device
+
+        // ── Step 4: Create depth-only shadow render passes ──
+        // CLEAR variant: first opaque pass clears depth
+        shadowRenderPass = createShadowRenderPass(device, shadowMap.getDepthFormat(),
+                VK_ATTACHMENT_LOAD_OP_CLEAR,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        // LOAD variant: translucent pass preserves opaque depth
+        shadowRenderPassLoad = createShadowRenderPass(device, shadowMap.getDepthFormat(),
+                VK_ATTACHMENT_LOAD_OP_LOAD,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (shadowRenderPass == VK_NULL_HANDLE) {
+            LOGGER.warn("[SHADOW] Failed to create shadow render pass — shadow rendering disabled");
+            if (shadowRenderPassLoad != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(device, shadowRenderPassLoad, null);
+                shadowRenderPassLoad = VK_NULL_HANDLE;
+            }
+            shadowMap.destroy(0L, allocator);
+            shadowMap = null;
+            return;
+        }
+
+        // ── Step 5: Create shadow framebuffer (depth attachment only) ──
+        shadowFramebuffer = createShadowFramebuffer(device, shadowRenderPass,
+                shadowMap.getMainDepthView(), resolution, resolution);
+        if (shadowFramebuffer == VK_NULL_HANDLE) {
+            LOGGER.warn("[SHADOW] Failed to create shadow framebuffer — shadow rendering disabled");
+            vkDestroyRenderPass(device, shadowRenderPass, null);
+            shadowRenderPass = VK_NULL_HANDLE;
+            shadowMap.destroy(0L, allocator);
+            shadowMap = null;
+            return;
+        }
+
+        // ── Step 6: Create ShadowRenderer ──
+        shadowRenderer = new ShadowRenderer(shadowMap, shadowDirectives, null);
+        shadowRenderer.setSunPathRotation(sunPathRotation);
+        shadowRenderer.setShadowRenderTargets(shadowRenderPass, shadowRenderPassLoad,
+                shadowFramebuffer, 0);
+
+        // ── Step 6b: Create shadow terrain pipeline ──
+        createShadowTerrainPipeline(device);
+
+        shadowImagesInitialized = false;
+
+        // ── Step 7: Feed shadow parameters to DrawBatcher ──
+        DrawBatcher batcher = Vulkanium.getDrawBatcher();
+        if (batcher != null) {
+            batcher.setShadowParams(
+                    sunPathRotation,
+                    shadowDirectives.getDistance(),
+                    shadowDirectives.getIntervalSize(),
+                    shadowDirectives.getNearPlane(),
+                    shadowDirectives.getFarPlane(),
+                    shadowDirectives.getDistanceRenderMul(),
+                    shadowDirectives.getResolution()
+            );
+        }
+
+        LOGGER.info("[SHADOW] Shadow infrastructure initialized: {}x{} depth-only render pass",
+                resolution, resolution);
+    }
+
+    /**
+     * Creates a 256x256 RGBA8 noise texture for the noisetex sampler.
+     * Uses the same random-data approach as Iris (java.util.Random, deterministic seed per pixel).
+     * Reference: Iris NoiseTexture (Iris Shaders, LGPL-3.0)
+     */
+    private void initializeNoiseTexture() {
+        VkDevice device = Vulkanium.getVulkanDevice().getLogicalDevice();
+        VulkaniumMemory memory = Vulkanium.getVulkanMemory();
+        VulkaniumCommand command = Vulkanium.getVulkanCommand();
+
+        if (device == null || memory == null || command == null) {
+            LOGGER.warn("[NOISE] Cannot create noise texture — device/memory/command not ready");
+            return;
+        }
+
+        int w = NOISE_TEXTURE_SIZE;
+        int h = NOISE_TEXTURE_SIZE;
+        int dataSize = w * h * 4; // RGBA8
+
+        // 1. Create device-local image
+        VulkaniumMemory.ImageAllocation img = memory.createImage(
+                w, h, 1,
+                VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_TILING_OPTIMAL,
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        // 2. Fill staging buffer with random noise
+        VulkaniumMemory.BufferAllocation staging = memory.createStagingBuffer(dataSize);
+        long ptr = memory.map(staging.allocation());
+        java.util.Random rng = new java.util.Random(0L); // deterministic seed for reproducibility
+        for (int i = 0; i < w * h; i++) {
+            byte r = (byte) rng.nextInt(256);
+            byte g = (byte) rng.nextInt(256);
+            byte b = (byte) rng.nextInt(256);
+            byte a = (byte) rng.nextInt(256);
+            MemoryUtil.memPutByte(ptr + (long) i * 4, r);
+            MemoryUtil.memPutByte(ptr + (long) i * 4 + 1, g);
+            MemoryUtil.memPutByte(ptr + (long) i * 4 + 2, b);
+            MemoryUtil.memPutByte(ptr + (long) i * 4 + 3, a);
+        }
+        memory.unmap(staging.allocation());
+
+        // 3. Upload via one-shot command buffer
+        VkCommandBuffer cmd = command.beginSingleTimeCommand();
+
+        // Transition UNDEFINED → TRANSFER_DST
+        VulkaniumCommand.transitionImageLayout(cmd, img.image(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Copy buffer → image
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
+            region.bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+            region.imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.imageOffset().set(0, 0, 0);
+            region.imageExtent().set(w, h, 1);
+            vkCmdCopyBufferToImage(cmd, staging.buffer(), img.image(),
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+        }
+
+        // Transition TRANSFER_DST → SHADER_READ
+        VulkaniumCommand.transitionImageLayout(cmd, img.image(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        command.endSingleTimeCommand(cmd);
+        memory.freeBufferImmediate(staging);
+
+        // 4. Create image view
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkImageViewCreateInfo viewInfo = VkImageViewCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+                    .image(img.image())
+                    .viewType(VK_IMAGE_VIEW_TYPE_2D)
+                    .format(VK_FORMAT_R8G8B8A8_UNORM);
+            viewInfo.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+
+            LongBuffer pView = stack.longs(VK_NULL_HANDLE);
+            int result = vkCreateImageView(device, viewInfo, null, pView);
+            if (result != VK_SUCCESS) {
+                LOGGER.warn("[NOISE] Failed to create noise image view: {}", result);
+                return;
+            }
+            noiseImageView = pView.get(0);
+        }
+
+        // 5. Create sampler (REPEAT + NEAREST, matching Iris noisetex sampler)
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSamplerCreateInfo samplerInfo = VkSamplerCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+                    .magFilter(VK_FILTER_NEAREST)
+                    .minFilter(VK_FILTER_NEAREST)
+                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                    .anisotropyEnable(false)
+                    .borderColor(VK_BORDER_COLOR_INT_OPAQUE_WHITE)
+                    .unnormalizedCoordinates(false)
+                    .compareEnable(false)
+                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST);
+
+            LongBuffer pSampler = stack.longs(VK_NULL_HANDLE);
+            int result = vkCreateSampler(device, samplerInfo, null, pSampler);
+            if (result != VK_SUCCESS) {
+                LOGGER.warn("[NOISE] Failed to create noise sampler: {}", result);
+                return;
+            }
+            noiseSampler = pSampler.get(0);
+        }
+
+        noiseImage = img.image();
+        noiseImageAllocation = img.allocation();
+        LOGGER.info("[NOISE] Created {}x{} RGBA8 noise texture (noisetex binding=27)", w, h);
+    }
+
+    /**
+     * Creates a VkRenderPass with a single depth-only attachment for shadow mapping.
+     *
+     * @param loadOp        VK_ATTACHMENT_LOAD_OP_CLEAR or VK_ATTACHMENT_LOAD_OP_LOAD
+     * @param initialLayout initial depth layout (UNDEFINED for clear, ATTACHMENT for load)
+     * @param finalLayout   final depth layout after the pass
+     */
+    private long createShadowRenderPass(VkDevice device, int depthFormat,
+                                         int loadOp, int initialLayout, int finalLayout) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAttachmentDescription.Buffer attachments = VkAttachmentDescription.calloc(1, stack);
+            attachments.get(0)
+                    .format(depthFormat)
+                    .samples(VK_SAMPLE_COUNT_1_BIT)
+                    .loadOp(loadOp)
+                    .storeOp(VK_ATTACHMENT_STORE_OP_STORE)
+                    .stencilLoadOp(VK_ATTACHMENT_LOAD_OP_DONT_CARE)
+                    .stencilStoreOp(VK_ATTACHMENT_STORE_OP_DONT_CARE)
+                    .initialLayout(initialLayout)
+                    .finalLayout(finalLayout);
+
+            VkAttachmentReference.Buffer depthRef = VkAttachmentReference.calloc(1, stack)
+                    .attachment(0)
+                    .layout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+            VkSubpassDescription.Buffer subpasses = VkSubpassDescription.calloc(1, stack)
+                    .pipelineBindPoint(VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    .colorAttachmentCount(0)
+                    .pDepthStencilAttachment(depthRef.get(0));
+
+            VkSubpassDependency.Buffer dependencies = VkSubpassDependency.calloc(2, stack);
+            // External → subpass
+            dependencies.get(0)
+                    .srcSubpass(VK_SUBPASS_EXTERNAL)
+                    .dstSubpass(0)
+                    .srcStageMask(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                    .dstStageMask(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
+                    .srcAccessMask(VK_ACCESS_SHADER_READ_BIT)
+                    .dstAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                    .dependencyFlags(VK_DEPENDENCY_BY_REGION_BIT);
+            // Subpass → external
+            dependencies.get(1)
+                    .srcSubpass(0)
+                    .dstSubpass(VK_SUBPASS_EXTERNAL)
+                    .srcStageMask(VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
+                    .dstStageMask(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT)
+                    .srcAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT)
+                    .dependencyFlags(VK_DEPENDENCY_BY_REGION_BIT);
+
+            VkRenderPassCreateInfo renderPassCI = VkRenderPassCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO)
+                    .pAttachments(attachments)
+                    .pSubpasses(subpasses)
+                    .pDependencies(dependencies);
+
+            LongBuffer pRenderPass = stack.mallocLong(1);
+            int result = vkCreateRenderPass(device, renderPassCI, null, pRenderPass);
+            if (result != VK_SUCCESS) {
+                LOGGER.error("[SHADOW] vkCreateRenderPass failed: {}", result);
+                return VK_NULL_HANDLE;
+            }
+            return pRenderPass.get(0);
+        }
+    }
+
+    /**
+     * Creates a VkFramebuffer for the shadow render pass with a single depth attachment.
+     */
+    private long createShadowFramebuffer(VkDevice device, long renderPass,
+                                          long depthView, int width, int height) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            LongBuffer attachments = stack.mallocLong(1);
+            attachments.put(0, depthView);
+
+            VkFramebufferCreateInfo fbCI = VkFramebufferCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
+                    .renderPass(renderPass)
+                    .pAttachments(attachments)
+                    .width(width)
+                    .height(height)
+                    .layers(1);
+
+            LongBuffer pFramebuffer = stack.mallocLong(1);
+            int result = vkCreateFramebuffer(device, fbCI, null, pFramebuffer);
+            if (result != VK_SUCCESS) {
+                LOGGER.error("[SHADOW] vkCreateFramebuffer failed: {}", result);
+                return VK_NULL_HANDLE;
+            }
+            return pFramebuffer.get(0);
+        }
+    }
+
+    /**
+     * Creates a depth-only shadow terrain pipeline from compiled shadow shader modules.
+     *
+     * <p>Uses the shadow/shadow_solid/shadow_cutout program modules if the shaderpack
+     * compiled them. Falls back to gbuffers_terrain modules if no shadow programs exist.
+     * The pipeline renders with {@code cullMode=NONE}, depth bias enabled, and zero
+     * color attachments (depth-only render pass).</p>
+     */
+    private void createShadowTerrainPipeline(VkDevice device) {
+        // Resolve shadow program (SHADOW → SHADOW_SOLID → gbuffers_terrain fallback)
+        CompiledProgram shadowProg = compiledPrograms.get(ProgramId.SHADOW);
+        if (shadowProg == null) shadowProg = compiledPrograms.get(ProgramId.SHADOW_SOLID);
+        if (shadowProg == null) shadowProg = compiledPrograms.get(ProgramId.GBUFFERS_TERRAIN);
+        if (shadowProg == null) shadowProg = compiledPrograms.get(ProgramId.GBUFFERS_TERRAIN_SOLID);
+
+        if (shadowProg == null || shadowProg.vertexModule == 0 || shadowProg.fragmentModule == 0) {
+            LOGGER.warn("[SHADOW] No shadow or terrain shader modules found — shadow terrain pipeline skipped");
+            return;
+        }
+
+        try {
+            shadowTerrainPipeline = new BasicPipeline();
+            long sharedDescriptorSetLayout = VK_NULL_HANDLE;
+            if (Vulkanium.getPipelineRegistry() != null) {
+                sharedDescriptorSetLayout = Vulkanium.getPipelineRegistry().getDescriptorSetLayout();
+            }
+
+            // Use DefaultVertexFormat.BLOCK (terrain format) with 0 color attachments
+            // for the depth-only shadow render pass
+            shadowTerrainPipeline.initializeWithModules(
+                    device,
+                    shadowRenderPass,
+                    "shadow_terrain",
+                    shadowProg.vertexModule,
+                    shadowProg.fragmentModule,
+                    VK_NULL_HANDLE,
+                    DefaultVertexFormat.BLOCK,
+                        0,  // no color attachments — depth only
+                        sharedDescriptorSetLayout
+            );
+            LOGGER.info("[SHADOW] Shadow terrain pipeline created using program: {}",
+                    compiledPrograms.containsKey(ProgramId.SHADOW) ? "shadow" :
+                    compiledPrograms.containsKey(ProgramId.SHADOW_SOLID) ? "shadow_solid" :
+                    "gbuffers_terrain (fallback)");
+        } catch (Exception e) {
+            LOGGER.error("[SHADOW] Failed to create shadow terrain pipeline: {}", e.getMessage());
+            shadowTerrainPipeline = null;
+        }
+    }
+
+    /**
+     * Executes the shadow rendering pass for the current frame.
+     *
+     * <p>This must be called BEFORE the main MRT G-buffer pass begins, as
+     * shadow rendering uses its own depth-only VkRenderPass. The sequence is:</p>
+     * <ol>
+     *   <li>Set {@link WorldRenderingPhase} to SHADOW</li>
+     *   <li>Bind shadow terrain pipeline to ChunkRenderer</li>
+     *   <li>Call {@link ShadowRenderer#renderShadows} (17-step sequence)</li>
+     *   <li>Transition shadow depth images to DEPTH_STENCIL_READ_ONLY for sampling</li>
+     *   <li>Reset phase to NONE</li>
+     * </ol>
+     */
+    public void renderShadowPass(VkCommandBuffer cmd) {
+        // Initialize shadow depth images on first call (must be outside any VkRenderPass).
+        // The caller (onWorldRenderStart) ends the main render pass before calling us,
+        // so vkCmdPipelineBarrier/vkCmdClearDepthStencilImage are legal here.
+        if (!shadowImagesInitialized && shadowMap != null) {
+            initializeShadowImageLayouts(cmd);
+        }
+
+        if (shadowRenderer == null || shadowMap == null) return;
+        if (shadowDirectives == null || shadowDirectives.getDistance() <= 0) return;
+
+        // Get camera position and sky angle from live game state
+        net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+        if (mc == null || mc.level == null || mc.player == null) return;
+
+        float partialTick = Vulkanium.getCurrentPartialTick();
+        float skyAngle = mc.level.getTimeOfDay(partialTick);
+        org.joml.Vector3d cameraPos = new org.joml.Vector3d(
+                mc.player.getX(partialTick),
+                mc.player.getEyeY(),
+                mc.player.getZ(partialTick));
+
+        // Get ChunkRenderer for terrain draws
+        net.vulkanium.world.VulkaniumWorldRenderer worldRenderer =
+                net.vulkanium.world.VulkaniumWorldRenderer.getInstance();
+        net.vulkanium.render.terrain.ChunkRenderer chunkRenderer = worldRenderer.getChunkRenderer();
+        if (chunkRenderer == null) return;
+
+        // Set shadow phase
+        net.vulkanium.render.program.WorldRenderingPhase.setPhase(
+                net.vulkanium.render.program.WorldRenderingPhase.Phase.SHADOW);
+
+        // Bind shadow terrain pipeline for ChunkRenderer shadow draws
+        if (shadowTerrainPipeline != null) {
+            long pipeline = shadowTerrainPipeline.getOrCreatePipeline(
+                    false,   // no blend
+                    true,    // depth test
+                    true,    // depth write
+                    false,   // no cull (both sides for shadows)
+                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+            chunkRenderer.setShadowTerrainPipeline(pipeline, shadowTerrainPipeline.getPipelineLayout());
+        }
+
+        try {
+            // Mark shadow images as initialized (the render pass CLEAR handles init)
+            shadowImagesInitialized = true;
+
+            // Execute the full 17-step shadow rendering sequence
+            shadowRenderer.renderShadows(
+                    cmd.address(), cameraPos, skyAngle, partialTick, chunkRenderer);
+
+            // Transition shadow depth images to DEPTH_STENCIL_READ_ONLY for sampling
+            transitionShadowDepthToReadOnly(cmd);
+        } catch (Exception e) {
+            LOGGER.error("[SHADOW] Error during shadow pass: {}", e.getMessage(), e);
+        } finally {
+            // Clear shadow pipeline binding
+            chunkRenderer.setShadowTerrainPipeline(0, 0);
+
+            // Reset phase
+            net.vulkanium.render.program.WorldRenderingPhase.setPhase(
+                    net.vulkanium.render.program.WorldRenderingPhase.Phase.NONE);
+        }
+    }
+
+    /**
+     * Transitions shadow depth images from DEPTH_STENCIL_ATTACHMENT to
+     * DEPTH_STENCIL_READ_ONLY for sampling in composite/deferred passes.
+     */
+    private void transitionShadowDepthToReadOnly(VkCommandBuffer cmd) {
+        long mainDepth = shadowMap.getMainDepthImage();
+        if (mainDepth == VK_NULL_HANDLE) return;
+
+        // Only transition mainDepth here.  noTranslucentsDepthImage is already in
+        // DEPTH_STENCIL_READ_ONLY_OPTIMAL after copyPreTranslucentDepth() ran earlier
+        // in the shadow render sequence (Step 11).
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkImageMemoryBarrier.Buffer barriers = VkImageMemoryBarrier.calloc(1, stack);
+            barriers.get(0)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .oldLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(mainDepth)
+                    .srcAccessMask(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+            barriers.get(0).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseMipLevel(0).levelCount(VK_REMAINING_MIP_LEVELS)
+                    .baseArrayLayer(0).layerCount(1);
+
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                    null, null, barriers);
+        }
+    }
+
+    /**
+     * Initializes shadow depth images for first-time use.
+     * Transitions both depth images to DEPTH_STENCIL_READ_ONLY_OPTIMAL so
+     * they can be safely sampled before any shadow geometry is rendered.
+     * The clear-on-load in the render pass ensures depth = 1.0 (no shadow).
+     */
+    private void initializeShadowImageLayouts(VkCommandBuffer cmd) {
+        if (shadowImagesInitialized || shadowMap == null) return;
+        shadowImagesInitialized = true;
+
+        long mainDepth = shadowMap.getMainDepthImage();
+        long noTransDepth = shadowMap.getNoTranslucentsDepthImage();
+        if (mainDepth == VK_NULL_HANDLE) return;
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Collect depth images to initialize
+            boolean hasNoTrans = (noTransDepth != VK_NULL_HANDLE && noTransDepth != mainDepth);
+            int imageCount = hasNoTrans ? 2 : 1;
+            long[] depthImages = hasNoTrans
+                    ? new long[]{mainDepth, noTransDepth}
+                    : new long[]{mainDepth};
+
+            // Transition all depth images UNDEFINED → TRANSFER_DST
+            VkImageMemoryBarrier.Buffer barriers = VkImageMemoryBarrier.calloc(imageCount, stack);
+            for (int i = 0; i < imageCount; i++) {
+                barriers.get(i)
+                        .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                        .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                        .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                        .image(depthImages[i])
+                        .srcAccessMask(0)
+                        .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
+                barriers.get(i).subresourceRange()
+                        .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                        .baseMipLevel(0).levelCount(VK_REMAINING_MIP_LEVELS)
+                        .baseArrayLayer(0).layerCount(1);
+            }
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                    null, null, barriers);
+
+            // Clear all depth images to 1.0 (no shadow)
+            VkClearDepthStencilValue clearDS = VkClearDepthStencilValue.calloc(stack)
+                    .depth(1.0f).stencil(0);
+            VkImageSubresourceRange.Buffer clearRange = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .baseMipLevel(0).levelCount(VK_REMAINING_MIP_LEVELS)
+                    .baseArrayLayer(0).layerCount(1);
+            for (int i = 0; i < imageCount; i++) {
+                vkCmdClearDepthStencilImage(cmd, depthImages[i],
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, clearDS, clearRange);
+            }
+
+            // Transition all depth images TRANSFER_DST → DEPTH_STENCIL_READ_ONLY
+            for (int i = 0; i < imageCount; i++) {
+                barriers.get(i)
+                        .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                        .newLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+                        .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
+            }
+            vkCmdPipelineBarrier(cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                    null, null, barriers);
+        }
+
+        LOGGER.debug("[SHADOW] Shadow depth images initialized (cleared to depth=1.0)");
+    }
+
+    /**
      * Returns (or lazily creates) a compatibility graphics pipeline for this program and vertex format.
      *
      * <p>This bridges shaderpack modules into Vulkanium's current draw path while full phase render graph
@@ -1168,9 +1838,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (program == null) return null;
 
         try {
-            long geometryModule = 0;
-            if (program.geometryModule != 0 && warnedGeometryCompatBypass.add(requestedProgram.getSourceName())) {
-                LOGGER.info("[COMPAT] Ignoring geometry stage for {} in compatibility gbuffers path", requestedProgram.getSourceName());
+            long geometryModule = program.geometryModule;
+            if (geometryModule != 0 && warnedGeometryCompatBypass.add(requestedProgram.getSourceName())) {
+                LOGGER.info("[COMPAT] Using geometry stage for {} in compatibility gbuffers path", requestedProgram.getSourceName());
             }
 
             // Use MRT render pass for gbuffers programs when G-buffer is active
@@ -1291,6 +1961,15 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     /** Returns the G-buffer manager, or null if MRT is not initialized. */
     public GBufferManager getGBufferManager() { return gbufferManager; }
 
+    /** Returns the shadow map, or null if shadow is not initialized. */
+    public ShadowMap getShadowMap() { return shadowMap; }
+
+    /** Returns the shadow renderer, or null if shadow is not initialized. */
+    public ShadowRenderer getShadowRenderer() { return shadowRenderer; }
+
+    /** Returns the shadow directives, or null if not parsed. */
+    public ShadowDirectives getShadowDirectives() { return shadowDirectives; }
+
     @Override
     public void onFrameBegin(VkCommandBuffer cmd, int frameIndex) {
         if (!loaded) return;
@@ -1301,6 +1980,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (uniforms != null) {
             uniforms.updateFromGameState();
         }
+
+        // NOTE: Shadow depth image initialization moved to renderShadowPass()
+        // where it runs OUTSIDE any VkRenderPass. vkCmdPipelineBarrier with
+        // image memory barriers and vkCmdClearDepthStencilImage are illegal
+        // inside a render pass (mainRenderPass is active here).
     }
 
     @Override
@@ -1337,6 +2021,15 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         // Lazily create / resize MRT targets
         if (fsTargets == null) {
             fsTargets = new FullscreenRenderTargets();
+            // Apply per-target format overrides from shaderpack properties
+            if (renderTargetSettings != null) {
+                for (int i = 0; i < RenderTargetSettings.MAX_COLOR_TARGETS; i++) {
+                    RenderTargetSettings.BufferSettings bs = renderTargetSettings.getColorSettings(i);
+                    if (bs != null && bs.getVkFormat() != 0) {
+                        fsTargets.setTargetFormat(i, bs.getVkFormat());
+                    }
+                }
+            }
         }
         fsTargets.ensureSize(device, Vulkanium.getVulkanMemory(), width, height, renderFormat, depthFormat);
         fsTargets.initializeImageLayouts(cmd); // transition UNDEFINED → SHADER_READ on first use
@@ -1407,13 +2100,15 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (placeholderView == VK_NULL_HANDLE || placeholderSampler == VK_NULL_HANDLE) return;
 
         // Pre-compute uniform data shared across all passes
+        // Use world-render snapshots — the live matrices may have been
+        // overwritten by GUI/HUD rendering by the time fullscreen passes run.
         float[] modelView = new float[16];
-        VRenderSystem.getModelViewMatrix().get(modelView);
-        org.joml.Matrix4f vkProjection = new org.joml.Matrix4f(VRenderSystem.getProjectionMatrix());
+        VRenderSystem.getWorldRenderModelView().get(modelView);
+        org.joml.Matrix4f vkProjection = new org.joml.Matrix4f(VRenderSystem.getWorldRenderProjection());
         float[] projection = new float[16];
         vkProjection.get(projection);
         float[] modelViewInv = new float[16];
-        new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix()).invert().get(modelViewInv);
+        new org.joml.Matrix4f(VRenderSystem.getWorldRenderModelView()).invert().get(modelViewInv);
         float[] projectionInv = new float[16];
         new org.joml.Matrix4f(vkProjection).invert().get(projectionInv);
         float[] colorMod = {
@@ -1473,7 +2168,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                         int maxTex = ShaderpackComputeManager.MAX_SAMPLERS;
                         long[] compViews = new long[maxTex];
                         long[] compSamplers = new long[maxTex];
-                        fillFullscreenSamplerBindings(compViews, compSamplers, placeholderView, placeholderSampler);
+                        int[] compLayouts = new int[maxTex];
+                        fillFullscreenSamplerBindings(compViews, compSamplers, compLayouts, placeholderView, placeholderSampler);
 
                         // Storage images (colorimgN from G-buffer targets + custom images)
                         long[] storageImageViews = new long[ShaderpackComputeManager.MAX_STORAGE_IMAGES];
@@ -1548,11 +2244,15 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 targets = new int[]{0}; // Default: write to colortex0
             }
 
-            // ── Get/create MRT render pass and pipeline ──
-            int attachCount = targets.length;
-            long mrtRenderPass = fsTargets.getOrCreateMrtRenderPass(attachCount);
+            // ── Get/create compact MRT render pass and pipeline ──
+            // Compact mapping: attachmentCount == renderTargets.length.
+            // Fragment output layout(location=i) maps to framebuffer attachment i,
+            // which holds colortex[targets[i]].  Always ≤ maxColorAttachments.
+            int subpassColorCount = FullscreenRenderTargets.getSubpassColorCount(targets);
+            long mrtRenderPass = fsTargets.getOrCreateMrtRenderPass(targets);
 
-            BasicPipeline pipeline = getOrCreateMrtFullscreenPipeline(programId, program, mrtRenderPass, attachCount);
+            BasicPipeline pipeline = getOrCreateMrtFullscreenPipeline(
+                    programId, program, mrtRenderPass, targets, subpassColorCount);
             if (pipeline == null) continue;
 
             long vkPipeline = pipeline.getOrCreatePipeline(
@@ -1607,8 +2307,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             int maxTex = BasicPipeline.getMaxTextureBindings();
             long[] views = new long[maxTex];
             long[] samplers = new long[maxTex];
-            fillFullscreenSamplerBindings(views, samplers, placeholderView, placeholderSampler);
-            int setIdx = drawBatcher.updateDescriptorSet(frameIndex, views, samplers);
+            int[] imageLayouts = new int[maxTex];
+            fillFullscreenSamplerBindings(views, samplers, imageLayouts, placeholderView, placeholderSampler);
+            int setIdx = drawBatcher.updateDescriptorSet(frameIndex, views, samplers, imageLayouts);
 
             // ── Bind pipeline + descriptors ──
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkPipeline);
@@ -1640,8 +2341,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             long[] swapchainImages = Vulkanium.getVulkanSwapchain().getImages();
             int imageIndex = Vulkanium.getFrameOrchestrator().getCurrentImageIndex();
             if (swapchainImages != null && imageIndex >= 0 && imageIndex < swapchainImages.length) {
+                int scWidth = Vulkanium.getVulkanSwapchain().getWidth();
+                int scHeight = Vulkanium.getVulkanSwapchain().getHeight();
                 fsTargets.blitColorTarget0ToSwapchain(cmd,
-                        swapchainImages[imageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+                        swapchainImages[imageIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        scWidth, scHeight);
             }
         }
 
@@ -1664,11 +2368,14 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     }
 
     /**
-     * Gets or creates an MRT fullscreen pipeline for the given program and attachment count.
+     * Gets or creates an MRT fullscreen pipeline for the given program and target configuration.
+     * The subpassColorCount must match the subpass's colorAttachmentCount (= max_target + 1)
+     * so that the pipeline's blend state array has the correct size.
      */
     private BasicPipeline getOrCreateMrtFullscreenPipeline(ProgramId id, CompiledProgram program,
-                                                           long mrtRenderPass, int attachmentCount) {
-        String key = id.name() + "_mrt" + attachmentCount;
+                                                           long mrtRenderPass, int[] targets,
+                                                           int subpassColorCount) {
+        String key = id.name() + "_mrt" + java.util.Arrays.toString(targets);
         BasicPipeline existing = mrtPipelines.get(key);
         if (existing != null) return existing;
 
@@ -1677,18 +2384,18 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             pipeline.initializeWithModules(
                     Vulkanium.getVulkanDevice().getLogicalDevice(),
                     mrtRenderPass,
-                    "shaderpack_mrt_" + id.getSourceName() + "_" + attachmentCount,
+                    "shaderpack_mrt_" + id.getSourceName() + "_" + java.util.Arrays.toString(targets),
                     program.vertexModule,
                     program.fragmentModule,
                     VK_NULL_HANDLE,
                     DefaultVertexFormat.POSITION,
-                    attachmentCount
+                    subpassColorCount
             );
             mrtPipelines.put(key, pipeline);
             return pipeline;
         } catch (Exception e) {
-            LOGGER.warn("[FULLSCREEN] Failed to create MRT pipeline for {} (attachments={}): {}",
-                    id.getSourceName(), attachmentCount, e.getMessage());
+            LOGGER.warn("[FULLSCREEN] Failed to create MRT pipeline for {} (targets={}): {}",
+                    id.getSourceName(), java.util.Arrays.toString(targets), e.getMessage());
             return null;
         }
     }
@@ -1806,9 +2513,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     }
 
     private void fillFullscreenSamplerBindings(long[] views, long[] samplers,
+                                               int[] imageLayouts,
                                                long placeholderView, long placeholderSampler) {
         Arrays.fill(views, placeholderView);
         Arrays.fill(samplers, placeholderSampler);
+        if (imageLayouts != null) Arrays.fill(imageLayouts, 0); // 0 = default (SHADER_READ_ONLY)
 
         if (fsTargets == null || !fsTargets.isInitialized()) return;
 
@@ -1854,7 +2563,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             bindSamplerAlias(views, samplers, "gaux4", ct7.getImageView(), ct7.getSampler());
         }
 
-        // Bind depth targets
+        // Bind depth targets (these images are in DEPTH_STENCIL_READ_ONLY_OPTIMAL)
         for (int i = 0; i < FullscreenRenderTargets.MAX_DEPTH_TARGETS; i++) {
             RenderTarget depthTarget = fsTargets.getDepthTarget(i);
             if (depthTarget != null
@@ -1862,16 +2571,70 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     && depthTarget.getSampler() != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "depthtex" + i,
                         depthTarget.getImageView(), depthTarget.getSampler());
+                // Mark depth textures with correct layout for descriptor set
+                Integer depthBinding = DEFAULT_SAMPLER_BINDINGS.get("depthtex" + i);
+                if (imageLayouts != null && depthBinding != null && depthBinding >= 0 && depthBinding < imageLayouts.length) {
+                    imageLayouts[depthBinding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                }
             }
         }
         // Legacy depth alias
         RenderTarget dt0 = fsTargets.getDepthTarget(0);
         if (dt0 != null && dt0.getImageView() != VK_NULL_HANDLE) {
             bindSamplerAlias(views, samplers, "gdepthtex", dt0.getImageView(), dt0.getSampler());
+            // gdepthtex uses same binding as depthtex0, layout already set above
+        }
+
+        // ── Shadow texture bindings ──
+        // Bind shadow depth maps (shadowtex0 → binding 23, shadowtex1 → binding 24)
+        // and shadow color attachments (shadowcolor0 → binding 25, shadowcolor1 → binding 26)
+        if (shadowMap != null && shadowImagesInitialized) {
+            // shadowtex0 — main shadow depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            long stView0 = shadowMap.getMainDepthView();
+            long stSamp0 = shadowMap.getMainDepthSampler();
+            if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
+                bindSamplerAlias(views, samplers, "shadowtex0", stView0, stSamp0);
+                bindSamplerAlias(views, samplers, "shadow", stView0, stSamp0);
+                bindSamplerAlias(views, samplers, "waterShadow", stView0, stSamp0);
+                Integer st0Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex0");
+                if (imageLayouts != null && st0Binding != null && st0Binding >= 0 && st0Binding < imageLayouts.length) {
+                    imageLayouts[st0Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                }
+            }
+
+            // shadowtex1 — pre-translucent depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            long stView1 = shadowMap.getNoTranslucentsDepthView();
+            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
+            if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
+                bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
+                Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
+                if (imageLayouts != null && st1Binding != null && st1Binding >= 0 && st1Binding < imageLayouts.length) {
+                    imageLayouts[st1Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                }
+            }
+
+            // shadowcolor0..7 — shadow color attachments (if allocated)
+            for (int i = 0; i < ShadowMap.MAX_COLOR_TARGETS; i++) {
+                if (shadowMap.isColorAllocated(i)) {
+                    long scView = shadowMap.getColorView(i);
+                    long scSamp = shadowMap.getColorSampler(i);
+                    if (scView != VK_NULL_HANDLE && scSamp != VK_NULL_HANDLE) {
+                        bindSamplerAlias(views, samplers, "shadowcolor" + i, scView, scSamp);
+                    }
+                }
+            }
+        }
+
+        // ── Noise texture binding (noisetex → binding 27) ──
+        if (noiseImageView != VK_NULL_HANDLE && noiseSampler != VK_NULL_HANDLE) {
+            bindSamplerAlias(views, samplers, "noisetex", noiseImageView, noiseSampler);
         }
 
         // Also pick up any MC-bound textures (block atlas, lightmap, etc.)
-        int maxUnits = Math.min(views.length, BasicPipeline.getMaxTextureBindings());
+        // But do NOT overwrite shaderpack-managed slots (depthtex, shadowtex, shadowcolor, colortex, noisetex)
+        // since fullscreen/composite passes must use shaderpack targets, not MC GL state.
+        // We only allow MC textures to fill gtexture (0), lightmap (1), normals (2), specular (3).
+        int maxUnits = Math.min(4, Math.min(views.length, BasicPipeline.getMaxTextureBindings()));
         for (int unit = 0; unit < maxUnits; unit++) {
             int textureId = VRenderSystem.getBoundTextureId(unit);
             if (textureId <= 0) continue;
@@ -1882,6 +2645,23 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
             views[unit] = texture.getImageView();
             samplers[unit] = texture.getSampler();
+        }
+
+        // Remap MC lightmap: MC binds lightmap to GL unit 2, but shaders expect
+        // it at binding 1 (see DEFAULT_SAMPLER_BINDINGS "lightmap" → 1).
+        {
+            int lmUnit = 2; // MC's lightmap GL texture unit
+            int lmBinding = 1; // Shader binding for "lightmap"
+            int lmId = VRenderSystem.getBoundTextureId(lmUnit);
+            if (lmId > 0 && lmBinding < views.length) {
+                VulkanTexture lmTex = GlStateInterceptor.getVulkanTexture(lmId);
+                if (lmTex != null && lmTex.isAllocated()
+                        && lmTex.getImageView() != VK_NULL_HANDLE
+                        && lmTex.getSampler() != VK_NULL_HANDLE) {
+                    views[lmBinding] = lmTex.getImageView();
+                    samplers[lmBinding] = lmTex.getSampler();
+                }
+            }
         }
     }
 

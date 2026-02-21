@@ -115,6 +115,9 @@ public class Vulkanium implements ClientModInitializer {
 
     // Frame state
     private static boolean frameStarted = false;
+
+    /** Deferred startup shaderpack load: set in onWindowCreated(), consumed in onFrameBegin(). */
+    private static volatile String startupPendingPack = null;
     // Track last viewport/scissor to avoid redundant vkCmdSet calls
     private static int lastVpX = -1, lastVpY = -1, lastVpW = -1, lastVpH = -1;
     private static Boolean lastVpFlipY = null;
@@ -335,23 +338,15 @@ public class Vulkanium implements ClientModInitializer {
             // This prevents SHADERPACK mode without an active pipeline, which can
             // break non-shaderpack draw assumptions (e.g., chunk offset handling).
             if (wantsShaderpack) {
-                boolean loaded = shaderpackManager.loadPack(resolvedSelected);
-                if (loaded) {
-                    config.setRenderMode(net.vulkanium.render.RenderMode.SHADERPACK);
-                    config.shaderpackEnabled = true;
-                    config.selectedShaderpack = resolvedSelected;
-                    gameOptions.shader.enableShaderpack = true;
-                    gameOptions.shader.selectedShaderpack = resolvedSelected;
-                    LOGGER.info("Startup shaderpack active: '{}'", resolvedSelected);
-                } else {
-                    LOGGER.warn("Startup shaderpack '{}' failed to load; falling back to VANILLA mode",
-                            resolvedSelected);
-                    config.shaderpackEnabled = false;
-                    config.selectedShaderpack = "";
-                    config.setRenderMode(net.vulkanium.render.RenderMode.VANILLA);
-                    gameOptions.shader.enableShaderpack = false;
-                    gameOptions.shader.selectedShaderpack = "";
-                }
+                // Defer startup shaderpack loading until MC's screen system is ready.
+                // This allows showing ShaderpackLoadingScreen with progress + compilation detail
+                // instead of blocking the render thread silently during window creation.
+                startupPendingPack = resolvedSelected;
+                config.shaderpackEnabled = true;
+                config.selectedShaderpack = resolvedSelected;
+                gameOptions.shader.enableShaderpack = true;
+                gameOptions.shader.selectedShaderpack = resolvedSelected;
+                LOGGER.info("Startup shaderpack '{}' deferred until MC screen system ready", resolvedSelected);
                 config.save();
                 try {
                     VulkaniumGameOptions.writeToDisk(gameOptions);
@@ -582,6 +577,20 @@ public class Vulkanium implements ClientModInitializer {
 
         frameStarted = true;
 
+        // ── Deferred startup shaderpack load ──
+        // Show ShaderpackLoadingScreen once MC's screen system is ready
+        // (i.e., resource loading overlay is gone).
+        if (startupPendingPack != null) {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            if (mc != null && mc.getOverlay() == null) {
+                String pendingPack = startupPendingPack;
+                startupPendingPack = null;
+                LOGGER.info("Triggering deferred startup shaderpack load: '{}'", pendingPack);
+                mc.execute(() -> mc.setScreen(
+                        new net.vulkanium.gui.ShaderpackLoadingScreen(mc.screen, pendingPack)));
+            }
+        }
+
         // Reset draw batcher for this frame
         drawBatcher.resetFrame(frameOrchestrator.getCurrentFrame());
 
@@ -761,6 +770,14 @@ public class Vulkanium implements ClientModInitializer {
     private static final boolean DEBUG_TRANSLUCENT = Boolean.getBoolean("vulkanium.debug.translucent");
     private static final boolean DEBUG_WATER = Boolean.getBoolean("vulkanium.debug.water");
 
+    /** Partial tick captured from renderLevel for celestial uniform calculations. */
+    private static float currentPartialTick = 1.0f;
+
+    /** Returns the partial tick captured at world render start. */
+    public static float getCurrentPartialTick() {
+        return currentPartialTick;
+    }
+
     private static org.joml.Matrix4f toVulkanClipProjection(org.joml.Matrix4f glProjection) {
         return new org.joml.Matrix4f(glProjection);
     }
@@ -768,9 +785,21 @@ public class Vulkanium implements ClientModInitializer {
     /** Whether the fullscreen composite/deferred passes already executed this frame. */
     private static boolean fullscreenPassesExecuted = false;
 
-    public static void onWorldRenderStart() {
+    /**
+     * Called at renderLevel HEAD with the actual camera matrices from MC.
+     * These are the correct gbufferModelView/gbufferProjection matrices.
+     */
+    public static void onWorldRenderStart(org.joml.Matrix4f poseStackModelView,
+                                           org.joml.Matrix4f projectionMatrix,
+                                           float partialTick) {
         worldRenderActive = true;
         frameHadWorldRender = true;
+
+        // Snapshot the camera matrices from renderLevel parameters (not VRenderSystem
+        // which may not be updated yet). This matches Iris's CapturedRenderingState.
+        net.vulkanium.compat.VRenderSystem.snapshotWorldRenderMatrices(
+                poseStackModelView, projectionMatrix);
+        currentPartialTick = partialTick;
 
         // Begin MRT G-buffer pass if a shaderpack with MRT is active
         if (vulkanReady && frameStarted
@@ -779,9 +808,19 @@ public class Vulkanium implements ClientModInitializer {
                 && shaderpackManager.getActivePipeline() instanceof
                         net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline
                 && vkPipeline.isLoaded()) {
+            VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
+
+            // Run shadow pass BEFORE G-buffer — shadow uses its own depth-only render pass
+            // and must complete before the MRT pass begins so shadow textures are readable.
+            // The main render pass is always active here (started in onFrameBegin),
+            // so we must end it, run the shadow pass, then restart it.
+            mainRenderPass.end(cmd);
+            vkPipeline.renderShadowPass(cmd);
+            mainRenderPass.beginPreserve(cmd, frameOrchestrator.getCurrentImageIndex(),
+                    vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
+
             var gbuf = vkPipeline.getGBufferManager();
             if (gbuf != null) {
-                VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
                 gbuf.beginWorldPass(cmd, mainRenderPass);
             }
         }
@@ -970,12 +1009,6 @@ public class Vulkanium implements ClientModInitializer {
             if (activeTerrainLayerName.contains("translucent")
                     || activeTerrainLayerName.contains("tripwire")
                     || activeTerrainLayerName.contains("water")) {
-                // Without MRT, gbuffers_water writes packed G-buffer data to location 0
-                // instead of albedo → produces visual garbage. Fall back to vanilla
-                // translucent rendering until MRT support is implemented.
-                if (!Boolean.getBoolean("vulkanium.mrt.enabled")) {
-                    return null;
-                }
                 return net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER;
             }
             if (activeTerrainLayerName.contains("solid")) {
@@ -985,9 +1018,7 @@ public class Vulkanium implements ClientModInitializer {
 
         if (name.isEmpty()) {
             if (net.vulkanium.compat.VRenderSystem.isBlendEnabled()) {
-                return Boolean.getBoolean("vulkanium.mrt.enabled")
-                        ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER
-                        : null;
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_WATER;
             }
             return net.vulkanium.shaderpack.ProgramId.GBUFFERS_TERRAIN_SOLID;
         }
@@ -1148,6 +1179,19 @@ public class Vulkanium implements ClientModInitializer {
                 drawTextureSamplers[i] = vt.getSampler();
             }
         }
+
+        // ── Lightmap remap: MC GL unit 2 → binding 1 ──
+        // Minecraft binds the lightmap texture at GL texture unit 2, but shaderpack
+        // shaders expect it at sampler binding 1 (the "lightmap" uniform).
+        // Without this remap, binding 1 gets a white placeholder and lighting breaks.
+        int lmId = VRenderSystem.getBoundTextureId(2);
+        if (lmId > 0) {
+            VulkanTexture lmTex = GlStateInterceptor.getVulkanTexture(lmId);
+            if (lmTex != null && lmTex.isAllocated()) {
+                drawTextureViews[1] = lmTex.getImageView();
+                drawTextureSamplers[1] = lmTex.getSampler();
+            }
+        }
     }
 
     public static void recordDraw(ByteBuffer vertexData, int vertexCount,
@@ -1240,25 +1284,23 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetX = net.vulkanium.compat.VRenderSystem.getChunkOffsetX();
             float chunkOffsetY = net.vulkanium.compat.VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
-            boolean hasChunkOffset = chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f;
 
+            // ── gbufferModelView = snapshot camera MV (not per-draw GL MV) ──
+            // Iris sets gbufferModelView = poseStack.last().pose() captured once
+            // per frame at the start of renderLevel.  Using the per-draw GL
+            // model-view would include per-section chunk offset translations,
+            // causing gbufferModelViewInverse * sunPosition to give a different
+            // world-space light direction for each section → light "rotates" as
+            // the camera turns.  The chunk offset goes in iris_ChunkOffset and
+            // is applied in the vertex decode (vkm_Position + chunkOffset).
             org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(
-                    net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
-            if (hasChunkOffset) {
-                // Stabilize terrain compatibility path: apply section translation in CPU
-                // model-view
-                // and zero the explicit chunk offset uniform to avoid double application.
-                modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-                chunkOffsetX = 0.0f;
-                chunkOffsetY = 0.0f;
-                chunkOffsetZ = 0.0f;
-            }
+                    net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
 
             float[] modelView = new float[16];
             modelViewMat.get(modelView);
             float[] projection = new float[16];
             org.joml.Matrix4f glProjection = new org.joml.Matrix4f(
-                    net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
+                    net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
             glProjection.get(projection);
             float[] modelViewInv = new float[16];
             new org.joml.Matrix4f(modelViewMat).invert().get(modelViewInv);
@@ -1498,6 +1540,18 @@ public class Vulkanium implements ClientModInitializer {
         int srcAlphaVk = VRenderSystem.glToVkBlendFactor(VRenderSystem.getBlendSrcAlpha());
         int dstAlphaVk = VRenderSystem.glToVkBlendFactor(VRenderSystem.getBlendDstAlpha());
         int depthOpVk = VRenderSystem.glToVkDepthFunc(VRenderSystem.getDepthFunc());
+
+        // ── Safety net: force alpha blend ON for water/translucent draws ──
+        // MC's RenderType.translucent() calls enableBlend() via GL state, but if
+        // the mixin intercept missed it or blend was disabled between setupRenderState()
+        // and the actual draw call, water becomes fully transparent.
+        if (isWaterDraw && !blend) {
+            blend = true;
+            srcColorVk = org.lwjgl.vulkan.VK10.VK_BLEND_FACTOR_SRC_ALPHA;
+            dstColorVk = org.lwjgl.vulkan.VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            srcAlphaVk = org.lwjgl.vulkan.VK10.VK_BLEND_FACTOR_ONE;
+            dstAlphaVk = org.lwjgl.vulkan.VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        }
 
         long vkPipeline = pipeline.getOrCreatePipeline(blend, depth, depthWrite, cull,
                 org.lwjgl.vulkan.VK10.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,

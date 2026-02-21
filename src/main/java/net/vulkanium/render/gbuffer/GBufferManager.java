@@ -84,6 +84,9 @@ public class GBufferManager {
     private boolean initialized = false;
     private boolean worldPassActive = false;
 
+    /** Stored per-target settings for clear colors and other properties. */
+    private RenderTargetSettings renderTargetSettings;
+
     // ═══════════════════════════════════════════════════════════════
     //  Initialization
     // ═══════════════════════════════════════════════════════════════
@@ -111,6 +114,7 @@ public class GBufferManager {
         this.width = width;
         this.height = height;
         this.depthFormat = swapchainDepthFormat;
+        this.renderTargetSettings = settings;
 
         // Always include colortex0 (the main color target)
         allGbufferTargets.add(0);
@@ -123,9 +127,10 @@ public class GBufferManager {
         this.colorAttachmentCount = usedColorTargets.length;
 
         // subpassColorRefCount = max colortex index + 1 (so fragment shader can use
-        // layout(location = colortexIndex) directly, with VK_ATTACHMENT_UNUSED for gaps)
+        // layout(location = colortexIndex) directly, with VK_ATTACHMENT_UNUSED for gaps).
+        // GBuffer programs always use colortex 0-7, so this never exceeds maxColorAttachments (8).
         this.subpassColorRefCount = usedColorTargets.length > 0
-                ? usedColorTargets[usedColorTargets.length - 1] + 1
+                ? Math.min(usedColorTargets[usedColorTargets.length - 1] + 1, 8)
                 : 1;
 
         // Build the colortex → attachment index mapping
@@ -241,6 +246,7 @@ public class GBufferManager {
 
             // Subpass: color references use VK_ATTACHMENT_UNUSED for gap indices
             // so that fragment shader layout(location=N) maps to colortex N directly.
+            // GBuffer targets are always 0-7, so subpassColorRefCount <= 8.
             VkAttachmentReference.Buffer colorRefs =
                     VkAttachmentReference.calloc(subpassColorRefCount, stack);
             for (int loc = 0; loc < subpassColorRefCount; loc++) {
@@ -363,11 +369,18 @@ public class GBufferManager {
             int totalAttachments = colorAttachmentCount + 1;
             VkClearValue.Buffer clearValues = VkClearValue.calloc(totalAttachments, stack);
             for (int i = 0; i < colorAttachmentCount; i++) {
+                int colortexIdx = usedColorTargets[i];
+                // Use per-target clear colors from shaderpack settings.
+                // Default is (0,0,0,0) — alpha=0 is critical for shaderpacks
+                // that check alpha to distinguish sky pixels from geometry.
+                float[] cc = (renderTargetSettings != null)
+                        ? renderTargetSettings.getColorSettings(colortexIdx).getClearColor()
+                        : new float[]{0.0f, 0.0f, 0.0f, 0.0f};
                 clearValues.get(i).color()
-                        .float32(0, 0.0f)
-                        .float32(1, 0.0f)
-                        .float32(2, 0.0f)
-                        .float32(3, 1.0f);
+                        .float32(0, cc.length > 0 ? cc[0] : 0.0f)
+                        .float32(1, cc.length > 1 ? cc[1] : 0.0f)
+                        .float32(2, cc.length > 2 ? cc[2] : 0.0f)
+                        .float32(3, cc.length > 3 ? cc[3] : 0.0f);
             }
             clearValues.get(colorAttachmentCount).depthStencil()
                     .depth(1.0f)

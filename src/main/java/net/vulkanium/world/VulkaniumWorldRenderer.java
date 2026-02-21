@@ -358,6 +358,11 @@ public class VulkaniumWorldRenderer {
         this.chunkRenderer = renderer;
     }
 
+    /** Returns the chunk renderer, or null if world is not loaded. */
+    public ChunkRenderer getChunkRenderer() {
+        return chunkRenderer;
+    }
+
     public static void shutdown() {
         if (instance != null) {
             instance.onWorldUnload();
