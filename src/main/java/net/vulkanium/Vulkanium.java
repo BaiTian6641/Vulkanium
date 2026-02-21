@@ -285,6 +285,23 @@ public class Vulkanium implements ClientModInitializer {
                                 rtRenderer.getRTOutputSampler());
                     }
                 }
+
+                // Resize shaderpack G-buffer and invalidate fullscreen targets
+                // so they get lazily recreated at the new swapchain dimensions.
+                if (shaderpackManager != null
+                        && shaderpackManager.getActivePipeline() instanceof
+                                net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline
+                        && vkPipeline.isLoaded()) {
+                    int newW = vulkanSwapchain.getWidth();
+                    int newH = vulkanSwapchain.getHeight();
+                    var gbuf = vkPipeline.getGBufferManager();
+                    if (gbuf != null && gbuf.isInitialized()) {
+                        gbuf.ensureSize(newW, newH);
+                    }
+                    // Force fsTargets to be recreated at new size on next frame
+                    vkPipeline.invalidateFullscreenTargets();
+                    LOGGER.info("Resized shaderpack render targets to {}x{}", newW, newH);
+                }
             });
 
             vulkanReady = true;
@@ -761,6 +778,8 @@ public class Vulkanium implements ClientModInitializer {
     private static final int MAX_TEXTURE_BINDINGS = BasicPipeline.getMaxTextureBindings();
     private static final long[] drawTextureViews = new long[MAX_TEXTURE_BINDINGS];
     private static final long[] drawTextureSamplers = new long[MAX_TEXTURE_BINDINGS];
+    /** Per-texture image layout overrides (0 = default SHADER_READ_ONLY, non-zero = explicit layout). */
+    private static final int[] drawImageLayouts = new int[MAX_TEXTURE_BINDINGS];
     private static final Set<String> loggedShaderpackSelections = new HashSet<>();
     private static final Set<String> loggedShaderpackMappingMisses = new HashSet<>();
     private static volatile boolean worldRenderActive = false;
@@ -821,10 +840,6 @@ public class Vulkanium implements ClientModInitializer {
 
             var gbuf = vkPipeline.getGBufferManager();
             if (gbuf != null) {
-                // Ensure G-buffer dimensions match current swapchain size
-                // (fsTargets are resized in prepareFullscreenInputs, but G-buffer
-                //  must match BEFORE the world pass begins rendering into it)
-                gbuf.ensureSize(vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
                 gbuf.beginWorldPass(cmd, mainRenderPass);
             }
         }
@@ -993,17 +1008,21 @@ public class Vulkanium implements ClientModInitializer {
                         ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_HAND_WATER
                         : net.vulkanium.shaderpack.ProgramId.GBUFFERS_HAND;
             }
-            // Route specific render types to their dedicated shaderpack programs
-            if (name.startsWith("rendertype_eyes")) {
-                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_SPIDEREYES;
-            }
+            // Route entity draws through shaderpack entity pipeline.
+            // Glint/armor_glint use the dedicated armor_glint program;
+            // eyes (spider, enderman, phantom) use entities_glowing;
+            // translucent entities use entities_translucent;
+            // all other entities use the base entities program.
             if (name.startsWith("rendertype_glint") || name.contains("armor_glint")) {
                 return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ARMOR_GLINT;
             }
-            // Standard entity rendering through shaderpack pipeline
-            return name.contains("translucent")
-                    ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES_TRANSLUCENT
-                    : net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES;
+            if (name.startsWith("rendertype_eyes")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES_GLOWING;
+            }
+            if (name.contains("translucent")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES_TRANSLUCENT;
+            }
+            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES;
         }
 
         if (!isTerrainLikeFormat(format)) {
@@ -1179,6 +1198,7 @@ public class Vulkanium implements ClientModInitializer {
         for (int i = 0; i < MAX_TEXTURE_BINDINGS; i++) {
             drawTextureViews[i] = placeholderImageView;
             drawTextureSamplers[i] = placeholderSampler;
+            drawImageLayouts[i] = 0; // default: SHADER_READ_ONLY_OPTIMAL
 
             int boundTexId = VRenderSystem.getBoundTextureId(i);
             if (boundTexId <= 0)
@@ -1202,6 +1222,18 @@ public class Vulkanium implements ClientModInitializer {
                 drawTextureViews[1] = lmTex.getImageView();
                 drawTextureSamplers[1] = lmTex.getSampler();
             }
+        }
+
+        // ── Shaderpack texture bindings for gbuffers draws ──
+        // Shadow, noise, and other shaderpack-managed textures must be bound for
+        // gbuffers programs (terrain, sky, entities), not just fullscreen passes.
+        // Without this, the shader samples from placeholder textures → broken shadows.
+        if (getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                && shaderpackManager != null
+                && shaderpackManager.getActivePipeline()
+                    instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipe) {
+            vkPipe.populateShaderpackTexturesForGbuffers(drawTextureViews, drawTextureSamplers,
+                    drawImageLayouts, placeholderImageView, placeholderSampler);
         }
     }
 
@@ -1296,28 +1328,29 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetY = net.vulkanium.compat.VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
 
-            // ── gbufferModelView vs per-draw GL ModelView ──
-            // Iris has TWO matrix paths:
-            //   gbufferModelView = camera-only snapshot (captured once per frame)
-            //   gl_ModelViewMatrix (iris_ModelViewMatrix) = per-draw GL MV
+            // ── Model-view matrix selection ──
+            // For sky programs (sun, moon, stars, sky dome, clouds), use the per-draw
+            // GL model-view matrix which includes MC's celestial rotations applied
+            // inside renderSky() (rotateY(-90°), rotateX(skyAngle*360°), etc.).
+            // Without this, the sky geometry rotates with the player's view.
             //
-            // For terrain draws (hasChunkOffset), the per-draw GL MV includes
-            // per-section chunk offset translations which would break
-            // gbufferModelViewInverse * sunPosition.  So we use the snapshot.
-            //
-            // For sky/entity draws (!hasChunkOffset), MC sets the per-draw GL MV
-            // to include sky-specific rotations (celestial body angling, etc).
-            // Using the snapshot would lock the sky to the camera → sky follows
-            // the player instead of staying fixed in world space.
+            // For terrain/entity programs, use the per-frame snapshot to avoid
+            // per-section chunk offset translations leaking into the matrix.
+            // The chunk offset goes in iris_ChunkOffset instead.
+            boolean isSkyDraw = pipeline.getName().contains("sky")
+                    || pipeline.getName().contains("sun")
+                    || pipeline.getName().contains("moon")
+                    || pipeline.getName().contains("star")
+                    || pipeline.getName().contains("cloud");
             org.joml.Matrix4f modelViewMat;
-            if (net.vulkanium.compat.VRenderSystem.hasChunkOffset()) {
-                // Terrain: use captured camera-only MV (chunk offset in iris_ChunkOffset)
-                modelViewMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
-            } else {
-                // Sky / entity / particle: use per-draw GL MV with proper rotations
+            if (isSkyDraw) {
+                // Per-draw GL model-view includes celestial PoseStack rotations
                 modelViewMat = new org.joml.Matrix4f(
                         net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+            } else {
+                // Per-frame snapshot for terrain (avoids chunk offset in matrix)
+                modelViewMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
             }
 
             float[] modelView = new float[16];
@@ -1357,7 +1390,7 @@ public class Vulkanium implements ClientModInitializer {
         populateBoundTexturesForDraw();
 
         // Update descriptor set for this draw with all bound shader texture slots
-        int setIdx = drawBatcher.updateDescriptorSet(frameIndex, drawTextureViews, drawTextureSamplers);
+        int setIdx = drawBatcher.updateDescriptorSet(frameIndex, drawTextureViews, drawTextureSamplers, drawImageLayouts);
 
         // Bind pipeline with per-draw blend/depth state (GL→VK conversion)
         boolean blend = net.vulkanium.compat.VRenderSystem.isBlendEnabled();
@@ -1542,7 +1575,7 @@ public class Vulkanium implements ClientModInitializer {
         }
 
         // Update descriptor set
-        int setIdx = drawBatcher.updateDescriptorSet(frameIndex, drawTextureViews, drawTextureSamplers);
+        int setIdx = drawBatcher.updateDescriptorSet(frameIndex, drawTextureViews, drawTextureSamplers, drawImageLayouts);
 
         // Bind pipeline with per-draw blend/depth state (GL→VK conversion)
         boolean blend = VRenderSystem.isBlendEnabled();
