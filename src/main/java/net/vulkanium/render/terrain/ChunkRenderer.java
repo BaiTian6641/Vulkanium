@@ -501,13 +501,129 @@ public class ChunkRenderer {
     }
 
     /**
-     * Records draw commands for shadow rendering with the already-bound shadow pipeline.
-     * Does not rebind the pipeline (it's already bound in recordShadowLayers).
+     * Records draw commands for shadow rendering, issuing per-section draws
+     * with proper chunk offset. The MDI approach cannot be used here because
+     * vertex positions in VBOs are section-relative (0-16 range) and each
+     * section needs its own chunk offset to position it correctly in shadow space.
+     *
+     * <p>Without per-section chunk offset, all terrain sections would be rendered
+     * at the origin → overlapping → broken shadow map → everything in shadow.</p>
      */
     private void recordShadowRegions(VkCommandBuffer cmd, TerrainPassType passType) {
+        DrawBatcher drawBatcher = Vulkanium.getDrawBatcher();
+        if (drawBatcher == null || shadowTerrainPipelineLayout == 0) return;
+
+        int frameIndex = Vulkanium.getFrameOrchestrator().getCurrentFrame();
+
+        // Shadow matrices (already computed by ShadowRenderer.renderShadows() step 2)
+        Matrix4f shadowMV = ShadowRenderer.MODELVIEW;
+        Matrix4f shadowProj = ShadowRenderer.PROJECTION;
+        float[] modelView = new float[16];
+        float[] modelViewInv = new float[16];
+        float[] projection = new float[16];
+        float[] projectionInv = new float[16];
+        shadowMV.get(modelView);
+        new Matrix4f(shadowMV).invert().get(modelViewInv);
+        shadowProj.get(projection);
+        new Matrix4f(shadowProj).invert().get(projectionInv);
+
+        float[] colorMod = {1.0f, 1.0f, 1.0f, 1.0f};
+        float[] fogParams = {1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 10000.0f};
+
+        // Get camera position for computing camera-relative chunk offsets
+        double camX = 0, camY = 0, camZ = 0;
+        try {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            if (mc != null && mc.gameRenderer != null && mc.gameRenderer.getMainCamera() != null) {
+                net.minecraft.world.phys.Vec3 cam = mc.gameRenderer.getMainCamera().getPosition();
+                camX = cam.x;
+                camY = cam.y;
+                camZ = cam.z;
+            }
+        } catch (Exception ignored) {}
+
+        // Prepare sampler arrays (shared across all section draws)
+        int maxTex = BasicPipeline.getMaxTextureBindings();
+        long placeholderView = Vulkanium.getPlaceholderImageView();
+        long placeholderSampler = Vulkanium.getPlaceholderSampler();
+        long[] views = new long[maxTex];
+        long[] samplers = new long[maxTex];
+        Arrays.fill(views, placeholderView);
+        Arrays.fill(samplers, placeholderSampler);
+
+        // Bind block atlas at gtexture for cutout alpha testing
+        int atlasId = VRenderSystem.getBoundTextureId(0);
+        if (atlasId > 0) {
+            VulkanTexture atlasTex = GlStateInterceptor.getVulkanTexture(atlasId);
+            if (atlasTex != null && atlasTex.isAllocated()
+                    && atlasTex.getImageView() != VK_NULL_HANDLE
+                    && atlasTex.getSampler() != VK_NULL_HANDLE) {
+                views[0] = atlasTex.getImageView();
+                samplers[0] = atlasTex.getSampler();
+            }
+        }
+        // Lightmap at binding 1
+        int lmId = VRenderSystem.getBoundTextureId(2);
+        if (lmId > 0) {
+            VulkanTexture lmTex = GlStateInterceptor.getVulkanTexture(lmId);
+            if (lmTex != null && lmTex.isAllocated()
+                    && lmTex.getImageView() != VK_NULL_HANDLE
+                    && lmTex.getSampler() != VK_NULL_HANDLE) {
+                views[1] = lmTex.getImageView();
+                samplers[1] = lmTex.getSampler();
+            }
+        }
+
+        // Per-section draws with proper chunk offset
         for (net.vulkanium.render.terrain.region.RenderRegion region : regionManager.getActiveRegions()) {
             if (region.isEmpty()) continue;
-            net.vulkanium.render.terrain.region.RegionDrawBatch.buildAndDraw(cmd, region, passType);
+
+            net.vulkanium.render.terrain.region.RegionGPUBuffers buffers = region.getPassBuffers(passType);
+            if (buffers == null || !buffers.hasGeometry()) continue;
+
+            // Bind vertex/index buffers once per region
+            long[] vertexBuffers = {buffers.getVertexBuffer()};
+            long[] offsets = {0L};
+            org.lwjgl.vulkan.VK10.vkCmdBindVertexBuffers(cmd, 0, vertexBuffers, offsets);
+            org.lwjgl.vulkan.VK10.vkCmdBindIndexBuffer(cmd, buffers.getIndexBuffer(), 0,
+                    org.lwjgl.vulkan.VK10.VK_INDEX_TYPE_UINT32);
+
+            for (int i = 0; i < net.vulkanium.render.terrain.region.RenderRegion.SECTION_COUNT; i++) {
+                net.vulkanium.render.terrain.section.RenderSection section = region.getSection(i);
+                if (section == null) continue;
+                if (!section.getVisibility().isFrustumVisible()) continue;
+                if (section.getBuildState() != net.vulkanium.render.terrain.section.RenderSection.SectionBuildState.READY) continue;
+
+                net.vulkanium.render.terrain.section.RenderSection.PassGPUSlot gpu = section.getGPUSlot(passType);
+                if (gpu == null || !gpu.hasGeometry()) continue;
+
+                // Compute camera-relative chunk offset for this section
+                // Vertex positions in VBO are section-local [0, 16), so we need
+                // to translate by (sectionBlockPos - cameraPos)
+                float[] chunkOffset = {
+                        (float) (section.getBlockX() - camX),
+                        (float) (section.getBlockY() - camY),
+                        (float) (section.getBlockZ() - camZ)
+                };
+
+                // Upload UBO with per-section chunk offset
+                int uboOffset = drawBatcher.uploadUniformsShaderpack(frameIndex,
+                        modelView, modelViewInv, projection, projectionInv,
+                        colorMod, fogParams, null, chunkOffset);
+
+                int setIdx = drawBatcher.updateDescriptorSet(frameIndex, views, samplers);
+                drawBatcher.bindDescriptorSet(cmd, shadowTerrainPipelineLayout, setIdx, uboOffset);
+
+                // Issue per-section indexed draw
+                int firstIndex = (int) (gpu.indexOffset() / 4);
+                int vertexOffset = (int) (gpu.vertexOffset() / net.vulkanium.render.terrain.ChunkVertexFormat.STRIDE);
+                org.lwjgl.vulkan.VK10.vkCmdDrawIndexed(cmd,
+                        gpu.indexCount(),   // indexCount
+                        1,                  // instanceCount
+                        firstIndex,         // firstIndex
+                        vertexOffset,       // vertexOffset
+                        0);                 // firstInstance
+            }
         }
     }
 

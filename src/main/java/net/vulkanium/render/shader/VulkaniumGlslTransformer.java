@@ -900,8 +900,11 @@ public class VulkaniumGlslTransformer {
                     vec4 iris_HeldItems;                    // offset 1232 (heldItemId, heldBlockLight, heldItemId2, heldBlockLight2)
                     vec4 iris_BiomeData;                    // offset 1248 (biome, precipitation, category, 0)
                     vec4 iris_AlphaTestRef;                 // offset 1264 (alphaRef, 0, 0, 0)
-                    // 16 more vec4 padding to 2048
-                    vec4 iris_Reserved[16];                 // offset 1280-2048
+                    // HDR + GBuffer matrices (offset 1280-1439)
+                    vec4 iris_HdrParams;                    // offset 1280
+                    vec4 iris_HdrDisplay;                   // offset 1296
+                    mat4 iris_GBufferModelView;             // offset 1312 (per-frame camera-only)
+                    mat4 iris_GBufferModelViewInverse;      // offset 1376 (inverse of above)
                 };
                 """;
 
@@ -920,8 +923,8 @@ public class VulkaniumGlslTransformer {
 
     static {
         // Matrices
-        UNIFORM_MAP.put("gbufferModelView", "iris_ModelViewMatrix");
-        UNIFORM_MAP.put("gbufferModelViewInverse", "iris_ModelViewMatrixInverse");
+        UNIFORM_MAP.put("gbufferModelView", "iris_GBufferModelView");
+        UNIFORM_MAP.put("gbufferModelViewInverse", "iris_GBufferModelViewInverse");
         UNIFORM_MAP.put("gbufferProjection", "iris_ProjectionMatrix");
         UNIFORM_MAP.put("gbufferProjectionInverse", "iris_ProjectionMatrixInverse");
         UNIFORM_MAP.put("modelViewMatrix", "iris_ModelViewMatrix");

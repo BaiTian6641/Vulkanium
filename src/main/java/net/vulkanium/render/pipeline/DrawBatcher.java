@@ -503,6 +503,23 @@ public class DrawBatcher {
             MemoryUtil.memPutFloat(fogColorPtr + i * 4L, fogParams[i]);
         }
 
+        // ── Sky color (offset 864): vec4(r, g, b, 1) ──
+        // Previously never written — shaderpacks reading skyColor got (0,0,0) = black.
+        try {
+            net.minecraft.client.Minecraft mcSky = net.minecraft.client.Minecraft.getInstance();
+            if (mcSky != null && mcSky.level != null && mcSky.gameRenderer != null
+                    && mcSky.gameRenderer.getMainCamera() != null) {
+                net.minecraft.world.phys.Vec3 camPos = mcSky.gameRenderer.getMainCamera().getPosition();
+                float partialTick = net.vulkanium.Vulkanium.getCurrentPartialTick();
+                net.minecraft.world.phys.Vec3 sky = mcSky.level.getSkyColor(camPos, partialTick);
+                long skyPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SKY_COLOR;
+                MemoryUtil.memPutFloat(skyPtr, (float) sky.x);
+                MemoryUtil.memPutFloat(skyPtr + 4, (float) sky.y);
+                MemoryUtil.memPutFloat(skyPtr + 8, (float) sky.z);
+                MemoryUtil.memPutFloat(skyPtr + 12, 1.0f);
+            }
+        } catch (Exception ignored) {}
+
         // Write fog params (offset 1072): start, end, density, shape
         long fogRangePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_FOG_PARAMS;
         MemoryUtil.memPutFloat(fogRangePtr, fogParams.length > 4 ? fogParams[4] : 0.0f);       // FogStart
@@ -707,6 +724,25 @@ public class DrawBatcher {
             MemoryUtil.memPutFloat(upPtr + 4, upPos.y);
             MemoryUtil.memPutFloat(upPtr + 8, upPos.z);
             MemoryUtil.memPutFloat(upPtr + 12, 0.0f);
+
+            // ── GBuffer ModelView (offset 1312, 1376): per-frame camera-only matrix ──
+            // In Iris, gbufferModelView is the per-frame camera matrix (no per-draw
+            // celestial/chunk rotations), while gl_ModelViewMatrix is the per-draw
+            // matrix. Shaderpacks use gbufferModelView for screen-space calculations
+            // (e.g., reconstructing world position from depth). Writing the per-frame
+            // snapshot here ensures sky shaders get the correct camera-only matrix
+            // for gbufferModelView while still receiving the per-draw matrix via
+            // iris_ModelViewMatrix (gl_ModelViewMatrix) at offset 0.
+            float[] gbufMV = new float[16];
+            mvMat.get(gbufMV);
+            float[] gbufMVInv = new float[16];
+            new org.joml.Matrix4f(mvMat).invert().get(gbufMVInv);
+            long gbufMVPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_GBUFFER_MODEL_VIEW;
+            long gbufMVInvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_GBUFFER_MODEL_VIEW_INV;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(gbufMVPtr + i * 4L, gbufMV[i]);
+                MemoryUtil.memPutFloat(gbufMVInvPtr + i * 4L, gbufMVInv[i]);
+            }
         }
 
         // ── Shadow matrices (offsets 384, 448, 512, 576) ──

@@ -118,6 +118,12 @@ public class UniformBridge {
     /** vec4: (hdrWhitePointX, hdrWhitePointY, minLuminance, reserved) */
     public static final int OFF_HDR_DISPLAY             = 1296;
 
+    // ── GBuffer ModelView (per-frame camera-only matrix, separate from per-draw gl_ModelViewMatrix) ──
+    /** mat4: gbufferModelView — per-frame snapshot without per-draw celestial/chunk rotations */
+    public static final int OFF_GBUFFER_MODEL_VIEW      = 1312;
+    /** mat4: gbufferModelViewInverse — inverse of the per-frame snapshot */
+    public static final int OFF_GBUFFER_MODEL_VIEW_INV  = 1376;
+
     // ── Double-buffered UBOs ──
     private final long[] uboBuffers = new long[2];
     private final long[] uboAllocations = new long[2];

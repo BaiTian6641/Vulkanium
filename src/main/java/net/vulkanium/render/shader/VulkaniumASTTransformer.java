@@ -89,8 +89,8 @@ public class VulkaniumASTTransformer {
     private static final Map<String, String> UNIFORM_REMAP = new LinkedHashMap<>();
     static {
         // Matrices
-        UNIFORM_REMAP.put("gbufferModelView", "iris_ModelViewMatrix");
-        UNIFORM_REMAP.put("gbufferModelViewInverse", "iris_ModelViewMatrixInverse");
+        UNIFORM_REMAP.put("gbufferModelView", "iris_GBufferModelView");
+        UNIFORM_REMAP.put("gbufferModelViewInverse", "iris_GBufferModelViewInverse");
         UNIFORM_REMAP.put("gbufferProjection", "iris_ProjectionMatrix");
         UNIFORM_REMAP.put("gbufferProjectionInverse", "iris_ProjectionMatrixInverse");
         UNIFORM_REMAP.put("gbufferPreviousModelView", "iris_PreviousModelViewMatrix");
@@ -282,7 +282,10 @@ public class VulkaniumASTTransformer {
                 vec4 iris_HeldItems;
                 vec4 iris_BiomeData;
                 vec4 iris_AlphaTestRef;
-                vec4 iris_Reserved[16];
+                vec4 iris_HdrParams;
+                vec4 iris_HdrDisplay;
+                mat4 iris_GBufferModelView;
+                mat4 iris_GBufferModelViewInverse;
             };
             """;
 

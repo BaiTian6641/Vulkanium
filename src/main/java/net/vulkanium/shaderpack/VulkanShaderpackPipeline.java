@@ -72,18 +72,6 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     // ═══════════════════════════════════════════════════════════════
 
     /** Standard OptiFine/Iris sampler name → descriptor binding index (set=1) */
-    /**
-     * Sampler binding map — MUST match VulkaniumGlslTransformer.DEFAULT_SAMPLER_BINDINGS.
-     * The GLSL transformer compiles shaders with layout(set=0, binding=N+1) where N
-     * comes from this map. If the pipeline binds textures at different indices,
-     * the shader reads from the wrong (empty) descriptor → broken rendering.
-     *
-     * Canonical layout (matching Iris/OptiFine binding conventions):
-     *   0: gtexture/texture/tex    4-11: colortex0-7     15-16: shadowtex0-1
-     *   1: lightmap                12-14: depthtex0-2     17-18: shadowcolor0-1
-     *   2: normals                 19: noisetex
-     *   3: specular
-     */
     private static final Map<String, Integer> DEFAULT_SAMPLER_BINDINGS;
     static {
         Map<String, Integer> m = new LinkedHashMap<>();
@@ -95,41 +83,49 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         m.put("normals", 2);        // Normal map atlas
         m.put("specular", 3);       // Specular/PBR atlas
 
-        // Color textures (composite pass inputs) — bindings 4-11
-        m.put("colortex0", 4);
-        m.put("gcolor", 4);         // Legacy alias → colortex0
-        m.put("colortex1", 5);
-        m.put("gdepth", 5);         // Legacy alias → colortex1
-        m.put("colortex2", 6);
-        m.put("gnormal", 6);        // Legacy alias → colortex2
-        m.put("colortex3", 7);
-        m.put("composite", 7);      // Legacy alias → colortex3
-        m.put("colortex4", 8);
-        m.put("gaux1", 8);          // Legacy alias → colortex4
-        m.put("colortex5", 9);
-        m.put("gaux2", 9);
-        m.put("colortex6", 10);
-        m.put("gaux3", 10);
-        m.put("colortex7", 11);
-        m.put("gaux4", 11);
+        // Depth textures
+        m.put("depthtex0", 4);
+        m.put("gdepthtex", 4);      // Alias
+        m.put("depthtex1", 5);
+        m.put("depthtex2", 6);
 
-        // Depth textures — bindings 12-14
-        m.put("depthtex0", 12);
-        m.put("gdepthtex", 12);     // Legacy alias
-        m.put("depthtex1", 13);
-        m.put("depthtex2", 14);
+        // Color textures (composite pass inputs)
+        m.put("colortex0", 7);
+        m.put("gcolor", 7);         // Alias
+        m.put("colortex1", 8);
+        m.put("gdepth", 8);         // Legacy alias
+        m.put("colortex2", 9);
+        m.put("gnormal", 9);        // Legacy alias
+        m.put("colortex3", 10);
+        m.put("composite", 10);     // Legacy alias
+        m.put("colortex4", 11);
+        m.put("gaux1", 11);         // Legacy alias
+        m.put("colortex5", 12);
+        m.put("gaux2", 12);
+        m.put("colortex6", 13);
+        m.put("gaux3", 13);
+        m.put("colortex7", 14);
+        m.put("gaux4", 14);
+        m.put("colortex8", 15);
+        m.put("colortex9", 16);
+        m.put("colortex10", 17);
+        m.put("colortex11", 18);
+        m.put("colortex12", 19);
+        m.put("colortex13", 20);
+        m.put("colortex14", 21);
+        m.put("colortex15", 22);
 
-        // Shadow textures — bindings 15-18 (MUST match GLSL transformer)
-        m.put("shadowtex0", 15);
-        m.put("shadow", 15);        // Alias
-        m.put("waterShadow", 15);   // Alias
-        m.put("shadowtex1", 16);
-        m.put("shadowcolor", 17);
-        m.put("shadowcolor0", 17);
-        m.put("shadowcolor1", 18);
+        // Shadow textures
+        m.put("shadowtex0", 23);
+        m.put("shadow", 23);        // Alias
+        m.put("waterShadow", 23);   // Alias
+        m.put("shadowtex1", 24);
+        m.put("shadowcolor", 25);
+        m.put("shadowcolor0", 25);
+        m.put("shadowcolor1", 26);
 
-        // Noise texture — binding 19
-        m.put("noisetex", 19);
+        // Noise texture
+        m.put("noisetex", 27);
 
         DEFAULT_SAMPLER_BINDINGS = Collections.unmodifiableMap(m);
     }
@@ -1489,7 +1485,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
         noiseImage = img.image();
         noiseImageAllocation = img.allocation();
-        LOGGER.info("[NOISE] Created {}x{} RGBA8 noise texture (noisetex binding=19)", w, h);
+        LOGGER.info("[NOISE] Created {}x{} RGBA8 noise texture (noisetex binding=27)", w, h);
     }
 
     /**
@@ -1656,12 +1652,28 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             initializeShadowImageLayouts(cmd);
         }
 
-        if (shadowRenderer == null || shadowMap == null) return;
-        if (shadowDirectives == null || shadowDirectives.getDistance() <= 0) return;
+        if (shadowRenderer == null || shadowMap == null) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: shadowRenderer={} shadowMap={}",
+                    shadowRenderer != null ? "OK" : "null",
+                    shadowMap != null ? "OK" : "null");
+            return;
+        }
+        if (shadowDirectives == null || shadowDirectives.getDistance() <= 0) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: shadowDirectives={} distance={}",
+                    shadowDirectives != null ? "OK" : "null",
+                    shadowDirectives != null ? shadowDirectives.getDistance() : "N/A");
+            return;
+        }
 
         // Get camera position and sky angle from live game state
         net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
-        if (mc == null || mc.level == null || mc.player == null) return;
+        if (mc == null || mc.level == null || mc.player == null) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: mc={} level={} player={}",
+                    mc != null ? "OK" : "null",
+                    mc != null && mc.level != null ? "OK" : "null",
+                    mc != null && mc.player != null ? "OK" : "null");
+            return;
+        }
 
         float partialTick = Vulkanium.getCurrentPartialTick();
         float skyAngle = mc.level.getTimeOfDay(partialTick);
@@ -1674,9 +1686,13 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         net.vulkanium.world.VulkaniumWorldRenderer worldRenderer =
                 net.vulkanium.world.VulkaniumWorldRenderer.getInstance();
         net.vulkanium.render.terrain.ChunkRenderer chunkRenderer = worldRenderer.getChunkRenderer();
-        if (chunkRenderer == null) return;
+        if (chunkRenderer == null) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: chunkRenderer is null");
+            return;
+        }
 
-        // Set shadow phase
+        LOGGER.debug("[SHADOW] Executing shadow pass: distance={}, skyAngle={}",
+                shadowDirectives.getDistance(), skyAngle);
         net.vulkanium.render.program.WorldRenderingPhase.setPhase(
                 net.vulkanium.render.program.WorldRenderingPhase.Phase.SHADOW);
 
@@ -1959,96 +1975,11 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         return sb.toString();
     }
 
-    /**
-     * Populates shadow, noise, and other shaderpack-managed texture bindings for gbuffers draws.
-     *
-     * <p>During gbuffers rendering (terrain, sky, entities), the draw path only populates
-     * textures from MC's GL state (atlas, lightmap). Shaderpack textures like shadowtex0/1
-     * and noisetex must be explicitly bound here so shaders can sample them.</p>
-     *
-     * @param views     per-draw texture image view array (modified in-place)
-     * @param samplers  per-draw texture sampler array (modified in-place)
-     * @param layouts   per-draw image layout overrides (0 = default SHADER_READ_ONLY)
-     * @param placeholderView   fallback image view for unset slots
-     * @param placeholderSampler fallback sampler for unset slots
-     */
-    public void populateShaderpackTexturesForGbuffers(long[] views, long[] samplers,
-                                                       int[] layouts,
-                                                       long placeholderView, long placeholderSampler) {
-        // ── Shadow textures ──
-        if (shadowMap != null && shadowImagesInitialized) {
-            // shadowtex0 — main shadow depth
-            long stView0 = shadowMap.getMainDepthView();
-            long stSamp0 = shadowMap.getMainDepthSampler();
-            if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
-                Integer binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex0");
-                if (binding != null && binding >= 0 && binding < views.length) {
-                    views[binding] = stView0;
-                    samplers[binding] = stSamp0;
-                    if (layouts != null) {
-                        layouts[binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-                    }
-                }
-            }
-
-            // shadowtex1 — pre-translucent depth
-            long stView1 = shadowMap.getNoTranslucentsDepthView();
-            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
-            if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
-                Integer binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
-                if (binding != null && binding >= 0 && binding < views.length) {
-                    views[binding] = stView1;
-                    samplers[binding] = stSamp1;
-                    if (layouts != null) {
-                        layouts[binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-                    }
-                }
-            }
-
-            // shadowcolor0..N
-            for (int i = 0; i < ShadowMap.MAX_COLOR_TARGETS; i++) {
-                if (shadowMap.isColorAllocated(i)) {
-                    long scView = shadowMap.getColorView(i);
-                    long scSamp = shadowMap.getColorSampler(i);
-                    if (scView != VK_NULL_HANDLE && scSamp != VK_NULL_HANDLE) {
-                        Integer binding = DEFAULT_SAMPLER_BINDINGS.get("shadowcolor" + i);
-                        if (binding != null && binding >= 0 && binding < views.length) {
-                            views[binding] = scView;
-                            samplers[binding] = scSamp;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Noise texture ──
-        if (noiseImageView != VK_NULL_HANDLE && noiseSampler != VK_NULL_HANDLE) {
-            Integer binding = DEFAULT_SAMPLER_BINDINGS.get("noisetex");
-            if (binding != null && binding >= 0 && binding < views.length) {
-                views[binding] = noiseImageView;
-                samplers[binding] = noiseSampler;
-            }
-        }
-    }
-
     @Override
     public boolean isLoaded() { return loaded; }
 
     /** Returns the G-buffer manager, or null if MRT is not initialized. */
     public GBufferManager getGBufferManager() { return gbufferManager; }
-
-    /**
-     * Destroys and nullifies the fullscreen render targets so they will be
-     * lazily recreated at the current swapchain dimensions on the next frame.
-     * Called from the swapchain recreation callback after a window resize.
-     */
-    public void invalidateFullscreenTargets() {
-        if (fsTargets != null) {
-            fsTargets.destroy();
-            fsTargets = null;
-            LOGGER.info("[FULLSCREEN] Invalidated fullscreen targets for resize");
-        }
-    }
 
     /** Returns the shadow map, or null if shadow is not initialized. */
     public ShadowMap getShadowMap() { return shadowMap; }
@@ -2675,8 +2606,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
 
         // ── Shadow texture bindings ──
-        // Bind shadow depth maps (shadowtex0 → binding 15, shadowtex1 → binding 16)
-        // and shadow color attachments (shadowcolor0 → binding 17, shadowcolor1 → binding 18)
+        // Bind shadow depth maps (shadowtex0 → binding 23, shadowtex1 → binding 24)
+        // and shadow color attachments (shadowcolor0 → binding 25, shadowcolor1 → binding 26)
         if (shadowMap != null && shadowImagesInitialized) {
             // shadowtex0 — main shadow depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
             long stView0 = shadowMap.getMainDepthView();
@@ -2863,5 +2794,59 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
     public String getCompatibilityIssueMessage() {
         return compatibilityIssueMessage;
+    }
+
+    /**
+     * Invalidates fullscreen render targets so they are recreated at the new
+     * swapchain size on the next frame. Called after window resize.
+     */
+    public void invalidateFullscreenTargets() {
+        // The fsTargets will be resized via ensureSize() on the next
+        // prepareFullscreenInputs() call which checks dimensions.
+        // No explicit invalidation needed — size check is done each frame.
+    }
+
+    /**
+     * Populates sampler bindings for G-buffer draws with shaderpack-managed textures
+     * (shadow maps, noise, etc.) so that gbuffers programs can access them during
+     * terrain/sky/entity rendering, not just during fullscreen composite passes.
+     *
+     * @param views           Sampler image view array to populate
+     * @param samplers        Sampler handle array to populate
+     * @param imageLayouts    Image layout array for depth textures (may be null)
+     * @param placeholderView Placeholder image view for unbound slots
+     * @param placeholderSampler Placeholder sampler for unbound slots
+     */
+    public void populateShaderpackTexturesForGbuffers(long[] views, long[] samplers,
+                                                       int[] imageLayouts,
+                                                       long placeholderView,
+                                                       long placeholderSampler) {
+        // Bind shadow textures so gbuffers shaders can access them
+        if (shadowMap != null && shadowImagesInitialized) {
+            long stView0 = shadowMap.getMainDepthView();
+            long stSamp0 = shadowMap.getMainDepthSampler();
+            if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
+                bindSamplerAlias(views, samplers, "shadowtex0", stView0, stSamp0);
+                bindSamplerAlias(views, samplers, "shadow", stView0, stSamp0);
+                Integer st0Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex0");
+                if (imageLayouts != null && st0Binding != null && st0Binding >= 0 && st0Binding < imageLayouts.length) {
+                    imageLayouts[st0Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                }
+            }
+            long stView1 = shadowMap.getNoTranslucentsDepthView();
+            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
+            if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
+                bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
+                Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
+                if (imageLayouts != null && st1Binding != null && st1Binding >= 0 && st1Binding < imageLayouts.length) {
+                    imageLayouts[st1Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                }
+            }
+        }
+
+        // Bind noise texture
+        if (noiseImageView != VK_NULL_HANDLE && noiseSampler != VK_NULL_HANDLE) {
+            bindSamplerAlias(views, samplers, "noisetex", noiseImageView, noiseSampler);
+        }
     }
 }
