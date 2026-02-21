@@ -271,6 +271,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     /** Shadow terrain pipeline (depth-only, for rendering shadow geometry) */
     private BasicPipeline shadowTerrainPipeline;
 
+    /** Shadow entity pipeline (depth-only, entity vertex format, for entity/block-entity shadows) */
+    private BasicPipeline shadowEntityPipeline;
+
     /** Whether shadow depth images have been initialized (transitioned to readable layout) */
     private boolean shadowImagesInitialized = false;
 
@@ -1160,6 +1163,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             shadowTerrainPipeline.destroy();
             shadowTerrainPipeline = null;
         }
+        if (shadowEntityPipeline != null) {
+            shadowEntityPipeline.destroy();
+            shadowEntityPipeline = null;
+        }
 
         // Destroy compute infrastructure
         // Reference: Iris CompositeRenderer cleanup (Iris Shaders, LGPL-3.0)
@@ -1355,8 +1362,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         shadowRenderer.setShadowRenderTargets(shadowRenderPass, shadowRenderPassLoad,
                 shadowFramebuffer, 0);
 
-        // ── Step 6b: Create shadow terrain pipeline ──
+        // ── Step 6b: Create shadow terrain + entity pipelines ──
         createShadowTerrainPipeline(device);
+        createShadowEntityPipeline(device);
 
         shadowImagesInitialized = false;
 
@@ -1645,6 +1653,71 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             shadowTerrainPipeline = null;
         }
     }
+
+    /**
+     * Creates the shadow entity pipeline for rendering entities and block entities
+     * in the shadow pass. Uses the entity vertex format (NEW_ENTITY) compiled
+     * against the shadow render pass (depth-only, 0 color attachments).
+     *
+     * <p>The program used is {@code gbuffers_entities} (resolved with its fallback
+     * chain). The fragment shader's color outputs are simply discarded since the
+     * shadow render pass has no color attachments — only depth is written.</p>
+     */
+    private void createShadowEntityPipeline(VkDevice device) {
+        if (shadowRenderPass == VK_NULL_HANDLE) {
+            LOGGER.warn("[SHADOW] No shadow render pass — entity pipeline skipped");
+            return;
+        }
+
+        // Resolve entity program: GBUFFERS_ENTITIES → fallback chain
+        CompiledProgram entityProg = null;
+        for (ProgramId candidate : new ProgramId[]{
+                ProgramId.GBUFFERS_ENTITIES,
+                ProgramId.GBUFFERS_TEXTURED_LIT,
+                ProgramId.GBUFFERS_TEXTURED,
+                ProgramId.GBUFFERS_BASIC}) {
+            CompiledProgram p = compiledPrograms.get(candidate);
+            if (p != null && p.vertexModule != 0 && p.fragmentModule != 0) {
+                entityProg = p;
+                break;
+            }
+        }
+
+        if (entityProg == null) {
+            LOGGER.warn("[SHADOW] No entity shader modules found — entity shadow pipeline skipped");
+            return;
+        }
+
+        try {
+            shadowEntityPipeline = new BasicPipeline();
+            long sharedDescriptorSetLayout = VK_NULL_HANDLE;
+            if (Vulkanium.getPipelineRegistry() != null) {
+                sharedDescriptorSetLayout = Vulkanium.getPipelineRegistry().getDescriptorSetLayout();
+            }
+
+            // Compile the entity pipeline against the shadow render pass with 0 color attachments.
+            // The entity vertex format (NEW_ENTITY) provides position at attribute location 0,
+            // UV0 at 2, etc. Fragment color outputs are discarded (no attachments).
+            shadowEntityPipeline.initializeWithModules(
+                    device,
+                    shadowRenderPass,
+                    "shadow_entity",
+                    entityProg.vertexModule,
+                    entityProg.fragmentModule,
+                    VK_NULL_HANDLE,
+                    com.mojang.blaze3d.vertex.DefaultVertexFormat.NEW_ENTITY,
+                    0,  // no color attachments — depth only
+                    sharedDescriptorSetLayout
+            );
+            LOGGER.info("[SHADOW] Shadow entity pipeline created (entity vertex format, depth-only)");
+        } catch (Exception e) {
+            LOGGER.error("[SHADOW] Failed to create shadow entity pipeline: {}", e.getMessage());
+            shadowEntityPipeline = null;
+        }
+    }
+
+    /** Returns the shadow entity pipeline, or {@code null} if not available. */
+    public BasicPipeline getShadowEntityPipeline() { return shadowEntityPipeline; }
 
     /**
      * Executes the shadow rendering pass for the current frame.

@@ -921,6 +921,21 @@ public class Vulkanium implements ClientModInitializer {
             return fallback;
         }
 
+        // ── Shadow pass entity routing ──
+        // During the shadow pass, entity/block-entity draws must use a pipeline
+        // compiled against the shadow render pass (depth-only, 0 color attachments).
+        // Entity terrain draws come through here; terrain is handled by ChunkRenderer
+        // directly, but entity-format draws need the shadow entity pipeline.
+        if (net.vulkanium.render.shadow.ShadowRenderer.ACTIVE && !isTerrainLikeFormat(format)) {
+            net.vulkanium.render.pipeline.BasicPipeline shadowEntityPipe =
+                    shaderpackPipeline.getShadowEntityPipeline();
+            if (shadowEntityPipe != null) {
+                return shadowEntityPipe;
+            }
+            // No shadow entity pipeline available — fall back to the default entity pipeline
+            // and hope the shadow render pass is compatible (best effort).
+        }
+
         net.vulkanium.shaderpack.ProgramId requested = mapShaderNameToProgramId(
                 VRenderSystem.getCurrentShaderName(), format, vertexCount, mode);
         if (requested == null) {
@@ -1320,7 +1335,11 @@ public class Vulkanium implements ClientModInitializer {
         net.vulkanium.compat.VRenderSystem.getTextureMatrix().get(texMat);
 
         boolean shaderpackCompat = getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-                && pipeline.getName().startsWith("shaderpack_");
+                && (pipeline.getName().startsWith("shaderpack_")
+                        // Shadow entity pipeline ("shadow_entity") also needs the
+                        // shaderpack UBO path so shadow matrices are correctly uploaded.
+                        || (net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
+                                && pipeline.getName().equals("shadow_entity")));
 
         int uboOffset;
         if (shaderpackCompat) {
@@ -1355,6 +1374,8 @@ public class Vulkanium implements ClientModInitializer {
                     || pipeline.getName().contains("star")
                     || pipeline.getName().contains("cloud");
             boolean isTerrainDraw = isTerrainLikeFormat(format);
+            boolean isShadowEntityDraw = net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
+                    && !isSkyDraw && !isTerrainDraw;
             org.joml.Matrix4f modelViewMat;
             org.joml.Matrix4f projectionMat;
             if (isSkyDraw) {
@@ -1365,6 +1386,29 @@ public class Vulkanium implements ClientModInitializer {
                 // Use the live projection (already set by MC for sky rendering)
                 projectionMat = new org.joml.Matrix4f(
                         net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
+            } else if (isShadowEntityDraw) {
+                // Shadow entity draws: transform entity from camera-relative world
+                // space into shadow clip space.
+                //
+                // Entity vertices are stored as object-space positions; the
+                // PoseStack at draw time = cameraMV × entityWorldTransform × animation.
+                // We want shadow clip space, so we compute:
+                //   shadowMV × inv(cameraMV) × liveEntityMV
+                // = shadowMV × entityWorldTransform × animation  (correct!)
+                //
+                // ShadowRenderer.MODELVIEW is the shadow camera transform.
+                // VRenderSystem.getWorldRenderModelView() is the saved camera MV snapshot.
+                org.joml.Matrix4f shadowMV = new org.joml.Matrix4f(
+                        net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW);
+                org.joml.Matrix4f cameraMV = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
+                // inv(cameraMV) × liveEntityMV = entity local transform in world space
+                org.joml.Matrix4f entityWorldTransform = new org.joml.Matrix4f(cameraMV)
+                        .invert()
+                        .mul(net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+                modelViewMat = shadowMV.mul(entityWorldTransform);
+                projectionMat = new org.joml.Matrix4f(
+                        net.vulkanium.render.shadow.ShadowRenderer.PROJECTION);
             } else if (isTerrainDraw) {
                 // Per-frame snapshot for terrain (avoids chunk offset in matrix)
                 modelViewMat = new org.joml.Matrix4f(
@@ -1531,7 +1575,9 @@ public class Vulkanium implements ClientModInitializer {
         VRenderSystem.getTextureMatrix().get(texMat);
 
         boolean shaderpackCompat = getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-                && pipeline.getName().startsWith("shaderpack_");
+                && (pipeline.getName().startsWith("shaderpack_")
+                        || (net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
+                                && pipeline.getName().equals("shadow_entity")));
 
         int uboOffset;
         if (shaderpackCompat) {

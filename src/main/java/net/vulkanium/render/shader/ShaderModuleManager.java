@@ -111,7 +111,7 @@ public class ShaderModuleManager {
     /** Per-pack transformed GLSL cache */
     private Path translatedCacheDir;
 
-    private static final String TRANSLATED_CACHE_VERSION = "v21-block-properties";
+    private static final String TRANSLATED_CACHE_VERSION = "v22-entity-shadows";
 
     @FunctionalInterface
     public interface CompileStageListener {

@@ -1,5 +1,14 @@
 package net.vulkanium.render.shadow;
 
+import com.mojang.blaze3d.vertex.PoseStack;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.RenderType;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.phys.AABB;
 import net.vulkanium.Vulkanium;
 import net.vulkanium.render.composite.CompositePassManager;
 import net.vulkanium.render.terrain.ChunkRenderer;
@@ -249,29 +258,200 @@ public class ShadowRenderer {
     }
 
     private void renderEntitiesShadow(long commandBuffer, Vector3d cameraPos) {
-        // TODO: Entity shadow rendering requires:
-        //   1. Shadow-compatible entity pipelines (created against the shadow render pass)
-        //   2. Pipeline selection routing: when ShadowRenderer.ACTIVE, resolve to shadow
-        //      programs (shadow.vsh/fsh) instead of gbuffers_entities
-        //   3. Entity iteration: level.entitiesForRendering() filtered by entityFrustum
-        //   4. For each visible entity: call EntityRenderDispatcher.render()
-        //      → draw calls flow through MixinBufferUploader → recordDraw()
-        //      → the command buffer is shared with shadow pass, so draws record
-        //        into the active shadow render pass automatically
-        //   5. Block entity iteration: visibleBlockEntities from terrain setup
-        //
-        // The current frame's command buffer (frameOrchestrator.getCommandBuffer())
-        // is the SAME one used by the shadow pass, so draw calls recorded during
-        // entity rendering will correctly go into the shadow render pass.  The main
-        // blocker is creating shadow-compatible VkPipelines for entity vertex formats.
-        entitiesRendered = 0;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.level == null) return;
+        ClientLevel level = mc.level;
+
+        // Full-bright lightmap for shadow rendering — entities should never be
+        // culled/darkened because of lighting during the shadow depth pass.
+        int fullBrightLight = LightTexture.pack(15, 15);
+        float partialTick = Vulkanium.getCurrentPartialTick();
+
+        // Set rendering phase for shader routing
+        net.vulkanium.render.program.WorldRenderingPhase.setPhase(
+                net.vulkanium.render.program.WorldRenderingPhase.Phase.ENTITIES);
+
+        // Grab the shared render buffer. BufferSource.endBatch() flushes all pending
+        // draws through BufferUploader → recordDraw() → the active command buffer.
+        MultiBufferSource.BufferSource bufferSource = mc.renderBuffers().bufferSource();
+
+        // The PoseStack root is the camera view matrix (same base as normal entity
+        // rendering). Entity positions are passed as camera-relative offsets below,
+        // matching the vanilla renderLevel() approach. The shadow matrices are
+        // substituted in recordDraw() via the isShadowEntityDraw branch.
+        PoseStack poseStack = new PoseStack();
+        // Push the camera model-view as the base transform so entity rendering
+        // builds on the same world-space origin as the main render pass.
+        poseStack.pushPose();
+        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView().get(
+                new float[16]); // warm up — actual matrix is applied via UBO
+        // (No matrix push here — entity positions are camera-relative already.)
+
+        try {
+            for (Entity entity : level.entitiesForRendering()) {
+                // Skip invisible entities and entities that shouldn't cast shadows
+                if (!entity.isAlive()) continue;
+
+                // Frustum / distance cull against shadow frustum
+                if (entityFrustum != null) {
+                    AABB aabb = entity.getBoundingBox();
+                    if (!entityFrustum.testVisibility(
+                            aabb.minX, aabb.minY, aabb.minZ,
+                            aabb.maxX, aabb.maxY, aabb.maxZ)) {
+                        continue;
+                    }
+                }
+
+                // Camera-relative position (same convention as renderLevel())
+                double dx = entity.getX(partialTick) - cameraPos.x;
+                double dy = entity.getY()             - cameraPos.y;
+                double dz = entity.getZ(partialTick) - cameraPos.z;
+
+                try {
+                    mc.getEntityRenderDispatcher().render(
+                            entity, dx, dy, dz,
+                            entity.getYRot(), partialTick,
+                            poseStack, bufferSource, fullBrightLight);
+                    entitiesRendered++;
+                } catch (Exception e) {
+                    LOGGER.warn("[SHADOW] Entity render error for {}: {}", entity.getType(), e.getMessage());
+                }
+            }
+
+            // Also render the player if shouldRenderPlayer is set and the player
+            // might not be in entitiesForRendering() (first-person camera).
+            if (shouldRenderPlayer && mc.player != null) {
+                Entity player = mc.player;
+                AABB playerAabb = player.getBoundingBox();
+                boolean inFrustum = entityFrustum == null || entityFrustum.testVisibility(
+                        playerAabb.minX, playerAabb.minY, playerAabb.minZ,
+                        playerAabb.maxX, playerAabb.maxY, playerAabb.maxZ);
+                if (inFrustum) {
+                    double dx = player.getX(partialTick) - cameraPos.x;
+                    double dy = player.getY()             - cameraPos.y;
+                    double dz = player.getZ(partialTick) - cameraPos.z;
+                    try {
+                        mc.getEntityRenderDispatcher().render(
+                                player, dx, dy, dz,
+                                player.getYRot(), partialTick,
+                                poseStack, bufferSource, fullBrightLight);
+                    } catch (Exception e) {
+                        LOGGER.warn("[SHADOW] Player shadow render error: {}", e.getMessage());
+                    }
+                }
+            }
+
+            // Flush all pending entity draw calls into the active shadow command buffer
+            bufferSource.endBatch();
+
+        } catch (Exception e) {
+            LOGGER.error("[SHADOW] Entity shadow rendering failed: {}", e.getMessage(), e);
+        } finally {
+            poseStack.popPose();
+            net.vulkanium.render.program.WorldRenderingPhase.setPhase(
+                    net.vulkanium.render.program.WorldRenderingPhase.Phase.SHADOW);
+        }
+
+        if (entitiesRendered > 0) {
+            LOGGER.debug("[SHADOW] Rendered {} entity shadow(s)", entitiesRendered);
+        }
     }
 
     private void renderBlockEntitiesShadow(long commandBuffer) {
-        // TODO: See renderEntitiesShadow — same architectural requirements.
-        // Block entities use the same rendering pipeline as entities but with
-        // different vertex formats and model rendering code.
-        blockEntitiesRendered = 0;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.level == null) return;
+        ClientLevel level = mc.level;
+
+        float partialTick = Vulkanium.getCurrentPartialTick();
+        int fullBrightLight = LightTexture.pack(15, 15);
+
+        net.vulkanium.render.program.WorldRenderingPhase.setPhase(
+                net.vulkanium.render.program.WorldRenderingPhase.Phase.BLOCK_ENTITIES);
+
+        MultiBufferSource.BufferSource bufferSource = mc.renderBuffers().bufferSource();
+        PoseStack poseStack = new PoseStack();
+        poseStack.pushPose();
+
+        // Camera position from the world render snapshot for block entity offset computation
+        org.joml.Vector3f camOffset = new org.joml.Vector3f();
+        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView().getTranslation(camOffset);
+        // camOffset here is the camera world position negated (it's the translation
+        // component of the inverse view matrix). Use VulkaniumWorldRenderer camera instead:
+        double camX = 0, camY = 0, camZ = 0;
+        try {
+            net.vulkanium.world.VulkaniumWorldRenderer wr =
+                    net.vulkanium.world.VulkaniumWorldRenderer.getInstance();
+            camX = wr.getCameraX();
+            camY = wr.getCameraY();
+            camZ = wr.getCameraZ();
+        } catch (Exception ignored) {
+            // World renderer not available — block entity shadows disabled this frame
+        }
+
+        // Iterate loaded chunks within shadow render distance to collect block entities.
+        // We cannot access LevelRenderer internals directly, so we pull block entities
+        // straight from loaded chunks via ClientChunkCache.getChunkNow().
+        int centerChunkX = (int) Math.floor(camX) >> 4;
+        int centerChunkZ = (int) Math.floor(camZ) >> 4;
+        // renderDistance is in chunks; add 1 for boundary chunks
+        int radiusChunks = Math.max(renderDistance + 1, 2);
+
+        try {
+            for (int cx = centerChunkX - radiusChunks; cx <= centerChunkX + radiusChunks; cx++) {
+                for (int cz = centerChunkZ - radiusChunks; cz <= centerChunkZ + radiusChunks; cz++) {
+                    net.minecraft.world.level.chunk.LevelChunk chunk =
+                            level.getChunkSource().getChunkNow(cx, cz);
+                    if (chunk == null) continue;
+
+                    for (BlockEntity blockEntity : chunk.getBlockEntities().values()) {
+                        if (blockEntity.isRemoved()) continue;
+
+                        net.minecraft.core.BlockPos pos = blockEntity.getBlockPos();
+
+                        // Frustum check against shadow frustum
+                        if (terrainFrustum != null) {
+                            double bx = pos.getX();
+                            double by = pos.getY();
+                            double bz = pos.getZ();
+                            if (!terrainFrustum.testVisibility(bx, by, bz, bx + 1, by + 1, bz + 1)) {
+                                continue;
+                            }
+                        }
+
+                        // Translate to block entity position relative to camera
+                        poseStack.pushPose();
+                        poseStack.translate(
+                                pos.getX() - camX,
+                                pos.getY() - camY,
+                                pos.getZ() - camZ);
+
+                        try {
+                            mc.getBlockEntityRenderDispatcher().render(
+                                    blockEntity, partialTick, poseStack, bufferSource);
+                            blockEntitiesRendered++;
+                        } catch (Exception e) {
+                            LOGGER.warn("[SHADOW] Block entity render error at {}: {}", pos, e.getMessage());
+                        } finally {
+                            poseStack.popPose();
+                        }
+                    }
+                }
+            }
+
+            // Flush all block entity draw calls
+            bufferSource.endBatch();
+
+        } catch (Exception e) {
+            LOGGER.error("[SHADOW] Block entity shadow rendering failed: {}", e.getMessage(), e);
+        } finally {
+            poseStack.popPose();
+            net.vulkanium.render.program.WorldRenderingPhase.setPhase(
+                    net.vulkanium.render.program.WorldRenderingPhase.Phase.SHADOW);
+        }
+
+        if (blockEntitiesRendered > 0) {
+            LOGGER.debug("[SHADOW] Rendered {} block entity shadow(s)", blockEntitiesRendered);
+        }
     }
 
     /**
