@@ -1503,7 +1503,11 @@ public class Vulkanium implements ClientModInitializer {
         // clip-space conversion,
         // so avoid extra viewport Y flip.
         // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
-        updateViewportScissor(cmd, !shaderpackCompat);
+        // 3) Shadow pass: viewport was already set by ShadowRenderer.setShadowViewport();
+        //    do NOT overwrite it with the main window dimensions.
+        if (!net.vulkanium.render.shadow.ShadowRenderer.ACTIVE) {
+            updateViewportScissor(cmd, !shaderpackCompat);
+        }
 
         // Bind the per-draw descriptor set with dynamic UBO offset
         drawBatcher.bindDescriptorSet(cmd, pipeline.getPipelineLayout(), setIdx, uboOffset);
@@ -1702,7 +1706,11 @@ public class Vulkanium implements ClientModInitializer {
         // clip-space conversion,
         // so avoid extra viewport Y flip.
         // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
-        updateViewportScissor(cmd, !shaderpackCompat);
+        // 3) Shadow pass: viewport was already set by ShadowRenderer.setShadowViewport();
+        //    do NOT overwrite it with the main window dimensions.
+        if (!net.vulkanium.render.shadow.ShadowRenderer.ACTIVE) {
+            updateViewportScissor(cmd, !shaderpackCompat);
+        }
 
         // Bind descriptor set
         drawBatcher.bindDescriptorSet(cmd, pipeline.getPipelineLayout(), setIdx, uboOffset);

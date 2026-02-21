@@ -2210,15 +2210,23 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         // Pre-compute uniform data shared across all passes
         // Use world-render snapshots — the live matrices may have been
         // overwritten by GUI/HUD rendering by the time fullscreen passes run.
+        //
+        // IMPORTANT: For fullscreen passes (composite/deferred/final), the
+        // per-draw matrices (iris_ModelViewMatrix, iris_ProjectionMatrix at
+        // offsets 0 and 128) MUST be identity.  In Iris/GL, these passes draw
+        // a fullscreen triangle without any GL matrix state, so ftransform()
+        // → gl_ModelViewProjectionMatrix * gl_Vertex = identity * vertex = NDC.
+        // The per-frame camera matrices are written separately to
+        // gbufferModelView (offset 1312) and gbufferProjection (offset 1440)
+        // inside uploadUniformsShaderpack().
         float[] modelView = new float[16];
-        VRenderSystem.getWorldRenderModelView().get(modelView);
-        org.joml.Matrix4f vkProjection = new org.joml.Matrix4f(VRenderSystem.getWorldRenderProjection());
+        new org.joml.Matrix4f().get(modelView); // identity for per-draw matrix
         float[] projection = new float[16];
-        vkProjection.get(projection);
+        new org.joml.Matrix4f().get(projection); // identity for per-draw matrix
         float[] modelViewInv = new float[16];
-        new org.joml.Matrix4f(VRenderSystem.getWorldRenderModelView()).invert().get(modelViewInv);
+        new org.joml.Matrix4f().get(modelViewInv); // inv(identity) = identity
         float[] projectionInv = new float[16];
-        new org.joml.Matrix4f(vkProjection).invert().get(projectionInv);
+        new org.joml.Matrix4f().get(projectionInv); // inv(identity) = identity
         float[] colorMod = {
                 VRenderSystem.getShaderColorR(),
                 VRenderSystem.getShaderColorG(),
