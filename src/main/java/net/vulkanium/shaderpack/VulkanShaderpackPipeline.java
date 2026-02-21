@@ -1648,6 +1648,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     compiledPrograms.containsKey(ProgramId.SHADOW) ? "shadow" :
                     compiledPrograms.containsKey(ProgramId.SHADOW_SOLID) ? "shadow_solid" :
                     "gbuffers_terrain (fallback)");
+            // CW front face: no shader Y-flip, positive viewport
+            shadowTerrainPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow terrain pipeline: {}", e.getMessage());
             shadowTerrainPipeline = null;
@@ -1710,6 +1712,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     sharedDescriptorSetLayout
             );
             LOGGER.info("[SHADOW] Shadow entity pipeline created (entity vertex format, depth-only)");
+            // CW front face: no shader Y-flip, positive viewport
+            shadowEntityPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow entity pipeline: {}", e.getMessage());
             shadowEntityPipeline = null;
@@ -1974,6 +1978,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
+            // Shaderpack pipelines use CW front face because we removed the
+            // gl_Position.y = -gl_Position.y vertex shader flip. Without the flip,
+            // OpenGL CCW triangles appear as CW in Vulkan's Y-down framebuffer.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("Failed to create compatibility pipeline for {}: {}", requestedProgram, e.getMessage());
@@ -2397,12 +2405,13 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
                 vkCmdBeginRenderPass(cmd, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-                // Y-flipped viewport to match OpenGL gl_FragCoord convention
+                // Standard positive-height viewport for OpenGL-matching gl_FragCoord
+                // With no shader Y-flip, gl_FragCoord.y = 0 at scene bottom (matching OpenGL)
                 VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
                         .x(0.0f)
-                        .y((float) height)
+                        .y(0.0f)
                         .width((float) width)
-                        .height((float) -height)
+                        .height((float) height)
                         .minDepth(0.0f)
                         .maxDepth(1.0f);
                 vkCmdSetViewport(cmd, 0, viewport);
@@ -2508,6 +2517,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     subpassColorCount
             );
             mrtPipelines.put(key, pipeline);
+            // CW front face for consistency with other shaderpack pipelines
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("[FULLSCREEN] Failed to create MRT pipeline for {} (targets={}): {}",

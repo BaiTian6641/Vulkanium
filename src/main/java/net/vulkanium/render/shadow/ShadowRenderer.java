@@ -457,19 +457,21 @@ public class ShadowRenderer {
     /**
      * Sets viewport and scissor to shadow map dimensions.
      * Uses negative-height viewport (VK_KHR_maintenance1 / Vulkan 1.1) to match
-     * OpenGL Y convention. This is critical because shadow vertex shaders include
-     * the same Y-flip (`gl_Position.y = -gl_Position.y`) as all other shaders.
-     * With a standard positive-height viewport, the shadow map would be rendered
-     * Y-inverted, causing composite shaders to sample wrong depth values when
-     * computing shadowCoord = shadowNDC * 0.5 + 0.5.
+     * Sets the dynamic viewport and scissor for shadow map rendering.
+     *
+     * <p>Uses standard positive-height viewport (no Y-flip). Since shaderpack
+     * vertex shaders no longer inject gl_Position.y = -gl_Position.y, the shadow
+     * map is stored bottom-up (matching OpenGL convention). Shadow coordinate
+     * reconstruction in composite shaders uses the same OpenGL projection matrix,
+     * so V=0 correctly maps to the bottom of the shadow scene.</p>
      */
     private void setShadowViewport(long commandBuffer, int width, int height) {
         VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
                 net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
         try (MemoryStack stack = stackPush()) {
             VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
-                    .x(0.0f).y((float) height)
-                    .width((float) width).height((float) -height)
+                    .x(0.0f).y(0.0f)
+                    .width((float) width).height((float) height)
                     .minDepth(0.0f).maxDepth(1.0f);
             vkCmdSetViewport(cmd, 0, viewport);
 

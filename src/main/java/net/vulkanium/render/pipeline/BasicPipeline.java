@@ -148,6 +148,21 @@ public class BasicPipeline {
             Long.toHexString(geomShaderModule));
     }
 
+    /**
+     * Front face winding order. Default: CCW (OpenGL convention with shader Y-flip).
+     * For shaderpack pipelines that don't use shader Y-flip, set to CW.
+     */
+    private int frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+
+    public void setFrontFace(int face) {
+        this.frontFace = face;
+        // Invalidate cached pipelines — they embed the old front face
+        for (long pipeline : pipelineCache.values()) {
+            if (pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, null);
+        }
+        pipelineCache.clear();
+    }
+
     private void createDescriptorSetLayout() {
         try (MemoryStack stack = stackPush()) {
             VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(1 + MAX_TEXTURE_BINDINGS, stack);
@@ -288,7 +303,7 @@ public class BasicPipeline {
                     .polygonMode(VK_POLYGON_MODE_FILL)
                     .lineWidth(1.0f)
                     .cullMode(cullEnabled ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE)
-                    .frontFace(VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                    .frontFace(frontFace)
                     .depthBiasEnable(true);
 
             // Multisampling

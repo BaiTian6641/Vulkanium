@@ -96,7 +96,9 @@ public class MRTGraphicsPipeline {
 
         /** Face culling */
         public int cullMode = VK_CULL_MODE_BACK_BIT;
-        public int frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        // CW front face: shaderpack vertex shaders no longer inject gl_Position.y flip.
+        // OpenGL CCW triangles appear CW in Vulkan's Y-down framebuffer with positive viewport.
+        public int frontFace = VK_FRONT_FACE_CLOCKWISE;
 
         /** Polygon mode (for wireframe debug) */
         public int polygonMode = VK_POLYGON_MODE_FILL;

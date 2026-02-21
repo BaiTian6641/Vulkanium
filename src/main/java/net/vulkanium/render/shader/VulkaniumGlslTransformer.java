@@ -254,7 +254,6 @@ public class VulkaniumGlslTransformer {
         if (bodyEnd < 0) return source;
 
         String fix = "\n    // Vulkan clip-space conversion\n"
-                + "    gl_Position.y = -gl_Position.y;\n"
                 + "    gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n";
 
         return source.substring(0, bodyEnd) + fix + source.substring(bodyEnd);

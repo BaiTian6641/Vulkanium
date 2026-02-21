@@ -322,16 +322,21 @@ public class VulkaniumASTTransformer {
     // ═══════════════════════════════════════════════════════════════
 
     // UV.y is flipped (0.5 - y*0.5) to account for Vulkan's top-down texture layout.
-    // The function returns vec4(x, -y, ...) so that shaders computing UV from
-    // gl_Vertex.xy * 0.5 + 0.5 also get the correct flipped V coordinate.
-    // vkm_composite_ClipPos retains real Y for the Y-flipped viewport.
+    // Fullscreen triangle positions generated from gl_VertexIndex.
+    // With the positive-viewport approach (no gl_Position.y flip), we use standard
+    // Vulkan positive-height viewport. gl_FragCoord.y = 0 at NDC y=-1].
+    // The scene is stored bottom-up in the framebuffer:
+    //   - NDC y=-1 (scene bottom) → framebuffer row 0 → texture V=0
+    //   - NDC y=+1 (scene top)    → framebuffer last row → texture V=1
+    // This matches OpenGL convention: texcoord V=0 at bottom, V=1 at top.
+    // NDC reconstruction (texcoord * 2 - 1) gives correct OpenGL NDC.
     private static final String COMPOSITE_VERTEX_PREAMBLE = """
             vec2 vkm_composite_TexCoord;
             vec4 vkm_composite_ClipPos;
             vec4 vkm_composite_Position() {
                 float x = -1.0 + float((gl_VertexIndex & 1) << 2);
                 float y = -1.0 + float((gl_VertexIndex & 2) << 1);
-                vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, 0.5 - y * 0.5);
+                vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
                 vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
                 return vec4(x, -y, 0.0, 1.0);
             }
@@ -730,9 +735,9 @@ public class VulkaniumASTTransformer {
                 tree.prependMainFunctionBody(transformer, "vkm_decodeVertex();");
                 remap = TERRAIN_VERTEX_REMAP;
 
-                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.y = -gl_Position.y;");
+                // Vulkan Z-depth remap: OpenGL NDC z∈[-1,1] → Vulkan z∈[0,1]
+                // No Y-flip needed — we use positive-height viewport with CW front face
+                // so gl_FragCoord matches OpenGL convention (y=0 at bottom).
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
@@ -740,9 +745,7 @@ public class VulkaniumASTTransformer {
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
 
-                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.y = -gl_Position.y;");
+                // Vulkan Z-depth remap only — no Y-flip (positive viewport + CW front face)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
@@ -751,9 +754,7 @@ public class VulkaniumASTTransformer {
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
 
-                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.y = -gl_Position.y;");
+                // Vulkan Z-depth remap only — no Y-flip (positive viewport + CW front face)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
@@ -761,9 +762,7 @@ public class VulkaniumASTTransformer {
                 injectCodeBlock(tree, PARTICLE_VERTEX_INPUTS);
                 remap = PARTICLE_VERTEX_REMAP;
 
-                // Inject Vulkan clip-space fix (Y-flip + Z-depth remap)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.y = -gl_Position.y;");
+                // Vulkan Z-depth remap only — no Y-flip (positive viewport + CW front face)
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
             }
