@@ -392,22 +392,24 @@ public class BasicPipeline {
         //   UV index 1 = overlay (hurt/flash, entity-only — skipped)
         //   UV index 2 = lightmap (UV2)
         boolean hasUV = false, hasColor = false, hasUV2 = false, hasNormal = false;
+        boolean hasGeneric = false;
         for (VertexFormatElement e : elements) {
             if (e.getUsage() == VertexFormatElement.Usage.COLOR) hasColor = true;
             if (e.getUsage() == VertexFormatElement.Usage.NORMAL) hasNormal = true;
+            if (e.getUsage() == VertexFormatElement.Usage.GENERIC) hasGeneric = true;
             if (e.getUsage() == VertexFormatElement.Usage.UV) {
                 if (e.getIndex() == 0) hasUV = true;
                 else if (e.getIndex() == 2) hasUV2 = true;
-                // UV index 1 = overlay — not bound to shader, skipped
             }
         }
 
-        // Count attributes we'll emit (only those used by the shader)
+        // Count attributes we'll emit
         int attrCount = 1; // always have Position
         if (hasUV) attrCount++;
         if (hasColor) attrCount++;
         if (hasUV2) attrCount++;
         if (hasNormal) attrCount++;
+        if (hasGeneric) attrCount++;
 
         VkVertexInputAttributeDescription.Buffer attrs = VkVertexInputAttributeDescription.calloc(attrCount, stack);
         int attrIdx = 0;
@@ -453,11 +455,13 @@ public class BasicPipeline {
                 }
                 case COLOR -> {
                     if (!colorDone && hasColor) {
-                        // Color at location 2 when UV0 occupies location 1,
-                        // otherwise Color at location 1 (e.g., sky POSITION_COLOR format).
-                        // This matches the shader transforms: terrain declares Color at
-                        // location 2, sky declares Color at location 1.
-                        loc = hasUV ? 2 : 1;
+                        // Shaderpack pipelines always use the entity vertex layout where
+                        // Color is at location 2 (vkm_Entity_Color).  For non-shaderpack
+                        // pipelines without UV0, Color can go to location 1.
+                        // Without this, sky (POSITION_COLOR) feeds Color into location 1
+                        // where the shader expects UV0, leaving vkm_Entity_Color = (0,0,0,0).
+                        boolean isShaderpack = name != null && name.startsWith("shaderpack_");
+                        loc = (isShaderpack || hasUV) ? 2 : 1;
                         colorDone = true;
                     }
                 }
@@ -468,7 +472,12 @@ public class BasicPipeline {
                         normalDone = true;
                     }
                 }
-                default -> {} // GENERIC, etc.
+                default -> {} // Unhandled usage types
+            }
+
+            // GENERIC elements (mc_Entity etc.) — assign after standard elements
+            if (element.getUsage() == VertexFormatElement.Usage.GENERIC && loc < 0) {
+                loc = 5; // mc_Entity at location 5 (ivec2)
             }
 
             if (loc >= 0 && attrIdx < attrCount) {
@@ -509,7 +518,7 @@ public class BasicPipeline {
             };
             case NORMAL -> VK_FORMAT_R8G8B8A8_SNORM;
             case GENERIC -> switch (type) {
-                case SHORT -> VK_FORMAT_R16_SINT;
+                case SHORT -> count == 2 ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16_SINT;
                 case INT -> VK_FORMAT_R32_SINT;
                 default -> VK_FORMAT_R32_SINT;
             };

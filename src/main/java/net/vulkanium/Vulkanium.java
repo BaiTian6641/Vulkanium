@@ -1329,40 +1329,64 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
 
             // ── Model-view matrix selection ──
-            // For sky programs (sun, moon, stars, sky dome, clouds), use the per-draw
-            // GL model-view matrix which includes MC's celestial rotations applied
-            // inside renderSky() (rotateY(-90°), rotateX(skyAngle*360°), etc.).
-            // Without this, the sky geometry rotates with the player's view.
+            // Sky programs (sun/moon/sunset quads): vertices arrive via
+            // BufferUploader.drawWithShader() and are ALREADY pre-transformed
+            // by Camera×Celestial (MC calls bufferbuilder.vertex(pose, x,y,z)).
+            // The global model-view at this point also contains Camera×Celestial,
+            // so applying it again would double-transform.  Use IDENTITY for
+            // iris_ModelViewMatrix and the live projection (not the per-frame
+            // snapshot) to match how GL would draw these pre-transformed verts.
             //
-            // For terrain/entity programs, use the per-frame snapshot to avoid
-            // per-section chunk offset translations leaking into the matrix.
-            // The chunk offset goes in iris_ChunkOffset instead.
+            // VertexBuffer sky draws (sky dome, stars) go through
+            // recordDrawPersistent() instead — they pass the per-draw matrix
+            // explicitly, so this code path doesn't affect them.
+            //
+            // Entity / hand programs: per-draw model-view includes the entity's
+            // PoseStack transform (position + rotation in world space).  Using
+            // the per-frame snapshot would place all entities at the camera
+            // origin, making them invisible.
+            //
+            // Terrain programs: per-frame snapshot avoids per-section chunk
+            // offset translations leaking into the matrix.  The chunk offset
+            // is provided separately in iris_ChunkOffset.
             boolean isSkyDraw = pipeline.getName().contains("sky")
                     || pipeline.getName().contains("sun")
                     || pipeline.getName().contains("moon")
                     || pipeline.getName().contains("star")
                     || pipeline.getName().contains("cloud");
+            boolean isTerrainDraw = isTerrainLikeFormat(format);
             org.joml.Matrix4f modelViewMat;
+            org.joml.Matrix4f projectionMat;
             if (isSkyDraw) {
-                // Per-draw GL model-view includes celestial PoseStack rotations
-                modelViewMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
-            } else {
+                // BufferUploader sky draws: vertices are pre-transformed by
+                // Camera×Celestial, so use identity model-view to avoid
+                // double-applying the camera rotation.
+                modelViewMat = new org.joml.Matrix4f(); // identity
+                // Use the live projection (already set by MC for sky rendering)
+                projectionMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
+            } else if (isTerrainDraw) {
                 // Per-frame snapshot for terrain (avoids chunk offset in matrix)
                 modelViewMat = new org.joml.Matrix4f(
                         net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
+                projectionMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
+            } else {
+                // Per-draw GL model-view: entities get PoseStack transform
+                modelViewMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+                projectionMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
             }
 
             float[] modelView = new float[16];
             modelViewMat.get(modelView);
             float[] projection = new float[16];
-            org.joml.Matrix4f glProjection = new org.joml.Matrix4f(
-                    net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
-            glProjection.get(projection);
+            projectionMat.get(projection);
             float[] modelViewInv = new float[16];
             new org.joml.Matrix4f(modelViewMat).invert().get(modelViewInv);
             float[] projectionInv = new float[16];
-            new org.joml.Matrix4f(glProjection).invert().get(projectionInv);
+            new org.joml.Matrix4f(projectionMat).invert().get(projectionInv);
             float[] chunkOffset = {
                     chunkOffsetX,
                     chunkOffsetY,

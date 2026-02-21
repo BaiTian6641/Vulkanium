@@ -181,6 +181,23 @@ public class VulkaniumGlslTransformer {
         // behind preprocessor branches but still reference them in active code.
         result = injectFsrFallbackAliases(result);
 
+        // Step 4.7: For COMPOSITE passes, replace GL matrix uniforms with identity.
+        // Iris's CompositeTransformer sets gl_ModelViewMatrix = mat4(1.0) and
+        // gl_ProjectionMatrix = scale matrix.  We use mat4(1.0) for both since
+        // our composite fullscreen triangle is already generated in clip space.
+        // gbufferModelView / gbufferProjection (now iris_GBuffer* fields) retain
+        // the real camera matrices for fragment shader sky computations.
+        if (params.passType == PassType.COMPOSITE) {
+            // Negative lookbehind (?<!mat4 ) avoids replacing the UBO
+            // member *declarations* (e.g. "mat4 iris_ModelViewMatrix;")
+            // while still replacing all usage *references*.
+            result = result.replaceAll("(?<!mat4 )\\biris_ModelViewMatrix\\b", "mat4(1.0)");
+            result = result.replaceAll("(?<!mat4 )\\biris_ModelViewMatrixInverse\\b", "mat4(1.0)");
+            result = result.replaceAll("(?<!mat4 )\\biris_ProjectionMatrix\\b", "mat4(1.0)");
+            result = result.replaceAll("(?<!mat4 )\\biris_ProjectionMatrixInverse\\b", "mat4(1.0)");
+            result = result.replaceAll("(?<!mat4 )\\biris_NormalMat4\\b", "mat4(1.0)");
+        }
+
         // Step 5: Remap sampler declarations with binding qualifiers
         result = remapSamplers(result, params);
 
@@ -877,11 +894,11 @@ public class VulkaniumGlslTransformer {
                     vec4 iris_EntityColor;                  // offset 896
                     vec4 iris_ChunkOffset;                  // offset 912
                     vec4 iris_ColorModulator;               // offset 928
-                    vec4 iris_Padding1;                     // offset 944
-                    vec4 iris_Padding2;                     // offset 960
-                    vec4 iris_Padding3;                     // offset 976
-                    vec4 iris_Padding4;                     // offset 992
-                    vec4 iris_Padding5;                     // offset 1008
+                    vec4 iris_CustomA;                      // offset 944 (screenBrightness, eyeAltitude, worldDay, darknessLightFactor)
+                    vec4 iris_CustomB;                      // offset 960 (reserved, isEyeInCave, eyeBrightnessM, eyeBrightnessM2)
+                    vec4 iris_CustomC;                      // offset 976 (rainFactor, frameTimeSmooth, maxBlindnessDarkness, frameTime)
+                    vec4 iris_CameraPositionInt;            // offset 992 (floor cam XYZ)
+                    vec4 iris_PrevCameraPositionInt;        // offset 1008 (floor prev cam XYZ)
                 
                     // Packed scalars (512 bytes = 32 × vec4)
                     vec4 iris_ScreenSize;                   // offset 1024 (viewWidth, viewHeight, 1/w, 1/h)
@@ -905,6 +922,8 @@ public class VulkaniumGlslTransformer {
                     vec4 iris_HdrDisplay;                   // offset 1296
                     mat4 iris_GBufferModelView;             // offset 1312 (per-frame camera-only)
                     mat4 iris_GBufferModelViewInverse;      // offset 1376 (inverse of above)
+                    mat4 iris_GBufferProjection;            // offset 1440 (per-frame camera projection)
+                    mat4 iris_GBufferProjectionInverse;     // offset 1504 (inverse of above)
                 };
                 """;
 
@@ -925,8 +944,8 @@ public class VulkaniumGlslTransformer {
         // Matrices
         UNIFORM_MAP.put("gbufferModelView", "iris_GBufferModelView");
         UNIFORM_MAP.put("gbufferModelViewInverse", "iris_GBufferModelViewInverse");
-        UNIFORM_MAP.put("gbufferProjection", "iris_ProjectionMatrix");
-        UNIFORM_MAP.put("gbufferProjectionInverse", "iris_ProjectionMatrixInverse");
+        UNIFORM_MAP.put("gbufferProjection", "iris_GBufferProjection");
+        UNIFORM_MAP.put("gbufferProjectionInverse", "iris_GBufferProjectionInverse");
         UNIFORM_MAP.put("modelViewMatrix", "iris_ModelViewMatrix");
         UNIFORM_MAP.put("projectionMatrix", "iris_ProjectionMatrix");
         UNIFORM_MAP.put("modelViewMatrixInverse", "iris_ModelViewMatrixInverse");
@@ -1026,6 +1045,26 @@ public class VulkaniumGlslTransformer {
 
         // Alpha test
         UNIFORM_MAP.put("alphaTestRef", "iris_AlphaTestRef.x");
+
+        // ── Extended custom uniforms ──
+        UNIFORM_MAP.put("screenBrightness", "iris_CustomA.x");
+        UNIFORM_MAP.put("eyeAltitude", "iris_CustomA.y");
+        UNIFORM_MAP.put("worldDay", "int(iris_CustomA.z)");
+        UNIFORM_MAP.put("darknessLightFactor", "iris_CustomA.w");
+        UNIFORM_MAP.put("frameTime", "iris_CustomC.w");
+        UNIFORM_MAP.put("renderStage", "int(iris_RenderState.x)");
+        UNIFORM_MAP.put("framemod8", "mod(iris_Time.z, 8.0)");
+        UNIFORM_MAP.put("maxBlindnessDarkness", "max(iris_PlayerState.y, iris_PlayerState.z)");
+        UNIFORM_MAP.put("isEyeInCave", "iris_CustomB.y");
+        UNIFORM_MAP.put("eyeBrightnessM", "iris_CustomB.z");
+        UNIFORM_MAP.put("eyeBrightnessM2", "iris_CustomB.w");
+        UNIFORM_MAP.put("rainFactor", "iris_CustomC.x");
+        UNIFORM_MAP.put("frameTimeSmooth", "iris_CustomC.y");
+        UNIFORM_MAP.put("cameraPositionFract", "fract(iris_CameraPosition.xyz)");
+        UNIFORM_MAP.put("previousCameraPositionFract", "fract(iris_PreviousCameraPosition.xyz)");
+        UNIFORM_MAP.put("cameraPositionInt", "ivec3(iris_CameraPositionInt.xyz)");
+        UNIFORM_MAP.put("previousCameraPositionInt", "ivec3(iris_PrevCameraPositionInt.xyz)");
+        UNIFORM_MAP.put("relativeEyePosition", "vec3(0.0, 1.62, 0.0)");
 
         // Built-ins that may be referenced without uniform declarations.
         LEGACY_BUILTIN_MAP.put("gl_ModelViewMatrix", "iris_ModelViewMatrix");
@@ -1488,12 +1527,13 @@ public class VulkaniumGlslTransformer {
     private static String transformEntityVertex(String source) {
         String inputs = """
                 // ── Vulkanium Entity Vertex Inputs ──
+                // Must match BasicPipeline.createAttributeDescriptions() order:
+                // Position, UV0, Color, UV2(lightmap), Normal — UV1(overlay) skipped
                 layout(location = 0) in vec3 vkm_Entity_Position;
-                layout(location = 1) in vec4 vkm_Entity_Color;
-                layout(location = 2) in vec2 vkm_Entity_UV0;
-                layout(location = 3) in ivec2 vkm_Entity_UV1;
-                layout(location = 4) in ivec2 vkm_Entity_UV2;
-                layout(location = 5) in vec3 vkm_Entity_Normal;
+                layout(location = 1) in vec2 vkm_Entity_UV0;
+                layout(location = 2) in vec4 vkm_Entity_Color;
+                layout(location = 3) in ivec2 vkm_Entity_UV2;
+                layout(location = 4) in vec3 vkm_Entity_Normal;
                 """;
 
         source = insertAfterUBO(source, inputs);

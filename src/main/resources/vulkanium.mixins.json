@@ -14,6 +14,8 @@
     "render.MixinBufferUploader",
     "render.MixinVertexBuffer",
     "render.MixinBufferBuilder",
+    "render.MixinVertexFormatElement",
+    "render.MixinBlockRenderDispatcher",
     "render.MixinShaderProgram",
     "render.MixinTextureManager",
     "render.MixinEntityRenderDispatcher",

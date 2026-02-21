@@ -94,6 +94,18 @@ public class UniformBridge {
     public static final int OFF_CHUNK_OFFSET            = 912;
     public static final int OFF_COLOR_MODULATOR         = 928;
 
+    // ── Extended custom uniforms (filling former padding slots 944-1008) ──
+    /** vec4: (screenBrightness, eyeAltitude, worldDay, darknessLightFactor) */
+    public static final int OFF_CUSTOM_A                = 944;
+    /** vec4: (reserved, isEyeInCave, eyeBrightnessM, eyeBrightnessM2) */
+    public static final int OFF_CUSTOM_B                = 960;
+    /** vec4: (rainFactor, frameTimeSmooth, maxBlindnessDarkness, frameTime) */
+    public static final int OFF_CUSTOM_C                = 976;
+    /** vec4: (floor(camX), floor(camY), floor(camZ), 0) — integer camera position */
+    public static final int OFF_CAMERA_POS_INT          = 992;
+    /** vec4: (floor(prevCamX), floor(prevCamY), floor(prevCamZ), 0) */
+    public static final int OFF_PREV_CAMERA_POS_INT     = 1008;
+
     // ── Packed scalar offsets (bytes) ──
     public static final int OFF_SCREEN_SIZE             = 1024;
     public static final int OFF_VIEW_PARAMS             = 1040;
@@ -123,6 +135,12 @@ public class UniformBridge {
     public static final int OFF_GBUFFER_MODEL_VIEW      = 1312;
     /** mat4: gbufferModelViewInverse — inverse of the per-frame snapshot */
     public static final int OFF_GBUFFER_MODEL_VIEW_INV  = 1376;
+
+    // ── GBuffer Projection (per-frame camera projection, separate from per-draw gl_ProjectionMatrix) ──
+    /** mat4: gbufferProjection — per-frame camera projection */
+    public static final int OFF_GBUFFER_PROJECTION      = 1440;
+    /** mat4: gbufferProjectionInverse — inverse of per-frame camera projection */
+    public static final int OFF_GBUFFER_PROJECTION_INV  = 1504;
 
     // ── Double-buffered UBOs ──
     private final long[] uboBuffers = new long[2];

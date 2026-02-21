@@ -87,6 +87,22 @@ public class DrawBatcher {
     private float shadowDistanceRenderMul = -1.0f;
     private int shadowMapResolution = 1024;
 
+    // ── Eye brightness smoothing state ──
+    private float eyeBrightSmoothBlock = 0.0f;
+    private float eyeBrightSmoothSky = 240.0f;  // start at full daylight
+
+    // ── Custom uniform smoothing state (matches Iris SmoothedFloat) ──
+    private float smoothedEyeBrightM = 0.5f;       // smooth(eyeBrightness.y/240, 5s, 5s)
+    private float smoothedEyeBrightM2 = 1.0f;      // smooth(skyLight>239 ? 1 : 0, 2s, 2s)
+    private float smoothedIsEyeInCave = 0.0f;       // 1 - smooth(caveFactor, 6s, 12s)
+    private float smoothedCaveFactor = 1.0f;        // internal: smooth target for isEyeInCave
+    private float smoothedRainFactor = 0.0f;         // smooth(rainStrength, 3s, 3s)
+    private float smoothedFrameTime = 1.0f / 60.0f;  // smooth(frameTime, 5s, 5s)
+    private long lastFrameNanoTime = 0L;
+
+    // ── Previous camera position for TAA/motion vectors ──
+    private double prevCamX = 0.0, prevCamY = 64.0, prevCamZ = 0.0;
+
     /**
      * Updates shadow parameters from parsed directives.
      * Call after shadow infrastructure initialization.
@@ -101,6 +117,18 @@ public class DrawBatcher {
         this.shadowFarPlane = farPlane;
         this.shadowDistanceRenderMul = distRenderMul;
         this.shadowMapResolution = resolution;
+    }
+
+    /**
+     * Iris-compatible exponential smoothing: SmoothedFloat behavior.
+     * Uses different half-lives for increasing vs decreasing values.
+     * factor = exp(-deltaTime / halfLife * ln(2))
+     */
+    private static float irisSmooth(float current, float target, float halfLifeUp, float halfLifeDown, float dt) {
+        float halfLife = target > current ? halfLifeUp : halfLifeDown;
+        if (halfLife <= 0.0f) return target;
+        float factor = (float) Math.exp(-dt / halfLife * 0.693147f); // ln(2) ≈ 0.693147
+        return target + (current - target) * factor;
     }
 
     public void initialize(VkDevice device, VulkaniumMemory memory, int framesInFlight,
@@ -600,7 +628,14 @@ public class DrawBatcher {
             }
         } catch (Exception ignored) {}
         MemoryUtil.memPutFloat(viewParamsPtr + 8, farPlane);       // far
-        MemoryUtil.memPutFloat(viewParamsPtr + 12, 70.0f);         // fov (approx)
+        float fov = 70.0f;
+        try {
+            net.minecraft.client.Minecraft mcFov = net.minecraft.client.Minecraft.getInstance();
+            if (mcFov != null && mcFov.options != null) {
+                fov = mcFov.options.fov().get().floatValue();
+            }
+        } catch (Exception ignored) {}
+        MemoryUtil.memPutFloat(viewParamsPtr + 12, fov);             // fov from game settings
 
         // ── Time (offset 1056): vec4(frameTimeCounter, worldTime, frameCounter, sunAngle) ──
         long timePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_TIME;
@@ -743,6 +778,22 @@ public class DrawBatcher {
                 MemoryUtil.memPutFloat(gbufMVPtr + i * 4L, gbufMV[i]);
                 MemoryUtil.memPutFloat(gbufMVInvPtr + i * 4L, gbufMVInv[i]);
             }
+
+            // ── GBuffer Projection (offset 1440, 1504): per-frame camera projection ──
+            // Separate from per-draw iris_ProjectionMatrix so that composite shaders
+            // can set gl_ProjectionMatrix to identity while gbufferProjection retains
+            // the camera projection for ray/depth reconstruction.
+            org.joml.Matrix4f projMat = net.vulkanium.compat.VRenderSystem.getWorldRenderProjection();
+            float[] gbufProj = new float[16];
+            projMat.get(gbufProj);
+            float[] gbufProjInv = new float[16];
+            new org.joml.Matrix4f(projMat).invert().get(gbufProjInv);
+            long gbufProjPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_GBUFFER_PROJECTION;
+            long gbufProjInvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_GBUFFER_PROJECTION_INV;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(gbufProjPtr + i * 4L, gbufProj[i]);
+                MemoryUtil.memPutFloat(gbufProjInvPtr + i * 4L, gbufProjInv[i]);
+            }
         }
 
         // ── Shadow matrices (offsets 384, 448, 512, 576) ──
@@ -796,19 +847,31 @@ public class DrawBatcher {
         } catch (Exception ignored) {}
 
         // ── Eye Brightness (offset 1120): vec4(blockLight, skyLight, blockSmooth, skySmooth) ──
+        // Match Iris: use LightLayer.BLOCK and LightLayer.SKY at camera eye position,
+        // multiplied by 16 to get 0-240 range. Smoothed values use exponential decay.
         try {
             net.minecraft.client.Minecraft mc4 = net.minecraft.client.Minecraft.getInstance();
-            if (mc4 != null && mc4.player != null) {
-                int packedLight = mc4.player.getBlockX(); // placeholder — read actual brightness below
-                int blockLight = mc4.player.level().getMaxLocalRawBrightness(mc4.player.blockPosition());
-                int skyLight = 15; // approximation when no proper sky light query
-                // Use getBrightness for actual combined light
-                blockLight = Math.min(15, Math.max(0, blockLight));
+            if (mc4 != null && mc4.player != null && mc4.level != null) {
+                net.minecraft.world.phys.Vec3 feet = mc4.player.position();
+                net.minecraft.core.BlockPos eyePos = net.minecraft.core.BlockPos.containing(
+                        feet.x, mc4.player.getEyeY(), feet.z);
+                int blockLight = mc4.level.getBrightness(
+                        net.minecraft.world.level.LightLayer.BLOCK, eyePos);
+                int skyLightVal = mc4.level.getBrightness(
+                        net.minecraft.world.level.LightLayer.SKY, eyePos);
+                float blockF = blockLight * 16.0f;
+                float skyF = skyLightVal * 16.0f;
+
+                // Simple exponential smoothing (half-life ~1s at 60fps)
+                float alpha = 0.03f;
+                eyeBrightSmoothBlock = eyeBrightSmoothBlock + (blockF - eyeBrightSmoothBlock) * alpha;
+                eyeBrightSmoothSky = eyeBrightSmoothSky + (skyF - eyeBrightSmoothSky) * alpha;
+
                 long eyePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_EYE_BRIGHTNESS;
-                MemoryUtil.memPutFloat(eyePtr, blockLight * 16.0f);       // block (0-240 range like OptiFine)
-                MemoryUtil.memPutFloat(eyePtr + 4, skyLight * 16.0f);     // sky
-                MemoryUtil.memPutFloat(eyePtr + 8, blockLight * 16.0f);   // smoothed (TODO: proper smoothing)
-                MemoryUtil.memPutFloat(eyePtr + 12, skyLight * 16.0f);
+                MemoryUtil.memPutFloat(eyePtr, blockF);
+                MemoryUtil.memPutFloat(eyePtr + 4, skyF);
+                MemoryUtil.memPutFloat(eyePtr + 8, eyeBrightSmoothBlock);
+                MemoryUtil.memPutFloat(eyePtr + 12, eyeBrightSmoothSky);
             }
         } catch (Exception ignored) {}
 
@@ -831,16 +894,233 @@ public class DrawBatcher {
         } catch (Exception ignored) {}
 
         // ── Previous camera position (offset 784): vec4(x, y, z, 0) ──
-        // For now, use current camera pos as prev (motion blur will be minimal)
+        // Use stored previous frame's camera position for TAA/motion vectors.
+        {
+            long prevCamPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_CAMERA_POS;
+            MemoryUtil.memPutFloat(prevCamPtr, (float) prevCamX);
+            MemoryUtil.memPutFloat(prevCamPtr + 4, (float) prevCamY);
+            MemoryUtil.memPutFloat(prevCamPtr + 8, (float) prevCamZ);
+            MemoryUtil.memPutFloat(prevCamPtr + 12, 0.0f);
+        }
+        // Update stored previous camera position for next frame
         try {
             net.minecraft.client.Minecraft mc6 = net.minecraft.client.Minecraft.getInstance();
             if (mc6 != null && mc6.gameRenderer != null && mc6.gameRenderer.getMainCamera() != null) {
                 net.minecraft.world.phys.Vec3 camPos = mc6.gameRenderer.getMainCamera().getPosition();
-                long prevCamPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_CAMERA_POS;
-                MemoryUtil.memPutFloat(prevCamPtr, (float) camPos.x);
-                MemoryUtil.memPutFloat(prevCamPtr + 4, (float) camPos.y);
-                MemoryUtil.memPutFloat(prevCamPtr + 8, (float) camPos.z);
-                MemoryUtil.memPutFloat(prevCamPtr + 12, 0.0f);
+                prevCamX = camPos.x;
+                prevCamY = camPos.y;
+                prevCamZ = camPos.z;
+            }
+        } catch (Exception ignored) {}
+
+        // ── Player State (offset 1104): vec4(nightVision, blindness, darknessFactor, playerMood) ──
+        // Match Iris CommonUniforms: nightVision from MobEffects.NIGHT_VISION,
+        // blindness from MobEffects.BLINDNESS, darknessFactor from DARKNESS effect.
+        try {
+            net.minecraft.client.Minecraft mc7 = net.minecraft.client.Minecraft.getInstance();
+            if (mc7 != null && mc7.player != null) {
+                float nightVision = 0.0f;
+                float blindness = 0.0f;
+                float darknessFactor = 0.0f;
+
+                // Night vision effect strength
+                net.minecraft.world.effect.MobEffectInstance nvEffect =
+                        mc7.player.getEffect(net.minecraft.world.effect.MobEffects.NIGHT_VISION);
+                if (nvEffect != null) {
+                    float partialTick = net.vulkanium.Vulkanium.getCurrentPartialTick();
+                    nightVision = net.minecraft.client.renderer.GameRenderer
+                            .getNightVisionScale(mc7.player, partialTick);
+                }
+
+                // Blindness
+                if (mc7.player.hasEffect(net.minecraft.world.effect.MobEffects.BLINDNESS)) {
+                    blindness = 1.0f;
+                }
+
+                // Darkness
+                if (mc7.player.hasEffect(net.minecraft.world.effect.MobEffects.DARKNESS)) {
+                    darknessFactor = 1.0f;
+                }
+
+                long playerPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PLAYER_STATE;
+                MemoryUtil.memPutFloat(playerPtr, nightVision);
+                MemoryUtil.memPutFloat(playerPtr + 4, blindness);
+                MemoryUtil.memPutFloat(playerPtr + 8, darknessFactor);
+                MemoryUtil.memPutFloat(playerPtr + 12, 0.0f); // playerMood (placeholder)
+            }
+        } catch (Exception ignored) {}
+
+        // ── Depth Params (offset 1152): vec4(centerDepthSmooth, near, far, 0) ──
+        // centerDepthSmooth should be read from the depth buffer center texel;
+        // for now use 1.0 (far plane) as a safe default so auto-exposure doesn't break.
+        {
+            long depthPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_DEPTH_PARAMS;
+            MemoryUtil.memPutFloat(depthPtr, 1.0f);       // centerDepthSmooth (far plane default)
+            MemoryUtil.memPutFloat(depthPtr + 4, 0.05f);   // near
+            MemoryUtil.memPutFloat(depthPtr + 8, farPlane); // far
+            MemoryUtil.memPutFloat(depthPtr + 12, 0.0f);
+        }
+
+        // ── Blocklight Color (offset 1200): vec4(r, g, b, 1) ──
+        // Warm torch-light color matching Iris defaults.
+        {
+            long blcPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_BLOCKLIGHT_COLOR;
+            MemoryUtil.memPutFloat(blcPtr, 1.0f);
+            MemoryUtil.memPutFloat(blcPtr + 4, 0.7f);
+            MemoryUtil.memPutFloat(blcPtr + 8, 0.4f);
+            MemoryUtil.memPutFloat(blcPtr + 12, 1.0f);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Extended Custom Uniforms — filling former padding slots
+        // ═══════════════════════════════════════════════════════════════
+
+        // Compute real delta time for smoothing and frameTime uniform
+        long nowNano = System.nanoTime();
+        float deltaTime;
+        if (lastFrameNanoTime == 0L) {
+            deltaTime = 1.0f / 60.0f;
+            lastFrameNanoTime = nowNano;
+        } else {
+            deltaTime = (nowNano - lastFrameNanoTime) / 1_000_000_000.0f;
+            deltaTime = Math.max(0.0001f, Math.min(deltaTime, 1.0f)); // clamp to [0.1ms, 1s]
+            lastFrameNanoTime = nowNano;
+        }
+
+        // ── Custom A (offset 944): vec4(screenBrightness, eyeAltitude, worldDay, darknessLightFactor) ──
+        {
+            float screenBrightness = 0.5f;
+            float eyeAltitude = 64.0f;
+            float worldDayF = 0.0f;
+            float darknessLightFactor = 0.0f;
+            try {
+                net.minecraft.client.Minecraft mc8 = net.minecraft.client.Minecraft.getInstance();
+                if (mc8 != null) {
+                    // screenBrightness = game gamma setting (Options > Video > Brightness)
+                    if (mc8.options != null) {
+                        screenBrightness = (float) mc8.options.gamma().get().doubleValue();
+                    }
+                    // eyeAltitude = camera Y coordinate
+                    if (mc8.gameRenderer != null && mc8.gameRenderer.getMainCamera() != null) {
+                        eyeAltitude = (float) mc8.gameRenderer.getMainCamera().getPosition().y;
+                    }
+                    // worldDay = total day count
+                    if (mc8.level != null) {
+                        worldDayF = (float) (mc8.level.getDayTime() / 24000L);
+                    }
+                    // darknessLightFactor: captures the darkness effect's light suppression
+                    // In Iris this comes from CapturedRenderingState; approximate from effect
+                    if (mc8.player != null && mc8.player.hasEffect(net.minecraft.world.effect.MobEffects.DARKNESS)) {
+                        // Darkness pulsates — compute from effect duration
+                        net.minecraft.world.effect.MobEffectInstance darkEffect =
+                                mc8.player.getEffect(net.minecraft.world.effect.MobEffects.DARKNESS);
+                        if (darkEffect != null) {
+                            float partialTick = net.vulkanium.Vulkanium.getCurrentPartialTick();
+                            float effectTicks = (float) darkEffect.getDuration() - partialTick;
+                            // Pulsating factor similar to vanilla's darkness calculations
+                            darknessLightFactor = Math.max(0.0f,
+                                    (float) Math.cos((effectTicks * Math.PI / 40.0f)) * 0.5f + 0.5f);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+            long caPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_CUSTOM_A;
+            MemoryUtil.memPutFloat(caPtr, screenBrightness);
+            MemoryUtil.memPutFloat(caPtr + 4, eyeAltitude);
+            MemoryUtil.memPutFloat(caPtr + 8, worldDayF);
+            MemoryUtil.memPutFloat(caPtr + 12, darknessLightFactor);
+        }
+
+        // ── Custom B (offset 960): vec4(reserved, isEyeInCave, eyeBrightnessM, eyeBrightnessM2) ──
+        // These require CPU-side exponential smoothing matching Iris SmoothedFloat.
+        {
+            float rawEyeBrightMTarget = 0.5f;
+            float rawEyeBrightM2Target = 1.0f;
+            float rawCaveFactorTarget = 1.0f; // 1.0 = surface, low = cave
+            try {
+                net.minecraft.client.Minecraft mc9 = net.minecraft.client.Minecraft.getInstance();
+                if (mc9 != null && mc9.player != null && mc9.level != null) {
+                    net.minecraft.world.phys.Vec3 feet = mc9.player.position();
+                    net.minecraft.core.BlockPos eyePos = net.minecraft.core.BlockPos.containing(
+                            feet.x, mc9.player.getEyeY(), feet.z);
+                    int skyL = mc9.level.getBrightness(net.minecraft.world.level.LightLayer.SKY, eyePos);
+                    float skyLightNorm = (skyL * 16.0f) / 240.0f;
+
+                    rawEyeBrightMTarget = skyLightNorm;
+                    rawEyeBrightM2Target = (skyL * 16.0f) > 239.0f ? 1.0f : 0.0f;
+
+                    // Cave factor: if eyeAltitude < 5 → use sky brightness, else 1.0 (surface)
+                    float eyeY = (float) mc9.gameRenderer.getMainCamera().getPosition().y;
+                    int isInWater = mc9.gameRenderer.getMainCamera().getFluidInCamera()
+                            != net.minecraft.world.level.material.FogType.NONE ? 1 : 0;
+                    if (isInWater == 0) {
+                        rawCaveFactorTarget = eyeY < 5.0f ? skyLightNorm : 1.0f;
+                    } else {
+                        rawCaveFactorTarget = 1.0f; // not in cave when underwater
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            // Apply Iris-compatible exponential smoothing: factor = exp(-dt / halfLife * ln2)
+            smoothedEyeBrightM = irisSmooth(smoothedEyeBrightM, rawEyeBrightMTarget, 5.0f, 5.0f, deltaTime);
+            smoothedEyeBrightM2 = irisSmooth(smoothedEyeBrightM2, rawEyeBrightM2Target, 2.0f, 2.0f, deltaTime);
+            smoothedCaveFactor = irisSmooth(smoothedCaveFactor, rawCaveFactorTarget, 6.0f, 12.0f, deltaTime);
+            smoothedIsEyeInCave = 1.0f - smoothedCaveFactor;
+
+            long cbPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_CUSTOM_B;
+            MemoryUtil.memPutFloat(cbPtr, 0.0f); // reserved
+            MemoryUtil.memPutFloat(cbPtr + 4, smoothedIsEyeInCave);
+            MemoryUtil.memPutFloat(cbPtr + 8, smoothedEyeBrightM);
+            MemoryUtil.memPutFloat(cbPtr + 12, smoothedEyeBrightM2);
+        }
+
+        // ── Custom C (offset 976): vec4(rainFactor, frameTimeSmooth, maxBlindnessDarkness, frameTime) ──
+        {
+            float rawRain = 0.0f;
+            float blindnessVal = 0.0f;
+            float darknessVal = 0.0f;
+            try {
+                net.minecraft.client.Minecraft mc10 = net.minecraft.client.Minecraft.getInstance();
+                if (mc10 != null && mc10.level != null) {
+                    rawRain = mc10.level.getRainLevel(net.vulkanium.Vulkanium.getCurrentPartialTick());
+                }
+                if (mc10 != null && mc10.player != null) {
+                    if (mc10.player.hasEffect(net.minecraft.world.effect.MobEffects.BLINDNESS)) {
+                        blindnessVal = 1.0f;
+                    }
+                    if (mc10.player.hasEffect(net.minecraft.world.effect.MobEffects.DARKNESS)) {
+                        darknessVal = 1.0f;
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            smoothedRainFactor = irisSmooth(smoothedRainFactor, rawRain, 3.0f, 3.0f, deltaTime);
+            smoothedFrameTime = irisSmooth(smoothedFrameTime, deltaTime, 5.0f, 5.0f, deltaTime);
+
+            long ccPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_CUSTOM_C;
+            MemoryUtil.memPutFloat(ccPtr, smoothedRainFactor);
+            MemoryUtil.memPutFloat(ccPtr + 4, smoothedFrameTime);
+            MemoryUtil.memPutFloat(ccPtr + 8, Math.max(blindnessVal, darknessVal));
+            MemoryUtil.memPutFloat(ccPtr + 12, deltaTime); // real frame delta time
+        }
+
+        // ── Camera Position Integer (offset 992): vec4(floor(x), floor(y), floor(z), 0) ──
+        // ── Prev Camera Position Integer (offset 1008): vec4(floor(prevX), floor(prevY), floor(prevZ), 0) ──
+        try {
+            net.minecraft.client.Minecraft mc11 = net.minecraft.client.Minecraft.getInstance();
+            if (mc11 != null && mc11.gameRenderer != null && mc11.gameRenderer.getMainCamera() != null) {
+                net.minecraft.world.phys.Vec3 camPos = mc11.gameRenderer.getMainCamera().getPosition();
+                long ciPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_CAMERA_POS_INT;
+                MemoryUtil.memPutFloat(ciPtr, (float) Math.floor(camPos.x));
+                MemoryUtil.memPutFloat(ciPtr + 4, (float) Math.floor(camPos.y));
+                MemoryUtil.memPutFloat(ciPtr + 8, (float) Math.floor(camPos.z));
+                MemoryUtil.memPutFloat(ciPtr + 12, 0.0f);
+
+                long piPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_CAMERA_POS_INT;
+                MemoryUtil.memPutFloat(piPtr, (float) Math.floor(prevCamX));
+                MemoryUtil.memPutFloat(piPtr + 4, (float) Math.floor(prevCamY));
+                MemoryUtil.memPutFloat(piPtr + 8, (float) Math.floor(prevCamZ));
+                MemoryUtil.memPutFloat(piPtr + 12, 0.0f);
             }
         } catch (Exception ignored) {}
 

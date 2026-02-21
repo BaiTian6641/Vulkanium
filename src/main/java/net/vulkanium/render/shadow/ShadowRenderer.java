@@ -249,15 +249,28 @@ public class ShadowRenderer {
     }
 
     private void renderEntitiesShadow(long commandBuffer, Vector3d cameraPos) {
-        // Entity rendering delegated to the entity rendering subsystem
-        // which iterates visible entities within the entityFrustum bounds
-        // For now, the entity renderer integration is handled at a higher level
-        // by the main world renderer which calls into Minecraft's entity dispatch
+        // TODO: Entity shadow rendering requires:
+        //   1. Shadow-compatible entity pipelines (created against the shadow render pass)
+        //   2. Pipeline selection routing: when ShadowRenderer.ACTIVE, resolve to shadow
+        //      programs (shadow.vsh/fsh) instead of gbuffers_entities
+        //   3. Entity iteration: level.entitiesForRendering() filtered by entityFrustum
+        //   4. For each visible entity: call EntityRenderDispatcher.render()
+        //      → draw calls flow through MixinBufferUploader → recordDraw()
+        //      → the command buffer is shared with shadow pass, so draws record
+        //        into the active shadow render pass automatically
+        //   5. Block entity iteration: visibleBlockEntities from terrain setup
+        //
+        // The current frame's command buffer (frameOrchestrator.getCommandBuffer())
+        // is the SAME one used by the shadow pass, so draw calls recorded during
+        // entity rendering will correctly go into the shadow render pass.  The main
+        // blocker is creating shadow-compatible VkPipelines for entity vertex formats.
         entitiesRendered = 0;
     }
 
     private void renderBlockEntitiesShadow(long commandBuffer) {
-        // Block entity rendering delegated to the block entity rendering subsystem
+        // TODO: See renderEntitiesShadow — same architectural requirements.
+        // Block entities use the same rendering pipeline as entities but with
+        // different vertex formats and model rendering code.
         blockEntitiesRendered = 0;
     }
 

@@ -519,6 +519,21 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 LOGGER.info("[LOAD]   No shaders.properties found (using defaults)");
             }
 
+            // ── Phase 1b: Parse block.properties for material IDs ──
+            try {
+                String blockPropsContent = source.readShaderFile("block.properties");
+                if (blockPropsContent != null) {
+                    net.vulkanium.shaderpack.materialmap.BlockPropertyIdMap.load(blockPropsContent);
+                    LOGGER.info("[LOAD]   block.properties loaded — material IDs active");
+                } else {
+                    LOGGER.info("[LOAD]   No block.properties found (all blocks get mc_Entity=-1)");
+                    net.vulkanium.shaderpack.materialmap.BlockPropertyIdMap.clear();
+                }
+            } catch (Exception e) {
+                LOGGER.error("[LOAD]   Failed to parse block.properties", e);
+                net.vulkanium.shaderpack.materialmap.BlockPropertyIdMap.clear();
+            }
+
             // ── Phase 2: Discover and resolve programs ──
             LOGGER.info("[LOAD] ──── Phase 2: Discovering shader programs ────");
             reportProgress(new LoadProgress(

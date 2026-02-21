@@ -91,8 +91,8 @@ public class VulkaniumASTTransformer {
         // Matrices
         UNIFORM_REMAP.put("gbufferModelView", "iris_GBufferModelView");
         UNIFORM_REMAP.put("gbufferModelViewInverse", "iris_GBufferModelViewInverse");
-        UNIFORM_REMAP.put("gbufferProjection", "iris_ProjectionMatrix");
-        UNIFORM_REMAP.put("gbufferProjectionInverse", "iris_ProjectionMatrixInverse");
+        UNIFORM_REMAP.put("gbufferProjection", "iris_GBufferProjection");
+        UNIFORM_REMAP.put("gbufferProjectionInverse", "iris_GBufferProjectionInverse");
         UNIFORM_REMAP.put("gbufferPreviousModelView", "iris_PreviousModelViewMatrix");
         UNIFORM_REMAP.put("gbufferPreviousProjection", "iris_PreviousProjectionMatrix");
         UNIFORM_REMAP.put("modelViewMatrix", "iris_ModelViewMatrix");
@@ -166,6 +166,32 @@ public class VulkaniumASTTransformer {
         UNIFORM_REMAP.put("heldBlockLightValue", "int(iris_HeldItems.y)");
         UNIFORM_REMAP.put("heldItemId2", "int(iris_HeldItems.z)");
         UNIFORM_REMAP.put("heldBlockLightValue2", "int(iris_HeldItems.w)");
+
+        // ── Extended custom uniforms (formerly missing → const 0) ──
+        // Standard uniforms that had no UBO mapping:
+        UNIFORM_REMAP.put("screenBrightness", "iris_CustomA.x");
+        UNIFORM_REMAP.put("eyeAltitude", "iris_CustomA.y");
+        UNIFORM_REMAP.put("worldDay", "int(iris_CustomA.z)");
+        UNIFORM_REMAP.put("darknessLightFactor", "iris_CustomA.w");
+        UNIFORM_REMAP.put("frameTime", "iris_CustomC.w");
+        UNIFORM_REMAP.put("renderStage", "int(iris_RenderState.x)");
+
+        // Hardcoded custom uniform expressions (Iris HardcodedCustomUniforms equivalents):
+        UNIFORM_REMAP.put("framemod8", "mod(iris_Time.z, 8.0)");
+        UNIFORM_REMAP.put("maxBlindnessDarkness", "max(iris_PlayerState.y, iris_PlayerState.z)");
+
+        // CPU-smoothed custom uniforms (populated in DrawBatcher):
+        UNIFORM_REMAP.put("isEyeInCave", "iris_CustomB.y");
+        UNIFORM_REMAP.put("eyeBrightnessM", "iris_CustomB.z");
+        UNIFORM_REMAP.put("eyeBrightnessM2", "iris_CustomB.w");
+        UNIFORM_REMAP.put("rainFactor", "iris_CustomC.x");
+        UNIFORM_REMAP.put("frameTimeSmooth", "iris_CustomC.y");
+
+        // Camera integer/fractional position splits (Iris 1.8+ feature):
+        UNIFORM_REMAP.put("cameraPositionFract", "fract(iris_CameraPosition.xyz)");
+        UNIFORM_REMAP.put("previousCameraPositionFract", "fract(iris_PreviousCameraPosition.xyz)");
+        UNIFORM_REMAP.put("cameraPositionInt", "ivec3(iris_CameraPositionInt.xyz)");
+        UNIFORM_REMAP.put("previousCameraPositionInt", "ivec3(iris_PrevCameraPositionInt.xyz)");
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -261,11 +287,11 @@ public class VulkaniumASTTransformer {
                 vec4 iris_EntityColor;
                 vec4 iris_ChunkOffset;
                 vec4 iris_ColorModulator;
-                vec4 iris_Padding1;
-                vec4 iris_Padding2;
-                vec4 iris_Padding3;
-                vec4 iris_Padding4;
-                vec4 iris_Padding5;
+                vec4 iris_CustomA;
+                vec4 iris_CustomB;
+                vec4 iris_CustomC;
+                vec4 iris_CameraPositionInt;
+                vec4 iris_PrevCameraPositionInt;
                 vec4 iris_ScreenSize;
                 vec4 iris_ViewParams;
                 vec4 iris_Time;
@@ -286,6 +312,8 @@ public class VulkaniumASTTransformer {
                 vec4 iris_HdrDisplay;
                 mat4 iris_GBufferModelView;
                 mat4 iris_GBufferModelViewInverse;
+                mat4 iris_GBufferProjection;
+                mat4 iris_GBufferProjectionInverse;
             };
             """;
 
@@ -310,17 +338,17 @@ public class VulkaniumASTTransformer {
             """;
 
     // Terrain vertex inputs — MUST match BasicPipeline.createAttributeDescriptions
-    // location scheme for MC's DefaultVertexFormat.BLOCK:
+    // location scheme for Vulkanium extended terrain format (36 bytes):
     //   0=Position(vec3,R32G32B32_SFLOAT), 1=UV0(vec2,R32G32_SFLOAT),
     //   2=Color(vec4,R8G8B8A8_UNORM), 3=UV2/lightmap(ivec2,R16G16_SINT),
-    //   4=Normal(vec4,R8G8B8A8_SNORM)
-    // NOTE: MC's BLOCK format does NOT include Tangent or EntityId.
+    //   4=Normal(vec4,R8G8B8A8_SNORM), 5=mc_Entity(ivec2,R16G16_SINT)
     private static final String TERRAIN_VERTEX_INPUTS = """
             layout(location = 0) in vec3 vkm_Position;
             layout(location = 1) in vec2 vkm_TexCoord;
             layout(location = 2) in vec4 vkm_Color;
             layout(location = 3) in ivec2 vkm_LightCoord;
             layout(location = 4) in vec4 vkm_NormalPacked;
+            layout(location = 5) in ivec2 vkm_Entity;
             """;
 
     private static final String TERRAIN_VERTEX_DECODED_VARS = """
@@ -347,7 +375,7 @@ public class VulkaniumASTTransformer {
                 vec3 tangentDir = abs(iris_compat_Normal.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
                 iris_compat_Tangent = vec4(normalize(cross(iris_compat_Normal, tangentDir)), 1.0);
                 iris_vk_MidTexCoord = vkm_TexCoord;
-                iris_vk_EntityId = -1; // MC BLOCK format has no entity data
+                iris_vk_EntityId = vkm_Entity.x; // block material ID from block.properties
             }
             """;
 
@@ -432,6 +460,16 @@ public class VulkaniumASTTransformer {
 
         // ── 4. Rename uniform references → UBO member expressions ──
         renameUniforms(tree, root, params);
+
+        // ── 4.5. For COMPOSITE passes, replace per-draw GL matrices with identity ──
+        // In Iris/OpenGL, gl_ModelViewMatrix = identity and gl_ProjectionMatrix = scale
+        // matrix for composite fullscreen passes. gbufferModelView/gbufferProjection
+        // remain as the camera matrices. Since we've separated gbufferProjection →
+        // iris_GBufferProjection, we can safely replace per-draw matrix references
+        // with mat4(1.0) for composites without affecting gbuffer matrix readers.
+        if (params.passType == PassType.COMPOSITE) {
+            replaceCompositeGLMatrices(tree, root);
+        }
 
         // ── 5. Rename legacy GL builtins ──
         renameGLBuiltins(tree, root, params);
@@ -567,6 +605,36 @@ public class VulkaniumASTTransformer {
                 // Complex expression replacement (e.g., "iris_CameraPosition.xyz")
                 root.replaceReferenceExpressions(transformer, oldName, newExpr);
             }
+        }
+    }
+
+    /**
+     * For COMPOSITE passes, replaces per-draw GL matrix UBO members with identity.
+     *
+     * <p>After uniform remapping, gl_ModelViewMatrix → iris_ModelViewMatrix, etc.
+     * For composite fullscreen passes, these per-draw matrices should be identity
+     * (matching Iris behavior where gl_ModelViewMatrix = mat4(1.0) for composites).
+     * The separate gbuffer matrices (iris_GBufferModelView, iris_GBufferProjection)
+     * still carry the camera matrices for ray reconstruction.</p>
+     */
+    private static void replaceCompositeGLMatrices(TranslationUnit tree, Root root) {
+        // Replace per-draw model-view matrices with identity
+        if (root.identifierIndex.has("iris_ModelViewMatrix")) {
+            root.replaceReferenceExpressions(transformer, "iris_ModelViewMatrix", "mat4(1.0)");
+        }
+        if (root.identifierIndex.has("iris_ModelViewMatrixInverse")) {
+            root.replaceReferenceExpressions(transformer, "iris_ModelViewMatrixInverse", "mat4(1.0)");
+        }
+        // Replace per-draw projection matrices with identity
+        if (root.identifierIndex.has("iris_ProjectionMatrix")) {
+            root.replaceReferenceExpressions(transformer, "iris_ProjectionMatrix", "mat4(1.0)");
+        }
+        if (root.identifierIndex.has("iris_ProjectionMatrixInverse")) {
+            root.replaceReferenceExpressions(transformer, "iris_ProjectionMatrixInverse", "mat4(1.0)");
+        }
+        // Replace normal matrix with identity
+        if (root.identifierIndex.has("iris_NormalMat4")) {
+            root.replaceReferenceExpressions(transformer, "iris_NormalMat4", "mat4(1.0)");
         }
     }
 
@@ -825,14 +893,14 @@ public class VulkaniumASTTransformer {
         //       which is invalid (.a on vec3). Collapse: .rgb.a → .a, .rgb.rgb → .rgb, etc.
         source = collapseDoubleSwizzles(source);
 
-        // 4.6. For gbuffers_water vertex shader, override entity ID to water material.
-        //      Without Iris chunk-building integration, iris_vk_EntityId is hardcoded to -1.
-        //      gbuffers_water is only invoked for water blocks, so we can safely set the
-        //      entity ID to a common water material value (block state ~6000 in OptiFine convention).
+        // 4.6. For gbuffers_water vertex shader, ensure water material ID.
+        //      With block.properties loaded, vkm_Entity.x provides the correct water ID.
+        //      This override is a legacy fallback that only fires if the vertex decode
+        //      still uses the hardcoded -1 (shouldn't happen with v21+).
         if (params.isVertex && params.programName != null
                 && params.programName.contains("water")
                 && source.contains("iris_vk_EntityId = -1")) {
-            source = source.replace("iris_vk_EntityId = -1", "iris_vk_EntityId = 6000");
+            source = source.replace("iris_vk_EntityId = -1", "iris_vk_EntityId = 32000");
         }
 
         // 5. Apply compatibility fallbacks (MC_RENDER_STAGE_*, fsr*, Biome*Smooth, etc.)
@@ -936,9 +1004,11 @@ public class VulkaniumASTTransformer {
                 "(vec2(1.0) / max(iris_ScreenSize.xy, vec2(1.0)))");
 
         // ── Camera position derivatives ──
-        COMPAT_REPLACEMENTS.put("cameraPositionFract", "fract(iris_CameraPosition.xyz)");
         COMPAT_REPLACEMENTS.put("cameraPositionToPrevious",
                 "(iris_PreviousCameraPosition.xyz - iris_CameraPosition.xyz)");
+
+        // ── Relative eye position (Iris-specific, approx standing player) ──
+        COMPAT_REPLACEMENTS.put("relativeEyePosition", "vec3(0.0, 1.62, 0.0)");
 
         // ── Partial matrix column/row extractions ──
         // Used by some shaderpacks for optimized matrix access instead of the full mat4
@@ -952,12 +1022,6 @@ public class VulkaniumASTTransformer {
         COMPAT_REPLACEMENTS.put("shadowModelView1", "iris_ShadowModelView[1].xyz");
         COMPAT_REPLACEMENTS.put("shadowModelView2", "iris_ShadowModelView[2].xyz");
         COMPAT_REPLACEMENTS.put("shadowModelViewInverse2", "iris_ShadowModelViewInverse[2].xyz");
-
-        // ── Frame time ──
-        // frameTime is the delta time per frame; approximate as 1/60 until we
-        // add a proper delta-time UBO field.  frameTimeCounter (accumulated) is
-        // already in UNIFORM_REMAP → iris_Time.x.
-        COMPAT_REPLACEMENTS.put("frameTime", "(1.0 / 60.0)");
 
         // FSR / TAA fallback aliases
         COMPAT_REPLACEMENTS.put("fsrScreenSize", "vec2(iris_ScreenSize.x, iris_ScreenSize.y)");
