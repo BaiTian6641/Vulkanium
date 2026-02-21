@@ -1652,12 +1652,28 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             initializeShadowImageLayouts(cmd);
         }
 
-        if (shadowRenderer == null || shadowMap == null) return;
-        if (shadowDirectives == null || shadowDirectives.getDistance() <= 0) return;
+        if (shadowRenderer == null || shadowMap == null) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: shadowRenderer={} shadowMap={}",
+                    shadowRenderer != null ? "OK" : "null",
+                    shadowMap != null ? "OK" : "null");
+            return;
+        }
+        if (shadowDirectives == null || shadowDirectives.getDistance() <= 0) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: shadowDirectives={} distance={}",
+                    shadowDirectives != null ? "OK" : "null",
+                    shadowDirectives != null ? shadowDirectives.getDistance() : "N/A");
+            return;
+        }
 
         // Get camera position and sky angle from live game state
         net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
-        if (mc == null || mc.level == null || mc.player == null) return;
+        if (mc == null || mc.level == null || mc.player == null) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: mc={} level={} player={}",
+                    mc != null ? "OK" : "null",
+                    mc != null && mc.level != null ? "OK" : "null",
+                    mc != null && mc.player != null ? "OK" : "null");
+            return;
+        }
 
         float partialTick = Vulkanium.getCurrentPartialTick();
         float skyAngle = mc.level.getTimeOfDay(partialTick);
@@ -1670,9 +1686,13 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         net.vulkanium.world.VulkaniumWorldRenderer worldRenderer =
                 net.vulkanium.world.VulkaniumWorldRenderer.getInstance();
         net.vulkanium.render.terrain.ChunkRenderer chunkRenderer = worldRenderer.getChunkRenderer();
-        if (chunkRenderer == null) return;
+        if (chunkRenderer == null) {
+            LOGGER.debug("[SHADOW] renderShadowPass skipped: chunkRenderer is null");
+            return;
+        }
 
-        // Set shadow phase
+        LOGGER.debug("[SHADOW] Executing shadow pass: distance={}, skyAngle={}",
+                shadowDirectives.getDistance(), skyAngle);
         net.vulkanium.render.program.WorldRenderingPhase.setPhase(
                 net.vulkanium.render.program.WorldRenderingPhase.Phase.SHADOW);
 

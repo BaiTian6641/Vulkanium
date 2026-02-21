@@ -149,6 +149,20 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
         rainStrength = level.getRainLevel(1.0f);
         wetness = level.getRainLevel(1.0f); // Simplified — Iris tracks wetness separately
 
+        // Sky color — read from the actual level, matching Iris CommonUniforms.getSkyColor()
+        if (mc.cameraEntity != null) {
+            net.minecraft.world.phys.Vec3 sc = level.getSkyColor(mc.cameraEntity.position(), partialTick);
+            skyColor[0] = (float) sc.x;
+            skyColor[1] = (float) sc.y;
+            skyColor[2] = (float) sc.z;
+        }
+
+        // Fog color — capture from RenderSystem fog state
+        fogColor[0] = net.vulkanium.compat.VRenderSystem.getFogColorR();
+        fogColor[1] = net.vulkanium.compat.VRenderSystem.getFogColorG();
+        fogColor[2] = net.vulkanium.compat.VRenderSystem.getFogColorB();
+        fogColor[3] = net.vulkanium.compat.VRenderSystem.getFogColorA();
+
         // Screen
         viewWidth = mc.getWindow().getWidth();
         viewHeight = mc.getWindow().getHeight();

@@ -821,6 +821,10 @@ public class Vulkanium implements ClientModInitializer {
 
             var gbuf = vkPipeline.getGBufferManager();
             if (gbuf != null) {
+                // Ensure G-buffer dimensions match current swapchain size
+                // (fsTargets are resized in prepareFullscreenInputs, but G-buffer
+                //  must match BEFORE the world pass begins rendering into it)
+                gbuf.ensureSize(vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
                 gbuf.beginWorldPass(cmd, mainRenderPass);
             }
         }
@@ -989,10 +993,17 @@ public class Vulkanium implements ClientModInitializer {
                         ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_HAND_WATER
                         : net.vulkanium.shaderpack.ProgramId.GBUFFERS_HAND;
             }
-            // Keep other entities/glint on the stable fallback path for now.
-            // iterationRP entity compatibility requires tighter parity for overlays,
-            // lightmaps and material conventions than this bridge currently provides.
-            return null;
+            // Route specific render types to their dedicated shaderpack programs
+            if (name.startsWith("rendertype_eyes")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_SPIDEREYES;
+            }
+            if (name.startsWith("rendertype_glint") || name.contains("armor_glint")) {
+                return net.vulkanium.shaderpack.ProgramId.GBUFFERS_ARMOR_GLINT;
+            }
+            // Standard entity rendering through shaderpack pipeline
+            return name.contains("translucent")
+                    ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES_TRANSLUCENT
+                    : net.vulkanium.shaderpack.ProgramId.GBUFFERS_ENTITIES;
         }
 
         if (!isTerrainLikeFormat(format)) {
@@ -1285,16 +1296,29 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetY = net.vulkanium.compat.VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
 
-            // ── gbufferModelView = snapshot camera MV (not per-draw GL MV) ──
-            // Iris sets gbufferModelView = poseStack.last().pose() captured once
-            // per frame at the start of renderLevel.  Using the per-draw GL
-            // model-view would include per-section chunk offset translations,
-            // causing gbufferModelViewInverse * sunPosition to give a different
-            // world-space light direction for each section → light "rotates" as
-            // the camera turns.  The chunk offset goes in iris_ChunkOffset and
-            // is applied in the vertex decode (vkm_Position + chunkOffset).
-            org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(
-                    net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
+            // ── gbufferModelView vs per-draw GL ModelView ──
+            // Iris has TWO matrix paths:
+            //   gbufferModelView = camera-only snapshot (captured once per frame)
+            //   gl_ModelViewMatrix (iris_ModelViewMatrix) = per-draw GL MV
+            //
+            // For terrain draws (hasChunkOffset), the per-draw GL MV includes
+            // per-section chunk offset translations which would break
+            // gbufferModelViewInverse * sunPosition.  So we use the snapshot.
+            //
+            // For sky/entity draws (!hasChunkOffset), MC sets the per-draw GL MV
+            // to include sky-specific rotations (celestial body angling, etc).
+            // Using the snapshot would lock the sky to the camera → sky follows
+            // the player instead of staying fixed in world space.
+            org.joml.Matrix4f modelViewMat;
+            if (net.vulkanium.compat.VRenderSystem.hasChunkOffset()) {
+                // Terrain: use captured camera-only MV (chunk offset in iris_ChunkOffset)
+                modelViewMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
+            } else {
+                // Sky / entity / particle: use per-draw GL MV with proper rotations
+                modelViewMat = new org.joml.Matrix4f(
+                        net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+            }
 
             float[] modelView = new float[16];
             modelViewMat.get(modelView);
