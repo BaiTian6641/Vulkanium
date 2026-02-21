@@ -1,6 +1,6 @@
 # Vulkanium — Next-Generation Vulkan Rendering Engine for Minecraft
 
-> **Date:** 2026-02-19  
+> **Date:** 2026-02-21  
 > **Status:** IN PROGRESS — All 12 phases have substantial code scaffolding; runtime integration is partially complete  
 > **Codename:** Vulkanium  
 > **Based on:** VulkanMod (Vulkan core) + Sodium (optimization patterns) + Iris (shader compat layer)  
@@ -34,11 +34,11 @@
 
 ---
 
-## Current Progress Checklist (Audit: 2026-02-19)
+## Current Progress Checklist (Audit: 2026-02-21)
 
 > **Audit basis:** `src/main/java/net/vulkanium` + `src/main/resources/assets/vulkanium/shaders` + `src/main/resources/vulkanium.mixins.json`  
 > **Verification:** `./gradlew classes -x test` → BUILD SUCCESSFUL  
-> **Measured inventory:** 227 Java files, 34 mixin classes, 12 shader files
+> **Measured inventory:** 244 Java files, 37 mixin classes, 12 shader files
 
 ### Checklist Snapshot
 
@@ -51,6 +51,14 @@
 - [x] Chunk shadow layer-mask path and frustum-aware terrain filtering are implemented
 - [x] G-buffer depth copy/clear commands and mip-level tracking are implemented
 - [x] Shadow renderer command path now includes pass begin/end hooks + mipmap generation + image cleanup
+- [x] Shadow entity rendering and pipeline management are implemented
+- [x] G-buffer resizing and texture binding updates are implemented
+- [x] Compute shader support with layout transitions and descriptor pools are implemented
+- [x] HDR support with color space conversion is implemented
+- [x] Shaderpack custom image and SSBO management are implemented
+- [x] Feature flags for shader pack compatibility and blending logic are implemented
+- [x] Shaderpack slider support and preprocessor conditionals are implemented
+- [x] Front face winding and viewport handling for positive-height rendering are implemented
 - [ ] Vulkan command recording path is fully implemented end-to-end
 - [ ] Descriptor set lifecycle is fully implemented across all passes
 - [ ] Shaderpack runtime compatibility validated against real pack matrix
@@ -62,14 +70,14 @@
 |------|--------|-------------|
 | 0 — Core Vulkan | 🟡 Partial | Core classes are in place and compiling; several Vulkan command/barrier paths still marked TODO. |
 | 1 — Chunk Rendering | 🟡 Partial | Region/section/cull/upload/build structure exists; shadow-layer dispatch and frustum-aware shadow filtering are now wired, but broader runtime validation remains. |
-| 2 — GLSL Compat | 🟡 Partial | Transformer/preprocessor/compiler/UBO bridge exist; external pack discovery/load works and at least one real pack compiles cleanly, but broader runtime binding validation remains incomplete. |
-| 3 — MRT/G-Buffer | 🟡 Partial | MRT target/pass/pipeline classes exist; depth copy/clear command recording and mip-level handling are implemented, with full descriptor/render-path wiring still in progress. |
+| 2 — GLSL Compat | 🟡 Partial | Transformer/preprocessor/compiler/UBO bridge exist; external pack discovery/load works and at least one real pack compiles cleanly. Feature flags, slider support, and preprocessor conditionals are implemented. |
+| 3 — MRT/G-Buffer | 🟡 Partial | MRT target/pass/pipeline classes exist; depth copy/clear command recording, mip-level handling, G-buffer resizing, and texture binding updates are implemented. |
 | 4 — Composite/Deferred | 🟡 Partial | Composite pass manager/final pass exist; descriptor and binding completion remains. |
-| 5 — Shadows | 🟡 Partial | Shadow structures exist; pass begin/end hooks, viewport restore, shadow mipmap generation, and shadow image cleanup are implemented; full production shadow framebuffer wiring and runtime pack matrix validation remain. |
-| 6 — Entity/Sky/Particle | 🟡 Partial | Program and renderer scaffolding exist; full pass-by-pass runtime parity still pending. |
+| 5 — Shadows | 🟡 Partial | Shadow structures exist; pass begin/end hooks, viewport restore, shadow mipmap generation, shadow image cleanup, and shadow entity rendering are implemented. |
+| 6 — Entity/Sky/Particle | 🟡 Partial | Program and renderer scaffolding exist; shadow entity rendering is implemented, but full pass-by-pass runtime parity still pending. |
 | 7 — Vulkan Perf | 🟡 Partial | Async transfer/parallel recording/culling modules exist; deeper Vulkan integration still pending. |
-| 8 — Polish/UX | 🟡 Partial | Cache/progress/debug/config/overlay components exist and compile. |
-| 9 — Compute Platform | 🟡 Partial | Compute scheduler/allocator/modules exist; complete production dispatch-readback path still pending. |
+| 8 — Polish/UX | 🟡 Partial | Cache/progress/debug/config/overlay components exist and compile. HDR support with color space conversion is implemented. |
+| 9 — Compute Platform | 🟡 Partial | Compute scheduler/allocator/modules exist; compute shader support with layout transitions and descriptor pools are implemented. |
 | 10 — Ray Tracing | 🟠 Scaffolded | RT classes/shaders exist, but BLAS/TLAS/SBT/trace pipeline has significant TODO coverage. |
 | 11 — Module System | 🟡 Partial | Module API and built-ins exist; runtime conflict handling and full integration require more validation. |
 

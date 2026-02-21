@@ -1368,17 +1368,17 @@ public class Vulkanium implements ClientModInitializer {
             // Terrain programs: per-frame snapshot avoids per-section chunk
             // offset translations leaking into the matrix.  The chunk offset
             // is provided separately in iris_ChunkOffset.
-            boolean isSkyDraw = pipeline.getName().contains("sky")
-                    || pipeline.getName().contains("sun")
+                boolean isCelestialPretransformedDraw = pipeline.getName().contains("sun")
                     || pipeline.getName().contains("moon")
                     || pipeline.getName().contains("star")
-                    || pipeline.getName().contains("cloud");
+                    || pipeline.getName().contains("sunset")
+                    || pipeline.getName().contains("void");
             boolean isTerrainDraw = isTerrainLikeFormat(format);
             boolean isShadowEntityDraw = net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
-                    && !isSkyDraw && !isTerrainDraw;
+                    && !isCelestialPretransformedDraw && !isTerrainDraw;
             org.joml.Matrix4f modelViewMat;
             org.joml.Matrix4f projectionMat;
-            if (isSkyDraw) {
+                if (isCelestialPretransformedDraw) {
                 // BufferUploader sky draws: vertices are pre-transformed by
                 // Camera×Celestial, so use identity model-view to avoid
                 // double-applying the camera rotation.

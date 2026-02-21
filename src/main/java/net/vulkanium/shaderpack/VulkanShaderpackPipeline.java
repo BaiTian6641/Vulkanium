@@ -1978,10 +1978,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
-            // Shaderpack pipelines use CW front face because we removed the
-            // gl_Position.y = -gl_Position.y vertex shader flip. Without the flip,
-            // OpenGL CCW triangles appear as CW in Vulkan's Y-down framebuffer.
-            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
+            // Shaderpack compatibility pipelines use CCW front face to match
+            // Minecraft/OpenGL winding expectations for terrain/entity meshes.
+            // Using CW here causes inside-out culling in gbuffer terrain passes.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("Failed to create compatibility pipeline for {}: {}", requestedProgram, e.getMessage());
@@ -2517,8 +2517,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     subpassColorCount
             );
             mrtPipelines.put(key, pipeline);
-            // CW front face for consistency with other shaderpack pipelines
-            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
+            // Keep CCW winding consistent with compatibility pipelines.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("[FULLSCREEN] Failed to create MRT pipeline for {} (targets={}): {}",
