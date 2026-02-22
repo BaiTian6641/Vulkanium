@@ -1648,8 +1648,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     compiledPrograms.containsKey(ProgramId.SHADOW) ? "shadow" :
                     compiledPrograms.containsKey(ProgramId.SHADOW_SOLID) ? "shadow_solid" :
                     "gbuffers_terrain (fallback)");
-            // CW front face: no shader Y-flip, positive viewport
-            shadowTerrainPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
+            // CCW front face matches OpenGL winding convention.
+            // Negative-height viewport preserves winding sign in Vulkan's area formula.
+            shadowTerrainPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow terrain pipeline: {}", e.getMessage());
             shadowTerrainPipeline = null;
@@ -1712,8 +1713,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     sharedDescriptorSetLayout
             );
             LOGGER.info("[SHADOW] Shadow entity pipeline created (entity vertex format, depth-only)");
-            // CW front face: no shader Y-flip, positive viewport
-            shadowEntityPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
+            // CCW front face matches OpenGL winding convention.
+            shadowEntityPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow entity pipeline: {}", e.getMessage());
             shadowEntityPipeline = null;
@@ -1978,9 +1979,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
-            // Compatibility path uses Y-flipped Vulkan viewport (negative height)
-            // to preserve OpenGL screen convention. Keep CCW front face so
-            // culling matches Minecraft/OpenGL winding.
+            // CCW front face matches OpenGL winding convention.
+            // Vulkan's negative-height viewport (Y-flip) preserves the area sign
+            // for front-face determination — validated by VulkanMod reference.
             pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {

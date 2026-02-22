@@ -1173,6 +1173,18 @@ public class Vulkanium implements ClientModInitializer {
                 || "position_tex_color".equals(shaderName);
     }
 
+    // ─── Pipeline name helpers (kept for future per-program state) ────
+
+    private static boolean isSkyOrCloudPipelineName(String pipelineName) {
+        if (pipelineName == null) {
+            return false;
+        }
+        String lower = pipelineName.toLowerCase(Locale.ROOT);
+        return lower.contains("gbuffers_sky") || lower.contains("gbuffers_clouds");
+    }
+
+
+
     private static boolean isTerrainShaderName(String shaderName) {
         if (shaderName == null || shaderName.isEmpty()) {
             return false;
@@ -1363,86 +1375,38 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetX = net.vulkanium.compat.VRenderSystem.getChunkOffsetX();
             float chunkOffsetY = net.vulkanium.compat.VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
-            net.vulkanium.render.program.WorldRenderingPhase.Phase phase =
-                net.vulkanium.render.program.WorldRenderingPhase.getPhase();
-            boolean isSkyCloudPhase = net.vulkanium.render.program.WorldRenderingPhase.isSky()
-                || phase == net.vulkanium.render.program.WorldRenderingPhase.Phase.CLOUDS;
-
-            // ── Model-view matrix selection ──
-            // Sky programs (sun/moon/sunset quads): vertices arrive via
-            // BufferUploader.drawWithShader() and are ALREADY pre-transformed
-            // by Camera×Celestial (MC calls bufferbuilder.vertex(pose, x,y,z)).
-            // The global model-view at this point also contains Camera×Celestial,
-            // so applying it again would double-transform.  Use IDENTITY for
-            // iris_ModelViewMatrix and the live projection (not the per-frame
-            // snapshot) to match how GL would draw these pre-transformed verts.
-            //
-            // VertexBuffer sky draws (sky dome, stars) go through
-            // recordDrawPersistent() instead — they pass the per-draw matrix
-            // explicitly, so this code path doesn't affect them.
-            //
-            // Entity / hand programs: per-draw model-view includes the entity's
-            // PoseStack transform (position + rotation in world space).  Using
-            // the per-frame snapshot would place all entities at the camera
-            // origin, making them invisible.
-            //
-            // Terrain programs: per-frame snapshot avoids per-section chunk
-            // offset translations leaking into the matrix.  The chunk offset
-            // is provided separately in iris_ChunkOffset.
-                boolean isCelestialPretransformedDraw = pipeline.getName().contains("sun")
-                    || pipeline.getName().contains("moon")
-                    || pipeline.getName().contains("star")
-                    || pipeline.getName().contains("sunset")
-                    || pipeline.getName().contains("void");
-                boolean isPretransformedSkyOrCloudDraw = isCelestialPretransformedDraw || isSkyCloudPhase;
             boolean isTerrainDraw = isTerrainLikeFormat(format);
-            boolean isShadowEntityDraw = net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
-                    && !isPretransformedSkyOrCloudDraw && !isTerrainDraw;
+            boolean isShadowEntityDraw = net.vulkanium.render.shadow.ShadowRenderer.ACTIVE && !isTerrainDraw;
+
+            // ── Model-view / projection matrix selection ──
+            // Match Iris: iris_ModelViewMatrix = ALWAYS the live per-draw matrix
+            // from RenderSystem (set by vanilla's pose stack for each draw call).
+            // The world snapshot (camera-only) goes ONLY into gbufferModelView,
+            // which is written separately in DrawBatcher.uploadUniformsShaderpack().
+            // This ensures sky dome geometry gets its correct per-draw rotation,
+            // terrain chunks get the correct per-chunk camera transform, and
+            // celestial objects (sun/moon) get their pose-stack celestial rotations.
             org.joml.Matrix4f modelViewMat;
             org.joml.Matrix4f projectionMat;
-                if (isPretransformedSkyOrCloudDraw) {
-                // BufferUploader sky draws: vertices are pre-transformed by
-                // Camera×Celestial, so use identity model-view to avoid
-                // double-applying the camera rotation.
-                modelViewMat = new org.joml.Matrix4f(); // identity
-                // Use the live projection (already set by MC for sky rendering)
-                projectionMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
-            } else if (isShadowEntityDraw) {
-                // Shadow entity draws: transform entity from camera-relative world
-                // space into shadow clip space.
-                //
-                // Entity vertices are stored as object-space positions; the
-                // PoseStack at draw time = cameraMV × entityWorldTransform × animation.
-                // We want shadow clip space, so we compute:
-                //   shadowMV × inv(cameraMV) × liveEntityMV
-                // = shadowMV × entityWorldTransform × animation  (correct!)
-                //
-                // ShadowRenderer.MODELVIEW is the shadow camera transform.
-                // VRenderSystem.getWorldRenderModelView() is the saved camera MV snapshot.
+            if (isShadowEntityDraw) {
+                // Shadow entity: rebase from eye-camera space to shadow-camera space.
                 org.joml.Matrix4f shadowMV = new org.joml.Matrix4f(
                         net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW);
                 org.joml.Matrix4f cameraMV = new org.joml.Matrix4f(
                         net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
-                // inv(cameraMV) × liveEntityMV = entity local transform in world space
                 org.joml.Matrix4f entityWorldTransform = new org.joml.Matrix4f(cameraMV)
                         .invert()
                         .mul(net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
                 modelViewMat = shadowMV.mul(entityWorldTransform);
                 projectionMat = new org.joml.Matrix4f(
                         net.vulkanium.render.shadow.ShadowRenderer.PROJECTION);
-            } else if (isTerrainDraw) {
-                // Per-frame snapshot for terrain (avoids chunk offset in matrix)
-                modelViewMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getWorldRenderModelView());
-                projectionMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
             } else {
-                // Per-draw GL model-view: entities get PoseStack transform
+                // Default: use live per-draw matrices (matches Iris's iris_ModelViewMatrix).
+                // This works for ALL draw types: terrain, sky dome, celestial, entities.
                 modelViewMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+                    net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
                 projectionMat = new org.joml.Matrix4f(
-                        net.vulkanium.compat.VRenderSystem.getWorldRenderProjection());
+                    net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
             }
 
             float[] modelView = new float[16];
@@ -1453,6 +1417,7 @@ public class Vulkanium implements ClientModInitializer {
             new org.joml.Matrix4f(modelViewMat).invert().get(modelViewInv);
             float[] projectionInv = new float[16];
             new org.joml.Matrix4f(projectionMat).invert().get(projectionInv);
+            // Zero chunk offset for non-terrain (prevents section offsets leaking).
             if (!isTerrainDraw) {
                 chunkOffsetX = 0.0f;
                 chunkOffsetY = 0.0f;
@@ -1467,6 +1432,22 @@ public class Vulkanium implements ClientModInitializer {
                     modelView, modelViewInv,
                     projection, projectionInv,
                     colorMod, fogParams, texMat, chunkOffset);
+            // Unconditional diagnostic for first 5 shaderpack draws per frame, first 10 frames
+            if (frameCounter <= 10 && diagFrameDrawCount <= 5) {
+                LOGGER.info("[DRAW-DIAG] F#{} D#{} pipe={} shader='{}' terrain={} verts={} " +
+                        "mv[0,5,10,15]=({},{},{},{}) proj[0,5]=({},{}) co=({},{},{}) " +
+                        "blend={} cull={} depthW={}",
+                        frameCounter, diagFrameDrawCount, pipeline.getName(),
+                        VRenderSystem.getCurrentShaderName(), isTerrainDraw, vertexCount,
+                        String.format("%.3f", modelView[0]), String.format("%.3f", modelView[5]),
+                        String.format("%.3f", modelView[10]), String.format("%.3f", modelView[15]),
+                        String.format("%.3f", projection[0]), String.format("%.3f", projection[5]),
+                        String.format("%.3f", chunkOffset[0]), String.format("%.3f", chunkOffset[1]),
+                        String.format("%.3f", chunkOffset[2]),
+                        net.vulkanium.compat.VRenderSystem.isBlendEnabled(),
+                        net.vulkanium.compat.VRenderSystem.isCullEnabled(),
+                        net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled());
+            }
         } else {
             if (net.vulkanium.compat.VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {
                 org.joml.Matrix4f modelViewWithOffset = new org.joml.Matrix4f(
@@ -1487,14 +1468,13 @@ public class Vulkanium implements ClientModInitializer {
         // Update descriptor set for this draw with all bound shader texture slots
         int setIdx = drawBatcher.updateDescriptorSet(frameIndex, drawTextureViews, drawTextureSamplers, drawImageLayouts);
 
-        // Bind pipeline with per-draw blend/depth state (GL→VK conversion)
+        // Bind pipeline with per-draw blend/depth state (GL→VK conversion).
+        // Pass through the actual GL state that MC set — no per-program overrides.
+        // Iris does the same: the shader's blend/depth/cull come from MC's RenderType state.
         boolean blend = net.vulkanium.compat.VRenderSystem.isBlendEnabled();
         boolean depth = net.vulkanium.compat.VRenderSystem.isDepthTestEnabled();
         boolean depthWrite = net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled();
         boolean cull = net.vulkanium.compat.VRenderSystem.isCullEnabled();
-        // Match vanilla: translucent terrain uses depth-write as set by RenderType.setupRenderState().
-        // Previously we suppressed depth-write here, but that caused dark rectangular
-        // patches on water during movement (incorrect alpha accumulation).
         int topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // Quads use indexed triangles
 
         int srcColorVk = net.vulkanium.compat.VRenderSystem.glToVkBlendFactor(
@@ -1585,11 +1565,6 @@ public class Vulkanium implements ClientModInitializer {
         totalDraws++;
         diagFrameDrawCount++;
 
-        // ─── DIAGNOSTIC: Log first few persistent draws per frame at specific frame
-        // numbers
-        boolean diagPersist = isDebugLogging()
-                && (frameCounter >= 500 && frameCounter <= 502 && diagFrameDrawCount <= 5);
-
         // Build fog params for shader UBO
         float[] fogParams = {
                 VRenderSystem.getFogColorR(), VRenderSystem.getFogColorG(),
@@ -1611,21 +1586,34 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetX = VRenderSystem.getChunkOffsetX();
             float chunkOffsetY = VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = VRenderSystem.getChunkOffsetZ();
-            boolean hasChunkOffset = chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f;
             boolean isTerrainDraw = isTerrainLikeFormat(format);
 
-            org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix());
-            if (hasChunkOffset && isTerrainDraw) {
-                // Stabilize terrain compatibility path: apply section translation in CPU
-                // model-view
-                // and zero the explicit chunk offset uniform to avoid double application.
-                modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-                chunkOffsetX = 0.0f;
-                chunkOffsetY = 0.0f;
-                chunkOffsetZ = 0.0f;
-            } else if (!isTerrainDraw) {
-                // Never leak stale terrain section offsets into non-terrain draws
-                // (sky, clouds, entities, hand, etc).
+            // Always use per-draw matrices for iris_ModelViewMatrix / iris_ProjectionMatrix.
+            // The gbuffer snapshot (iris_GBufferModelView etc.) is handled inside
+            // uploadUniformsShaderpack() from VRenderSystem.getWorldRenderModelView().
+            // This matches Iris: per-draw = RenderSystem live, gbuffer = captured snapshot.
+            org.joml.Matrix4f modelViewMat;
+            org.joml.Matrix4f glProjection;
+            if (net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
+                    && pipeline.getName().equals("shadow_entity")) {
+                // Shadow entity draws: rebase from eye-camera to shadow-camera space
+                org.joml.Matrix4f shadowMV = new org.joml.Matrix4f(
+                        net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW);
+                org.joml.Matrix4f cameraMV = new org.joml.Matrix4f(
+                        VRenderSystem.getWorldRenderModelView());
+                org.joml.Matrix4f entityWorldTransform = new org.joml.Matrix4f(cameraMV)
+                        .invert()
+                        .mul(VRenderSystem.getModelViewMatrix());
+                modelViewMat = shadowMV.mul(entityWorldTransform);
+                glProjection = new org.joml.Matrix4f(
+                        net.vulkanium.render.shadow.ShadowRenderer.PROJECTION);
+            } else {
+                modelViewMat = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix());
+                glProjection = new org.joml.Matrix4f(VRenderSystem.getProjectionMatrix());
+            }
+
+            // Never leak terrain offsets into non-terrain draws.
+            if (!isTerrainDraw) {
                 chunkOffsetX = 0.0f;
                 chunkOffsetY = 0.0f;
                 chunkOffsetZ = 0.0f;
@@ -1634,7 +1622,6 @@ public class Vulkanium implements ClientModInitializer {
             float[] modelView = new float[16];
             modelViewMat.get(modelView);
             float[] projection = new float[16];
-            org.joml.Matrix4f glProjection = new org.joml.Matrix4f(VRenderSystem.getProjectionMatrix());
             glProjection.get(projection);
             float[] modelViewInv = new float[16];
             new org.joml.Matrix4f(modelViewMat).invert().get(modelViewInv);
@@ -1649,6 +1636,20 @@ public class Vulkanium implements ClientModInitializer {
                     modelView, modelViewInv,
                     projection, projectionInv,
                     colorMod, fogParams, texMat, chunkOffset);
+            // Unconditional diagnostic for first 5 persistent draws per frame, first 10 frames
+            if (frameCounter <= 10 && diagFrameDrawCount <= 5) {
+                LOGGER.info("[PERSIST-DIAG] F#{} D#{} pipe={} shader='{}' terrain={} verts={} " +
+                        "mv[0,5,10,15]=({},{},{},{}) co=({},{},{}) blend={} cull={} depthW={}",
+                        frameCounter, diagFrameDrawCount, pipeline.getName(),
+                        VRenderSystem.getCurrentShaderName(), isTerrainDraw, vertexCount,
+                        String.format("%.3f", modelView[0]), String.format("%.3f", modelView[5]),
+                        String.format("%.3f", modelView[10]), String.format("%.3f", modelView[15]),
+                        String.format("%.3f", chunkOffset[0]), String.format("%.3f", chunkOffset[1]),
+                        String.format("%.3f", chunkOffset[2]),
+                        VRenderSystem.isBlendEnabled(),
+                        VRenderSystem.isCullEnabled(),
+                        VRenderSystem.isDepthWriteEnabled());
+            }
         } else {
             if (VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {
                 org.joml.Matrix4f modelViewWithOffset = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix())
@@ -1664,31 +1665,16 @@ public class Vulkanium implements ClientModInitializer {
 
         populateBoundTexturesForDraw();
 
-        if (diagPersist) {
-            LOGGER.info("[PERSIST-DIAG] F#{} D#{} pipe={} verts={} stride={} colorMod=({},{},{},{}) " +
-                    "blend={} depth={} depthWrite={} cull={} " +
-                    "mvp[0,5,10,15]=({},{},{},{})",
-                    frameCounter, diagFrameDrawCount, pipeline.getName(),
-                    vertexCount, vertexSize,
-                    String.format("%.2f", colorMod[0]), String.format("%.2f", colorMod[1]),
-                    String.format("%.2f", colorMod[2]), String.format("%.2f", colorMod[3]),
-                    VRenderSystem.isBlendEnabled(), VRenderSystem.isDepthTestEnabled(),
-                    VRenderSystem.isDepthWriteEnabled(), VRenderSystem.isCullEnabled(),
-                    String.format("%.3f", mvp[0]), String.format("%.3f", mvp[5]),
-                    String.format("%.3f", mvp[10]), String.format("%.3f", mvp[15]));
-        }
-
         // Update descriptor set
         int setIdx = drawBatcher.updateDescriptorSet(frameIndex, drawTextureViews, drawTextureSamplers, drawImageLayouts);
 
-        // Bind pipeline with per-draw blend/depth state (GL→VK conversion)
+        // Bind pipeline with per-draw blend/depth state (GL→VK conversion).
+        // Pass through the actual GL state — no per-program overrides (matches Iris).
         boolean blend = VRenderSystem.isBlendEnabled();
         boolean depth = VRenderSystem.isDepthTestEnabled();
         boolean depthWrite = VRenderSystem.isDepthWriteEnabled();
         boolean cull = VRenderSystem.isCullEnabled();
-        // Match vanilla: translucent terrain uses depth-write as set by RenderType.setupRenderState().
-        // Previously we suppressed depth-write here, but that caused dark rectangular
-        // patches on water during movement (incorrect alpha accumulation).
+
         String currentShaderName = VRenderSystem.getCurrentShaderName();
         boolean isWaterDraw = isTerrainLikeFormat(format)
                 && (isActiveTerrainLayerTranslucent()
