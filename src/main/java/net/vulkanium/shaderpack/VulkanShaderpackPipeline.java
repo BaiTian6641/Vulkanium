@@ -1978,10 +1978,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
-            // Shaderpack compatibility pipelines use CCW front face to match
-            // Minecraft/OpenGL winding expectations for terrain/entity meshes.
-            // Using CW here causes inside-out culling in gbuffer terrain passes.
-            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
+            // Shaderpack compatibility path uses positive viewport height and no
+            // shader-side Y flip. In Vulkan this requires CW front faces to match
+            // OpenGL-facing geometry, otherwise back-face culling appears inside-out.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("Failed to create compatibility pipeline for {}: {}", requestedProgram, e.getMessage());

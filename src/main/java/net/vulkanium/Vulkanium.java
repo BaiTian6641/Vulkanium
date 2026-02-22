@@ -979,6 +979,23 @@ public class Vulkanium implements ClientModInitializer {
             return null;
         }
 
+        // Prefer explicit world phase over shader-name heuristics.
+        // This mirrors Iris behavior and avoids misrouting generic shaders
+        // (e.g. position_tex) between sky and cloud passes.
+        net.vulkanium.render.program.WorldRenderingPhase.Phase phase =
+                net.vulkanium.render.program.WorldRenderingPhase.getPhase();
+        if (phase == net.vulkanium.render.program.WorldRenderingPhase.Phase.CLOUDS) {
+            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_CLOUDS;
+        }
+        if (net.vulkanium.render.program.WorldRenderingPhase.isSky()) {
+            return hasUV0(format)
+                    ? net.vulkanium.shaderpack.ProgramId.GBUFFERS_SKYTEXTURED
+                    : net.vulkanium.shaderpack.ProgramId.GBUFFERS_SKYBASIC;
+        }
+        if (net.vulkanium.render.program.WorldRenderingPhase.isWeather()) {
+            return net.vulkanium.shaderpack.ProgramId.GBUFFERS_WEATHER;
+        }
+
         // Block selection outline and debug lines
         if (name.contains("lines") || name.equals("rendertype_lines")) {
             return net.vulkanium.shaderpack.ProgramId.GBUFFERS_LINE;
