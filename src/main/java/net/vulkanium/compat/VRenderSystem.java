@@ -351,6 +351,11 @@ public class VRenderSystem {
     }
 
     public static void setProjectionMatrix(Matrix4f matrix, VertexSorting sorting) {
+        // Guard against NaN projection — keep previous valid matrix.
+        // This can happen during the first few frames before matrices are fully initialized.
+        if (Float.isNaN(matrix.m00()) || Float.isNaN(matrix.m11())) {
+            return;
+        }
         projectionMat.set(matrix);
         // DO NOT overwrite savedProjectionMat here — it's only set by backupProjectionMatrix().
         // Overwriting it here causes the panorama's perspective projection to clobber the

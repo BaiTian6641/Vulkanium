@@ -1351,7 +1351,7 @@ public class Vulkanium implements ClientModInitializer {
             return;
 
         // One-shot entry diagnostic
-        if (drawEntryDiagBudget > 0) {
+        if (drawEntryDiagBudget > 0 && frameCounter > 50) {
             drawEntryDiagBudget--;
             System.err.println("[DRAW-ENTRY] pipe=" + pipeline.getName()
                 + " renderMode=" + getRenderMode()
@@ -1522,7 +1522,7 @@ public class Vulkanium implements ClientModInitializer {
                         net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled());
             }
             // Always log sky pipeline draws with a budget
-            if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0) {
+            if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0 && frameCounter > 50) {
                 skyDrawDiagBudget--;
                 LOGGER.info("[SKY-DRAW] F#{} D#{} pipe={} shader='{}' verts={} " +
                         "mv=({},{},{},{} / {},{},{},{} / {},{},{},{} / {},{},{},{}) " +
@@ -1646,7 +1646,7 @@ public class Vulkanium implements ClientModInitializer {
             return;
 
         // One-shot entry diagnostic
-        if (persistEntryDiagBudget > 0) {
+        if (persistEntryDiagBudget > 0 && frameCounter > 50) {
             persistEntryDiagBudget--;
             System.err.println("[PERSIST-ENTRY] pipe=" + pipeline.getName()
                 + " renderMode=" + getRenderMode()
@@ -1762,7 +1762,8 @@ public class Vulkanium implements ClientModInitializer {
                         VRenderSystem.isDepthWriteEnabled());
             }
             // One-shot terrain draw diagnostic with full matrix state
-            if (isTerrainDraw && terrainDrawDiagBudget > 0) {
+            // Gate on frameCounter > 50 to skip loading screen draws
+            if (isTerrainDraw && terrainDrawDiagBudget > 0 && frameCounter > 50) {
                 terrainDrawDiagBudget--;
                 float[] sMV = new float[16], sP = new float[16];
                 net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW.get(sMV);
@@ -1805,7 +1806,7 @@ public class Vulkanium implements ClientModInitializer {
                         VRenderSystem.isDepthTestEnabled());
             }
             // Always log sky pipeline persistent draws with a budget
-            if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0) {
+            if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0 && frameCounter > 50) {
                 skyDrawDiagBudget--;
                 LOGGER.info("[SKY-PERSIST] F#{} D#{} pipe={} shader='{}' verts={} " +
                         "mv=({},{},{},{} / {},{},{},{} / {},{},{},{} / {},{},{},{}) " +

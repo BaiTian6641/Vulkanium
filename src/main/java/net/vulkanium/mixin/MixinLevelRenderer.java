@@ -100,20 +100,20 @@ public abstract class MixinLevelRenderer {
 
         Vulkanium.onTerrainLayerStart(renderType.toString());
 
-        // Set the camera-rotated model-view for this terrain layer.
-        // No save/restore needed — MixinVertexBuffer.onDrawWithShader sets the MV
-        // from MC's arguments per-draw, and after the layer finishes, the last
-        // chunk's draw leaves VRenderSystem with the camera rotation (correct state).
-        net.vulkanium.compat.VRenderSystem.setModelViewMatrix(poseStack.last().pose());
-        net.vulkanium.compat.VRenderSystem.setProjectionMatrix(projectionMatrix,
-                net.vulkanium.compat.VRenderSystem.getVertexSorting());
+        // Do NOT set VRenderSystem MV/Proj here globally.
+        // In vanilla MC, renderChunkLayer passes poseStack and projectionMatrix
+        // as drawWithShader PARAMETERS — it never modifies RenderSystem.modelViewMatrix.
+        // MixinVertexBuffer.onDrawWithShader sets VRenderSystem MV/Proj per-draw
+        // from the parameter (and lets it persist). MixinBufferUploader syncs
+        // VRenderSystem back to RenderSystem's canonical state before each
+        // immediate draw, preventing the persisted terrain MV from leaking
+        // into entity/sky-textured draws.
     }
 
     /**
      * After each render layer finishes, reset ChunkOffset.
-     * The model-view and projection are NOT restored — they stay as whatever
-     * the last per-draw call set (camera rotation from MC's drawWithShader
-     * arguments), which is the correct rendering context.
+     * VRenderSystem MV/Proj are NOT modified here — they track
+     * RenderSystem's global state via MixinRenderSystem.applyModelViewMatrix().
      */
     @Inject(method = "renderChunkLayer", at = @At("RETURN"))
     private void afterRenderSectionLayer(RenderType renderType, PoseStack poseStack,

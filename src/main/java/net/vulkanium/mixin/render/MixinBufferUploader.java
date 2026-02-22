@@ -3,6 +3,7 @@ package net.vulkanium.mixin.render;
 import com.mojang.blaze3d.vertex.BufferUploader;
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import com.mojang.blaze3d.systems.RenderSystem;
 import net.vulkanium.Vulkanium;
 import net.vulkanium.compat.VRenderSystem;
 import org.spongepowered.asm.mixin.Mixin;
@@ -36,6 +37,21 @@ public abstract class MixinBufferUploader {
                 boolean hasIndex = drawState.indexOnly();
 
                 java.nio.ByteBuffer vertexData = renderedBuffer.vertexBuffer();
+
+                // ─── Sync VRenderSystem to RenderSystem's canonical state ───
+                // VertexBuffer.drawWithShader() persists its parameter MV/Proj
+                // in VRenderSystem for the persistent VBO draw path.  But
+                // BufferUploader draws (entities, sun/moon, particles, weather)
+                // should use whatever RenderSystem.modelViewMatrix has:
+                //   • identity during entity rendering (no applyModelViewMatrix yet)
+                //   • identity during renderSky sun/moon (pre-transformed vertices)
+                //   • camera rotation after applyModelViewMatrix for particles/weather
+                // This matches vanilla MC where BufferUploader.drawWithShader reads
+                // RenderSystem.getModelViewMatrix() for the MODEL_VIEW_MATRIX uniform.
+                VRenderSystem.setModelViewMatrix(RenderSystem.getModelViewMatrix());
+                VRenderSystem.setProjectionMatrix(
+                        RenderSystem.getProjectionMatrix(),
+                        VRenderSystem.getVertexSorting());
 
                 VRenderSystem.uploadAndDraw(
                         vertexData,

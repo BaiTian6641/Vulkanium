@@ -517,11 +517,18 @@ public abstract class MixinVertexBuffer {
             return;
         }
 
-        // Apply the per-draw matrices from the arguments.
-        // Do NOT save/restore — MC expects the RenderSystem state to persist
-        // after VertexBuffer draws, and subsequent immediate draws (sun/moon via
-        // BufferUploader) rely on the model-view being the camera rotation set here.
-        // Restoring would clobber it back to a stale/identity matrix.
+        // ─── Set per-draw matrices from drawWithShader parameters ───
+        // In vanilla MC, VertexBuffer.drawWithShader(mv, proj, shader) passes
+        // these matrices directly to the shader uniform – it does NOT modify
+        // RenderSystem.modelViewMatrix. We set VRenderSystem so that
+        // recordDrawPersistent reads the correct per-draw MV/Proj.
+        //
+        // We intentionally let this value PERSIST after the call.  The
+        // BufferUploader path (MixinBufferUploader) syncs VRenderSystem back
+        // to RenderSystem's canonical state before each immediate draw, so
+        // entities/sun/moon/particles always see the correct MV from
+        // RenderSystem.modelViewMatrix (identity during entity rendering,
+        // camera rotation after applyModelViewMatrix for particles/weather).
         VRenderSystem.setModelViewMatrix(modelViewMatrix);
         VRenderSystem.setProjectionMatrix(projectionMatrix, VRenderSystem.getVertexSorting());
 
@@ -593,14 +600,14 @@ public abstract class MixinVertexBuffer {
 
         if (appliedLocalChunkOffset) {
             // Restore the terrain chunk offset for subsequent draws.
-            // The MV and projection are intentionally NOT restored — MC expects
-            // the per-draw argument matrices to persist on RenderSystem state.
             VRenderSystem.setChunkOffset(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-            // Reset MV back to the original argument (without baked chunk offset)
-            // so that the VRenderSystem MV reflects the camera rotation,
-            // not camera + chunk offset.
-            VRenderSystem.setModelViewMatrix(modelViewMatrix);
         }
+
+        // VRenderSystem MV/Proj intentionally persist from the parameter.
+        // MixinBufferUploader will sync VRenderSystem to RenderSystem's
+        // canonical state before each immediate draw (entity, sun/moon, etc.),
+        // so the persisted value only affects subsequent VertexBuffer draws
+        // within the same phase (which also set from their own parameter).
 
         ci.cancel();
     }
