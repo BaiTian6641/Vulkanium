@@ -856,6 +856,33 @@ public class Vulkanium implements ClientModInitializer {
             // so we must end it, run the shadow pass, then restart it.
             mainRenderPass.end(cmd);
             vkPipeline.renderShadowPass(cmd);
+
+            // One-shot shadow diagnostic: dump shadow matrices after shadow pass
+            if (shadowPostDiagBudget > 0) {
+                shadowPostDiagBudget--;
+                float[] sMV = new float[16], sP = new float[16];
+                net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW.get(sMV);
+                net.vulkanium.render.shadow.ShadowRenderer.PROJECTION.get(sP);
+                LOGGER.info("[SHADOW-DIAG] F#{} shadowMV=({},{},{},{} / {},{},{},{} / {},{},{},{} / {},{},{},{}) " +
+                    "shadowProj=({},{},{},{} / {},{},{},{}) " +
+                    "shadowActive={} renderDist={}",
+                    frameCounter,
+                    String.format("%.4f", sMV[0]), String.format("%.4f", sMV[1]),
+                    String.format("%.4f", sMV[2]), String.format("%.4f", sMV[3]),
+                    String.format("%.4f", sMV[4]), String.format("%.4f", sMV[5]),
+                    String.format("%.4f", sMV[6]), String.format("%.4f", sMV[7]),
+                    String.format("%.4f", sMV[8]), String.format("%.4f", sMV[9]),
+                    String.format("%.4f", sMV[10]), String.format("%.4f", sMV[11]),
+                    String.format("%.4f", sMV[12]), String.format("%.4f", sMV[13]),
+                    String.format("%.4f", sMV[14]), String.format("%.4f", sMV[15]),
+                    String.format("%.4f", sP[0]), String.format("%.4f", sP[1]),
+                    String.format("%.4f", sP[2]), String.format("%.4f", sP[3]),
+                    String.format("%.4f", sP[4]), String.format("%.4f", sP[5]),
+                    String.format("%.4f", sP[6]), String.format("%.4f", sP[7]),
+                    net.vulkanium.render.shadow.ShadowRenderer.ACTIVE,
+                    net.vulkanium.render.shadow.ShadowRenderer.renderDistance);
+            }
+
             mainRenderPass.beginPreserve(cmd, frameOrchestrator.getCurrentImageIndex(),
                     vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
 
@@ -1201,6 +1228,10 @@ public class Vulkanium implements ClientModInitializer {
     /** One-shot budget to verify draw entry paths are reached. */
     private static int drawEntryDiagBudget = 10;
     private static int persistEntryDiagBudget = 10;
+    /** One-shot budget for terrain draw diagnostics. */
+    private static int terrainDrawDiagBudget = 5;
+    /** One-shot budget for shadow post-pass diagnostic. */
+    private static int shadowPostDiagBudget = 3;
 
     private static boolean isSkyOrCloudPipelineName(String pipelineName) {
         if (pipelineName == null) {
@@ -1729,6 +1760,49 @@ public class Vulkanium implements ClientModInitializer {
                         VRenderSystem.isBlendEnabled(),
                         VRenderSystem.isCullEnabled(),
                         VRenderSystem.isDepthWriteEnabled());
+            }
+            // One-shot terrain draw diagnostic with full matrix state
+            if (isTerrainDraw && terrainDrawDiagBudget > 0) {
+                terrainDrawDiagBudget--;
+                float[] sMV = new float[16], sP = new float[16];
+                net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW.get(sMV);
+                net.vulkanium.render.shadow.ShadowRenderer.PROJECTION.get(sP);
+                org.joml.Matrix4f wsMV = VRenderSystem.getWorldRenderModelView();
+                float[] ws = new float[16];
+                wsMV.get(ws);
+                LOGGER.info("[TERRAIN-DRAW] F#{} D#{} pipe={} shader='{}' verts={} co=({},{},{}) " +
+                        "perDrawMV[0,5,10,12-15]=({},{},{},{},{},{},{}) " +
+                        "worldSnapMV[0,5,10,15]=({},{},{},{}) " +
+                        "proj[0,5]=({},{}) " +
+                        "shadowMV[0,5,10]=({},{},{}) shadowProj[0,5]=({},{}) " +
+                        "blend={} cull={} depthW={} depthTest={}",
+                        frameCounter, diagFrameDrawCount, pipeline.getName(),
+                        VRenderSystem.getCurrentShaderName(), vertexCount,
+                        String.format("%.2f", chunkOffset[0]),
+                        String.format("%.2f", chunkOffset[1]),
+                        String.format("%.2f", chunkOffset[2]),
+                        String.format("%.4f", modelView[0]),
+                        String.format("%.4f", modelView[5]),
+                        String.format("%.4f", modelView[10]),
+                        String.format("%.4f", modelView[12]),
+                        String.format("%.4f", modelView[13]),
+                        String.format("%.4f", modelView[14]),
+                        String.format("%.4f", modelView[15]),
+                        String.format("%.4f", ws[0]),
+                        String.format("%.4f", ws[5]),
+                        String.format("%.4f", ws[10]),
+                        String.format("%.4f", ws[15]),
+                        String.format("%.4f", projection[0]),
+                        String.format("%.4f", projection[5]),
+                        String.format("%.4f", sMV[0]),
+                        String.format("%.4f", sMV[5]),
+                        String.format("%.4f", sMV[10]),
+                        String.format("%.4f", sP[0]),
+                        String.format("%.4f", sP[5]),
+                        VRenderSystem.isBlendEnabled(),
+                        VRenderSystem.isCullEnabled(),
+                        VRenderSystem.isDepthWriteEnabled(),
+                        VRenderSystem.isDepthTestEnabled());
             }
             // Always log sky pipeline persistent draws with a budget
             if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0) {

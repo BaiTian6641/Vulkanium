@@ -926,13 +926,34 @@ public class VulkaniumASTTransformer {
     }
 
     // ── gl_TextureMatrix[N] fix ──
+    //
+    // gl_TextureMatrix[0] → identity (diffuse texture coords are already correct)
+    // gl_TextureMatrix[1] → lightmap normalization matrix (same as Iris BuiltinReplacementUniforms)
+    //   MC provides raw lightmap shorts in 0-240 range via gl_MultiTexCoord1.
+    //   The matrix scales by 1/256 and offsets by 0.5/16, mapping to UV [0.03125, 0.96875]
+    //   for the 16×16 lightmap texture.
+    // gl_TextureMatrix[2+] → identity (unused)
 
-    private static final Pattern GL_TEXTURE_MATRIX_PATTERN = Pattern.compile(
-            "\\bgl_TextureMatrix\\s*\\[\\s*\\d+\\s*\\]");
+    private static final Pattern GL_TEX_MATRIX_0 = Pattern.compile(
+            "\\bgl_TextureMatrix\\s*\\[\\s*0\\s*\\]");
+    private static final Pattern GL_TEX_MATRIX_1 = Pattern.compile(
+            "\\bgl_TextureMatrix\\s*\\[\\s*1\\s*\\]");
+    private static final Pattern GL_TEX_MATRIX_OTHER = Pattern.compile(
+            "\\bgl_TextureMatrix\\s*\\[\\s*[2-9]\\s*\\]");
+
+    // Iris-compatible lightmap texture matrix: scale(1/256) + translate(1/32)
+    private static final String LIGHTMAP_TEXTURE_MATRIX =
+            "mat4(vec4(0.00390625, 0.0, 0.0, 0.0), "
+          + "vec4(0.0, 0.00390625, 0.0, 0.0), "
+          + "vec4(0.0, 0.0, 0.00390625, 0.0), "
+          + "vec4(0.03125, 0.03125, 0.03125, 1.0))";
 
     private static String fixGlTextureMatrix(String source) {
         if (!source.contains("gl_TextureMatrix")) return source;
-        return GL_TEXTURE_MATRIX_PATTERN.matcher(source).replaceAll("mat4(1.0)");
+        source = GL_TEX_MATRIX_1.matcher(source).replaceAll(LIGHTMAP_TEXTURE_MATRIX);
+        source = GL_TEX_MATRIX_0.matcher(source).replaceAll("mat4(1.0)");
+        source = GL_TEX_MATRIX_OTHER.matcher(source).replaceAll("mat4(1.0)");
+        return source;
     }
 
     // ── gl_Fog.* fix ──

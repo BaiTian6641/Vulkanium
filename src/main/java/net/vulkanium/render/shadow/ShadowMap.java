@@ -118,9 +118,11 @@ public class ShadowMap {
 
             ShadowDirectives.DepthSamplingSettings ds0 = directives.getDepthSettings(0);
             mainDepthSampler = createDepthSampler(stack, vkDevice, ds0, mips0, false);
-            if (ds0.isHardwareFiltering()) {
-                mainDepthHwSampler = createDepthSampler(stack, vkDevice, ds0, mips0, true);
-            }
+            // Always create the HW comparison sampler — needed for sampler2DShadow
+            // declarations in shader packs (e.g. Complementary's shadow2D calls).
+            // In OpenGL/Iris this works implicitly, but Vulkan requires an explicit
+            // compareEnable=true sampler for SPIR-V Dref sampling instructions.
+            mainDepthHwSampler = createDepthSampler(stack, vkDevice, ds0, mips0, true);
 
             // ── shadowtex1 — pre-translucent depth copy ──
             noTranslucentsDepthImage = createImage(stack, allocator, depthFormat, resolution, resolution, mips1,
@@ -131,9 +133,8 @@ public class ShadowMap {
 
             ShadowDirectives.DepthSamplingSettings ds1 = directives.getDepthSettings(1);
             noTranslucentsDepthSampler = createDepthSampler(stack, vkDevice, ds1, mips1, false);
-            if (ds1.isHardwareFiltering()) {
-                noTranslucentsHwSampler = createDepthSampler(stack, vkDevice, ds1, mips1, true);
-            }
+            // Always create comparison sampler for shadowtex1 (always sampler2DShadow)
+            noTranslucentsHwSampler = createDepthSampler(stack, vkDevice, ds1, mips1, true);
         }
     }
 

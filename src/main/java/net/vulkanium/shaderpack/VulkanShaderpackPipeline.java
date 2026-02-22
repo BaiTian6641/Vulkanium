@@ -2718,6 +2718,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         // and shadow color attachments (shadowcolor0 → binding 25, shadowcolor1 → binding 26)
         if (shadowMap != null && shadowImagesInitialized) {
             // shadowtex0 — main shadow depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            // Composite/deferred shaders declare shadowtex0 as sampler2D (not sampler2DShadow),
+            // so use the regular (non-comparison) sampler here. The Vulkan spec requires
+            // compareEnable=false for non-Dref SPIR-V sampling instructions.
             long stView0 = shadowMap.getMainDepthView();
             long stSamp0 = shadowMap.getMainDepthSampler();
             if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
@@ -2731,8 +2734,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             }
 
             // shadowtex1 — pre-translucent depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
+            // Uses HW comparison sampler (sampler2DShadow in all shader packs)
             long stView1 = shadowMap.getNoTranslucentsDepthView();
-            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
+            long stSamp1 = shadowMap.getNoTranslucentsHwSampler();
             if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
                 Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
@@ -2931,8 +2935,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                                                        long placeholderSampler) {
         // Bind shadow textures so gbuffers shaders can access them
         if (shadowMap != null && shadowImagesInitialized) {
+            // shadowtex0 — gbuffers shaders declare it as sampler2DShadow and call
+            // shadow2D() which emits SPIR-V Dref instructions requiring compareEnable=true.
             long stView0 = shadowMap.getMainDepthView();
-            long stSamp0 = shadowMap.getMainDepthSampler();
+            long stSamp0 = shadowMap.getMainDepthHwSampler();
             if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex0", stView0, stSamp0);
                 bindSamplerAlias(views, samplers, "shadow", stView0, stSamp0);
@@ -2941,8 +2947,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     imageLayouts[st0Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
                 }
             }
+            // shadowtex1 — also sampler2DShadow in gbuffers
             long stView1 = shadowMap.getNoTranslucentsDepthView();
-            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
+            long stSamp1 = shadowMap.getNoTranslucentsHwSampler();
             if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
                 Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
