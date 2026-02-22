@@ -783,11 +783,36 @@ public class DrawBatcher {
             // Separate from per-draw iris_ProjectionMatrix so that composite shaders
             // can set gl_ProjectionMatrix to identity while gbufferProjection retains
             // the camera projection for ray/depth reconstruction.
+            //
+            // IMPORTANT: Shaderpacks (OptiFine/Iris convention) expect gbufferProjection
+            // to use OpenGL depth conventions [-1,1].  Shaders reconstruct positions via:
+            //   vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+            //   vec4 view = gbufferProjectionInverse * clip;
+            // The "depth * 2.0 - 1.0" maps Vulkan's [0,1] depth to the [-1,1] range that
+            // the inverse projection matrix expects.  Therefore we must supply the OpenGL-
+            // convention projection matrix (with [-1,1] depth mapping) so the math works.
+            //
+            // Vulkanium's MixinMatrix4f produces [0,1] depth (zZeroToOne=true).  We convert
+            // back to [-1,1] by adjusting elements [2][2] and [3][2] of the projection matrix:
+            //   OpenGL:  m22 = -(far+near)/(far-near),  m32 = -2*near*far/(far-near)
+            //   Vulkan:  m22 = -far/(far-near),          m32 = -near*far/(far-near)
+            // Conversion: m22_gl = 2*m22_vk + 1,  m32_gl = 2*m32_vk
+            //
+            // Reference: Iris Shaders (LGPL-3.0) — runs on OpenGL where [-1,1] is native.
+            // Vulkanium must convert the Vulkan [0,1] projection back to [-1,1] for the
+            // uniform so that shaderpack depth reconstruction formulas work correctly.
             org.joml.Matrix4f projMat = net.vulkanium.compat.VRenderSystem.getWorldRenderProjection();
+            // Convert projection from Vulkan [0,1] depth to OpenGL [-1,1] depth convention
+            // for the gbufferProjection uniform that shaderpacks expect.
+            org.joml.Matrix4f glProjMat = new org.joml.Matrix4f(projMat);
+            float m22 = glProjMat.m22();
+            float m32 = glProjMat.m32();
+            glProjMat.m22(2.0f * m22 + 1.0f);  // Vulkan→OpenGL: m22_gl = 2*m22_vk + 1
+            glProjMat.m32(2.0f * m32);          // Vulkan→OpenGL: m32_gl = 2*m32_vk
             float[] gbufProj = new float[16];
-            projMat.get(gbufProj);
+            glProjMat.get(gbufProj);
             float[] gbufProjInv = new float[16];
-            new org.joml.Matrix4f(projMat).invert().get(gbufProjInv);
+            new org.joml.Matrix4f(glProjMat).invert().get(gbufProjInv);
             long gbufProjPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_GBUFFER_PROJECTION;
             long gbufProjInvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_GBUFFER_PROJECTION_INV;
             for (int i = 0; i < 16; i++) {
@@ -800,18 +825,35 @@ public class DrawBatcher {
         // Use the EXACT shadow matrices that were used during shadow map rendering.
         // Recomputing from parameters risks subtle mismatches (timing, precision)
         // that cause shadow depth comparison failures → everything appears in shadow.
+        //
+        // The shadow projection matrix stored in ShadowRenderer.PROJECTION uses
+        // Vulkan [0,1] depth (from ShadowMatrices.createOrthoMatrix with zZeroToOne=true).
+        // However, shaders expect the shadowProjection uniform in OpenGL [-1,1]
+        // convention for shadow coordinate reconstruction (same as gbufferProjection).
+        // We convert the uniform value to [-1,1] while keeping the actual rendering
+        // pipeline using [0,1] depth.
+        //
+        // Reference: Iris Shaders (LGPL-3.0) — shadow matrices are natively [-1,1].
         {
             org.joml.Matrix4f shadowMV = new org.joml.Matrix4f(
                     net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW);
             org.joml.Matrix4f shadowProj = new org.joml.Matrix4f(
                     net.vulkanium.render.shadow.ShadowRenderer.PROJECTION);
 
+            // Convert shadow projection from Vulkan [0,1] to OpenGL [-1,1] for the
+            // uniform, so shaderpack shadow coordinate reconstruction works correctly.
+            org.joml.Matrix4f glShadowProj = new org.joml.Matrix4f(shadowProj);
+            float sm22 = glShadowProj.m22();
+            float sm32 = glShadowProj.m32();
+            glShadowProj.m22(2.0f * sm22 + 1.0f);  // Vulkan→OpenGL depth
+            glShadowProj.m32(2.0f * sm32);          // Vulkan→OpenGL depth
+
             float[] sMV = new float[16], sP = new float[16];
             shadowMV.get(sMV);
-            shadowProj.get(sP);
+            glShadowProj.get(sP);
             float[] sMVInv = new float[16], sPInv = new float[16];
             new org.joml.Matrix4f(shadowMV).invert().get(sMVInv);
-            new org.joml.Matrix4f(shadowProj).invert().get(sPInv);
+            new org.joml.Matrix4f(glShadowProj).invert().get(sPInv);
 
             long smvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_MODEL_VIEW;
             long spPtr  = ptr + net.vulkanium.render.shader.UniformBridge.OFF_SHADOW_PROJECTION;

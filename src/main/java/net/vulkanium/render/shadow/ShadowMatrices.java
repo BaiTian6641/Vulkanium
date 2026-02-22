@@ -63,7 +63,14 @@ public class ShadowMatrices {
      */
     public static Matrix4f createOrthoMatrix(float halfPlaneLength, float nearPlane, float farPlane) {
         float size = halfPlaneLength * 2.0f;
-        return new Matrix4f().setOrthoSymmetric(size, size, nearPlane, farPlane);
+        // Use zZeroToOne=true for Vulkan's [0,1] depth range (OpenGL uses [-1,1]).
+        // Without this, shadow depth values are in [-1,1] which is wrong for Vulkan
+        // depth comparison and causes shadow acne, peter-panning, or fully-shadowed scenes.
+        // Note: setOrthoSymmetric is NOT intercepted by MixinMatrix4f (only setOrtho,
+        // ortho, setPerspective, perspective are), so we must pass the flag explicitly.
+        // Reference: Iris Shaders (LGPL-3.0) ShadowMatrices — uses [-1,1] natively on
+        // OpenGL. Vulkanium must produce [0,1] since we target Vulkan.
+        return new Matrix4f().setOrthoSymmetric(size, size, nearPlane, farPlane, true);
     }
 
     /**
@@ -81,12 +88,17 @@ public class ShadowMatrices {
         float xScale = yScale; // aspect = 1.0 (square shadow map)
         float frustumLength = DEFAULT_FAR - DEFAULT_NEAR;
 
+        // Vulkan [0,1] depth range perspective matrix.
+        // OpenGL: m22 = -(far+near)/(far-near),  m32 = -2*near*far/(far-near)
+        // Vulkan: m22 = -far/(far-near),          m32 = -near*far/(far-near)
+        // Reference: Iris Shaders (LGPL-3.0) ShadowMatrices — original uses OpenGL
+        // conventions. Adapted for Vulkan [0,1] depth.
         Matrix4f mat = new Matrix4f();
         mat.m00(xScale);
         mat.m11(yScale);
-        mat.m22(-((DEFAULT_FAR + DEFAULT_NEAR) / frustumLength));
+        mat.m22(-(DEFAULT_FAR / frustumLength));
         mat.m23(-1.0f);
-        mat.m32(-((2.0f * DEFAULT_NEAR * DEFAULT_FAR) / frustumLength));
+        mat.m32(-((DEFAULT_NEAR * DEFAULT_FAR) / frustumLength));
         mat.m33(1.0f); // Iris/OptiFine convention: 1 instead of 0
         return mat;
     }

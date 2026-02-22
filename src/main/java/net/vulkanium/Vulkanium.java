@@ -984,6 +984,19 @@ public class Vulkanium implements ClientModInitializer {
             // and hope the shadow render pass is compatible (best effort).
         }
 
+        // ── Shadow pass terrain routing ──
+        // Terrain draws during the shadow pass must use the shadow terrain pipeline
+        // (compiled against the shadow render pass), not the GBuffer compatibility
+        // pipeline (compiled against the MRT render pass). Using the wrong render
+        // pass handle is a Vulkan spec violation.
+        if (net.vulkanium.render.shadow.ShadowRenderer.ACTIVE && isTerrainLikeFormat(format)) {
+            net.vulkanium.render.pipeline.BasicPipeline shadowTerrainPipe =
+                    shaderpackPipeline.getShadowTerrainPipeline();
+            if (shadowTerrainPipe != null) {
+                return shadowTerrainPipe;
+            }
+        }
+
         net.vulkanium.shaderpack.ProgramId requested = mapShaderNameToProgramId(
                 VRenderSystem.getCurrentShaderName(), format, vertexCount, mode);
         if (requested == null) {
@@ -1229,7 +1242,7 @@ public class Vulkanium implements ClientModInitializer {
     private static int drawEntryDiagBudget = 10;
     private static int persistEntryDiagBudget = 10;
     /** One-shot budget for terrain draw diagnostics. */
-    private static int terrainDrawDiagBudget = 5;
+    private static int terrainDrawDiagBudget = 10;
     /** One-shot budget for shadow post-pass diagnostic. */
     private static int shadowPostDiagBudget = 3;
 
@@ -1761,10 +1774,35 @@ public class Vulkanium implements ClientModInitializer {
                         VRenderSystem.isCullEnabled(),
                         VRenderSystem.isDepthWriteEnabled());
             }
-            // One-shot terrain draw diagnostic with full matrix state
-            // Gate on frameCounter > 50 to skip loading screen draws
-            if (isTerrainDraw && terrainDrawDiagBudget > 0 && frameCounter > 50) {
+            // One-shot terrain draw diagnostic with full pipeline + viewport state
+            // Gate on frameCounter > 5 to skip loading screen draws (lowered from 50 for debugging)
+            if (isTerrainDraw && terrainDrawDiagBudget > 0 && frameCounter > 5) {
                 terrainDrawDiagBudget--;
+                // Log the CRITICAL pipeline state for face culling diagnosis:
+                // frontFace, cullEnabled, viewport y/height, and whether it's flipped
+                int vpX = VRenderSystem.getViewportX();
+                int vpY = VRenderSystem.getViewportY();
+                int vpW = VRenderSystem.getViewportWidth();
+                int vpH = VRenderSystem.getViewportHeight();
+                System.err.println("[FACE-CULL-DIAG] F#" + frameCounter + " D#" + diagFrameDrawCount
+                        + " pipe=" + pipeline.getName()
+                        + " frontFace=" + (pipeline.getFrontFace() == org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE ? "CCW" : "CW")
+                        + " cull=" + VRenderSystem.isCullEnabled()
+                        + " viewport=(" + vpX + "," + vpY + "," + vpW + "," + vpH + ")"
+                        + " lastVpFlipY=" + lastVpFlipY
+                        + " shadowActive=" + net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
+                        + " verts=" + vertexCount
+                        + " shader='" + VRenderSystem.getCurrentShaderName() + "'"
+                        + " depthTest=" + VRenderSystem.isDepthTestEnabled()
+                        + " depthWrite=" + VRenderSystem.isDepthWriteEnabled());
+                LOGGER.info("[FACE-CULL-DIAG] F#{} pipe={} frontFace={} cull={} viewport=({},{},{},{}) lastVpFlipY={} shader='{}'",
+                        frameCounter, pipeline.getName(),
+                        (pipeline.getFrontFace() == org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE ? "CCW" : "CW"),
+                        VRenderSystem.isCullEnabled(),
+                        vpX, vpY, vpW, vpH,
+                        lastVpFlipY,
+                        VRenderSystem.getCurrentShaderName());
+
                 float[] sMV = new float[16], sP = new float[16];
                 net.vulkanium.render.shadow.ShadowRenderer.MODELVIEW.get(sMV);
                 net.vulkanium.render.shadow.ShadowRenderer.PROJECTION.get(sP);

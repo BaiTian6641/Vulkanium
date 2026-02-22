@@ -183,8 +183,11 @@ public class VulkaniumGlslTransformer {
 
         // Step 4.7: For COMPOSITE passes, replace GL matrix uniforms with identity.
         // Iris's CompositeTransformer sets gl_ModelViewMatrix = mat4(1.0) and
-        // gl_ProjectionMatrix = scale matrix.  We use mat4(1.0) for both since
-        // our composite fullscreen triangle is already generated in clip space.
+        // gl_ProjectionMatrix = a scale-bias matrix that maps the quad from
+        // [0,1] UV space to [-1,1] NDC.  Shaderpacks (including Complementary
+        // Unbound) rely on this matrix for correct vertex positioning.
+        // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer — replaces
+        // gl_ProjectionMatrix with mat4(vec4(2,0,0,0),vec4(0,2,0,0),vec4(0),vec4(-1,-1,0,1)).
         // gbufferModelView / gbufferProjection (now iris_GBuffer* fields) retain
         // the real camera matrices for fragment shader sky computations.
         if (params.passType == PassType.COMPOSITE) {
@@ -193,8 +196,11 @@ public class VulkaniumGlslTransformer {
             // while still replacing all usage *references*.
             result = result.replaceAll("(?<!mat4 )\\biris_ModelViewMatrix\\b", "mat4(1.0)");
             result = result.replaceAll("(?<!mat4 )\\biris_ModelViewMatrixInverse\\b", "mat4(1.0)");
-            result = result.replaceAll("(?<!mat4 )\\biris_ProjectionMatrix\\b", "mat4(1.0)");
-            result = result.replaceAll("(?<!mat4 )\\biris_ProjectionMatrixInverse\\b", "mat4(1.0)");
+            // Scale-bias matrix: transforms [0,1] quad → [-1,1] NDC (Iris convention)
+            String compositeProjection = "mat4(vec4(2.0, 0.0, 0.0, 0.0), vec4(0.0, 2.0, 0.0, 0.0), vec4(0.0), vec4(-1.0, -1.0, 0.0, 1.0))";
+            String compositeProjectionInverse = "mat4(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, 0.5, 0.0, 0.0), vec4(0.0), vec4(0.5, 0.5, 0.0, 1.0))";
+            result = result.replaceAll("(?<!mat4 )\\biris_ProjectionMatrix\\b", compositeProjection);
+            result = result.replaceAll("(?<!mat4 )\\biris_ProjectionMatrixInverse\\b", compositeProjectionInverse);
             result = result.replaceAll("(?<!mat4 )\\biris_NormalMat4\\b", "mat4(1.0)");
         }
 
@@ -204,9 +210,11 @@ public class VulkaniumGlslTransformer {
         // Step 6: Vertex-specific transforms
         if (params.isVertex) {
             result = transformVertex(result, params);
-            if (params.passType != PassType.COMPOSITE) {
-                result = injectVulkanClipSpaceFix(result);
-            }
+            // Shadow projection matrices (createOrthoMatrix / createPerspectiveMatrix)
+            // now natively produce Vulkan [0,1] depth range (zZeroToOne=true).
+            // No shader-side depth remap is needed.
+            // Reference: Iris Shaders (LGPL-3.0) uses [-1,1] natively on OpenGL.
+            // Vulkanium's ShadowMatrices already handles the conversion CPU-side.
         }
 
         // Step 7: Fragment-specific transforms
@@ -229,35 +237,9 @@ public class VulkaniumGlslTransformer {
         return result;
     }
 
-    private static String injectVulkanClipSpaceFix(String source) {
-        Pattern mainPattern = Pattern.compile("void\\s+main\\s*\\(\\s*(?:void\\s*)?\\)");
-        Matcher mainMatcher = mainPattern.matcher(source);
-        if (!mainMatcher.find()) return source;
-
-        int mainStart = mainMatcher.start();
-        int bodyStart = source.indexOf('{', mainStart);
-        if (bodyStart < 0) return source;
-
-        int depth = 0;
-        int bodyEnd = -1;
-        for (int i = bodyStart; i < source.length(); i++) {
-            char c = source.charAt(i);
-            if (c == '{') depth++;
-            if (c == '}') {
-                depth--;
-                if (depth == 0) {
-                    bodyEnd = i;
-                    break;
-                }
-            }
-        }
-        if (bodyEnd < 0) return source;
-
-        String fix = "\n    // Vulkan clip-space conversion\n"
-                + "    gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n";
-
-        return source.substring(0, bodyEnd) + fix + source.substring(bodyEnd);
-    }
+    // injectVulkanClipSpaceFix removed: shadow/view projection matrices now
+    // natively produce Vulkan [0,1] depth (ShadowMatrices + MixinMatrix4f).
+    // No shader-side depth remap is needed.
 
     private static String injectLegacyShadowFunctions(String source) {
         if (!source.contains("shadow2D(") && !source.contains("shadow2DProj(")) {
@@ -1327,6 +1309,15 @@ public class VulkaniumGlslTransformer {
         DEFAULT_SAMPLER_BINDINGS.put("shadowcolor1", 18);
         DEFAULT_SAMPLER_BINDINGS.put("noisetex", 19);
         DEFAULT_SAMPLER_BINDINGS.put("iris_overlay", 20);
+        // Extended color textures (bindings 21-28) — colortex8-15
+        DEFAULT_SAMPLER_BINDINGS.put("colortex8", 21);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex9", 22);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex10", 23);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex11", 24);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex12", 25);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex13", 26);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex14", 27);
+        DEFAULT_SAMPLER_BINDINGS.put("colortex15", 28);
         // Legacy aliases
         DEFAULT_SAMPLER_BINDINGS.put("shadow", 15);
         DEFAULT_SAMPLER_BINDINGS.put("watershadow", 15);
@@ -1648,22 +1639,27 @@ public class VulkaniumGlslTransformer {
         // preventing camera projection/modelview matrices from distorting
         // the triangle (those matrices stay available for the fragment
         // shader's gbufferProjection / gbufferModelView aliases).
-        // UV.y is flipped (0.5 - y*0.5 instead of y*0.5+0.5) because Vulkan's
-        // texture row 0 is at the TOP of the image, while OpenGL shaders expect
-        // UV(0,0) at the bottom-left.  The function returns vec4(x, -y, ...)
-        // so that shaders computing UV from gl_Vertex.xy * 0.5 + 0.5 also get
-        // the correct flipped V coordinate.  vkm_composite_ClipPos retains the
-        // original Y for the Y-flipped viewport used during composite rendering.
+        //
+        // The Y-flipped Vulkan viewport (y=height, height=-height) handles
+        // the coordinate system conversion, so UV and gl_Vertex use standard
+        // OpenGL conventions (y=0 at bottom).  gl_Vertex and gl_Position
+        // use the SAME coordinates for consistency.
+        //
+        // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer — Iris
+        // provides gl_Vertex = vec4(Position, 1.0) on OpenGL where the
+        // vertex positions are already in [0,1] space.  Vulkanium generates
+        // the fullscreen triangle in [-1,1] NDC directly.
         String compute = """
                 // ── Vulkanium Composite Fullscreen Triangle ──
+                // Reference: Iris Shaders (LGPL-3.0) composite pass vertex handling
                 vec2 vkm_composite_TexCoord;
                 vec4 vkm_composite_ClipPos;
                 vec4 vkm_composite_Position() {
                     float x = -1.0 + float((gl_VertexIndex & 1) << 2);
                     float y = -1.0 + float((gl_VertexIndex & 2) << 1);
-                    vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, 0.5 - y * 0.5);
+                    vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
                     vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
-                    return vec4(x, -y, 0.0, 1.0);
+                    return vec4(x, y, 0.0, 1.0);
                 }
                 """;
 

@@ -149,8 +149,19 @@ public class BasicPipeline {
     }
 
     /**
-     * Front face winding order. Default: CCW (OpenGL convention with shader Y-flip).
-     * For shaderpack pipelines that don't use shader Y-flip, set to CW.
+     * Front face winding order.
+     *
+     * <p>Vulkanium uses a <b>negative-height viewport</b> ({@code height = -H,
+     * y = H}) to flip the Y axis from Vulkan's top-down convention to OpenGL's
+     * bottom-up convention.  This flip <em>reverses</em> the apparent triangle
+     * winding as seen by the rasteriser: triangles that are counter-clockwise
+     * (front-facing) in OpenGL's clip space become clockwise after the Y-flip.
+     *
+     * <p>The Vulkan spec area formula (with implicit Y-down compensation) means
+     * that negative-viewport + CCW correctly classifies OpenGL CCW triangles as
+     * front-facing (positive area).  Back-face culling ({@code VK_CULL_MODE_BACK_BIT})
+     * then culls the correct faces.  This is confirmed by the VK_KHR_maintenance1
+     * negative viewport specification and VulkanMod's reference implementation.
      */
     private int frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
@@ -564,6 +575,7 @@ public class BasicPipeline {
     public long getPipelineLayout() { return pipelineLayout; }
     public long getDescriptorSetLayout() { return descriptorSetLayout; }
     public String getName() { return name; }
+    public int getFrontFace() { return frontFace; }
     public static int getMaxTextureBindings() { return MAX_TEXTURE_BINDINGS; }
 
     public void destroy() {

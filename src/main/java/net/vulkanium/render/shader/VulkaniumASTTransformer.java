@@ -630,12 +630,17 @@ public class VulkaniumASTTransformer {
         if (root.identifierIndex.has("iris_ModelViewMatrixInverse")) {
             root.replaceReferenceExpressions(transformer, "iris_ModelViewMatrixInverse", "mat4(1.0)");
         }
-        // Replace per-draw projection matrices with identity
+        // Replace per-draw projection matrices with the Iris-compatible scale-bias
+        // matrix that maps the fullscreen quad from [0,1] UV space to [-1,1] NDC.
+        // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer — uses
+        // mat4(vec4(2,0,0,0), vec4(0,2,0,0), vec4(0), vec4(-1,-1,0,1)).
+        String compositeProjection = "mat4(vec4(2.0, 0.0, 0.0, 0.0), vec4(0.0, 2.0, 0.0, 0.0), vec4(0.0), vec4(-1.0, -1.0, 0.0, 1.0))";
+        String compositeProjectionInverse = "mat4(vec4(0.5, 0.0, 0.0, 0.0), vec4(0.0, 0.5, 0.0, 0.0), vec4(0.0), vec4(0.5, 0.5, 0.0, 1.0))";
         if (root.identifierIndex.has("iris_ProjectionMatrix")) {
-            root.replaceReferenceExpressions(transformer, "iris_ProjectionMatrix", "mat4(1.0)");
+            root.replaceReferenceExpressions(transformer, "iris_ProjectionMatrix", compositeProjection);
         }
         if (root.identifierIndex.has("iris_ProjectionMatrixInverse")) {
-            root.replaceReferenceExpressions(transformer, "iris_ProjectionMatrixInverse", "mat4(1.0)");
+            root.replaceReferenceExpressions(transformer, "iris_ProjectionMatrixInverse", compositeProjectionInverse);
         }
         // Replace normal matrix with identity
         if (root.identifierIndex.has("iris_NormalMat4")) {
@@ -728,43 +733,42 @@ public class VulkaniumASTTransformer {
                 tree.appendMainFunctionBody(transformer,
                         "gl_Position = vkm_composite_ClipPos;");
             }
-            case TERRAIN, SHADOW -> {
+            case TERRAIN -> {
+                injectCodeBlock(tree, TERRAIN_VERTEX_INPUTS);
+                injectCodeBlock(tree, TERRAIN_VERTEX_DECODED_VARS);
+                injectCodeBlock(tree, TERRAIN_VERTEX_DECODE_FN);
+                tree.prependMainFunctionBody(transformer, "vkm_decodeVertex();");
+                remap = TERRAIN_VERTEX_REMAP;
+                // No depth remap needed: MixinMatrix4f already produces [0,1] depth
+                // via zZeroToOne=true on setPerspective/setOrtho.
+            }
+            case SHADOW -> {
                 injectCodeBlock(tree, TERRAIN_VERTEX_INPUTS);
                 injectCodeBlock(tree, TERRAIN_VERTEX_DECODED_VARS);
                 injectCodeBlock(tree, TERRAIN_VERTEX_DECODE_FN);
                 tree.prependMainFunctionBody(transformer, "vkm_decodeVertex();");
                 remap = TERRAIN_VERTEX_REMAP;
 
-                // Vulkan Z-depth remap: OpenGL NDC z∈[-1,1] → Vulkan z∈[0,1]
-                // No Y-flip needed — we use positive-height viewport with CW front face
-                // so gl_FragCoord matches OpenGL convention (y=0 at bottom).
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
+                // Shadow projection matrices (ShadowMatrices.createOrthoMatrix /
+                // createPerspectiveMatrix) now natively produce Vulkan [0,1] depth
+                // (zZeroToOne=true).  No shader-side depth remap is needed.
+                // Reference: Iris Shaders (LGPL-3.0) uses [-1,1] natively on OpenGL.
             }
             case ENTITY, HAND -> {
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
-
-                // Vulkan Z-depth remap only — no Y-flip (positive viewport + CW front face)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
+                // No depth remap: MixinMatrix4f handles [0,1] depth.
             }
             case SKY -> {
                 // Sky uses position + optional UV — entity-like format
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
-
-                // Vulkan Z-depth remap only — no Y-flip (positive viewport + CW front face)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
+                // No depth remap: MixinMatrix4f handles [0,1] depth.
             }
             case PARTICLE -> {
                 injectCodeBlock(tree, PARTICLE_VERTEX_INPUTS);
                 remap = PARTICLE_VERTEX_REMAP;
-
-                // Vulkan Z-depth remap only — no Y-flip (positive viewport + CW front face)
-                tree.appendMainFunctionBody(transformer,
-                        "gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;");
+                // No depth remap: MixinMatrix4f handles [0,1] depth.
             }
             default -> {
                 remap = Collections.emptyMap();

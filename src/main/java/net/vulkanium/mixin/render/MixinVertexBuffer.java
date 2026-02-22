@@ -603,11 +603,16 @@ public abstract class MixinVertexBuffer {
             VRenderSystem.setChunkOffset(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
         }
 
-        // VRenderSystem MV/Proj intentionally persist from the parameter.
-        // MixinBufferUploader will sync VRenderSystem to RenderSystem's
-        // canonical state before each immediate draw (entity, sun/moon, etc.),
-        // so the persisted value only affects subsequent VertexBuffer draws
-        // within the same phase (which also set from their own parameter).
+        // ─── Restore VRenderSystem to RenderSystem's canonical state ───
+        // VulkanMod does this after every VBO draw to ensure any code that
+        // reads VRenderSystem between draws sees the correct canonical MV/Proj.
+        // Without this, the per-draw MV from the drawWithShader() parameter
+        // leaks into subsequent parameterless draw() calls or any code path
+        // that reads VRenderSystem.getModelViewMatrix() outside MixinBufferUploader.
+        VRenderSystem.setModelViewMatrix(com.mojang.blaze3d.systems.RenderSystem.getModelViewMatrix());
+        VRenderSystem.setProjectionMatrix(
+                com.mojang.blaze3d.systems.RenderSystem.getProjectionMatrix(),
+                VRenderSystem.getVertexSorting());
 
         ci.cancel();
     }

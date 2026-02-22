@@ -71,11 +71,35 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     //  Default Sampler Bindings (OptiFine/Iris sampler name → binding index)
     // ═══════════════════════════════════════════════════════════════
 
-    /** Standard OptiFine/Iris sampler name → descriptor binding index (set=1) */
+    /**
+     * Standard OptiFine/Iris sampler name → descriptor binding index (set=1).
+     *
+     * <p>CRITICAL: This map MUST be identical to the one in
+     * {@link net.vulkanium.render.shader.VulkaniumGlslTransformer} which drives
+     * the {@code layout(binding=N)} qualifiers compiled into SPIR-V.  Any mismatch
+     * means shaders read from the wrong descriptor slot at runtime.</p>
+     *
+     * <p>Binding layout (matches Iris/OptiFine sampler conventions):</p>
+     * <pre>
+     *   0       gtexture/texture/tex (block atlas)
+     *   1       lightmap
+     *   2       normals
+     *   3       specular
+     *   4-11    colortex0-7
+     *   12-14   depthtex0-2
+     *   15-16   shadowtex0-1
+     *   17-18   shadowcolor0-1
+     *   19      noisetex
+     *   20      iris_overlay
+     *   21-28   colortex8-15 (extended render targets)
+     * </pre>
+     *
+     * <p>Reference: Iris Shaders (LGPL-3.0) sampler binding conventions.</p>
+     */
     private static final Map<String, Integer> DEFAULT_SAMPLER_BINDINGS;
     static {
         Map<String, Integer> m = new LinkedHashMap<>();
-        // Primary textures
+        // Primary textures (bindings 0-3)
         m.put("gtexture", 0);       // Block atlas / main texture
         m.put("texture", 0);        // Alias for gtexture
         m.put("tex", 0);            // Another alias
@@ -83,49 +107,55 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         m.put("normals", 2);        // Normal map atlas
         m.put("specular", 3);       // Specular/PBR atlas
 
-        // Depth textures
-        m.put("depthtex0", 4);
-        m.put("gdepthtex", 4);      // Alias
-        m.put("depthtex1", 5);
-        m.put("depthtex2", 6);
+        // Color textures (bindings 4-11) — composite pass inputs
+        m.put("colortex0", 4);
+        m.put("gcolor", 4);         // Legacy alias
+        m.put("colortex1", 5);
+        m.put("gdepth", 5);         // Legacy alias
+        m.put("colortex2", 6);
+        m.put("gnormal", 6);        // Legacy alias
+        m.put("colortex3", 7);
+        m.put("composite", 7);      // Legacy alias
+        m.put("colortex4", 8);
+        m.put("gaux1", 8);          // Legacy alias
+        m.put("colortex5", 9);
+        m.put("gaux2", 9);
+        m.put("colortex6", 10);
+        m.put("gaux3", 10);
+        m.put("colortex7", 11);
+        m.put("gaux4", 11);
 
-        // Color textures (composite pass inputs)
-        m.put("colortex0", 7);
-        m.put("gcolor", 7);         // Alias
-        m.put("colortex1", 8);
-        m.put("gdepth", 8);         // Legacy alias
-        m.put("colortex2", 9);
-        m.put("gnormal", 9);        // Legacy alias
-        m.put("colortex3", 10);
-        m.put("composite", 10);     // Legacy alias
-        m.put("colortex4", 11);
-        m.put("gaux1", 11);         // Legacy alias
-        m.put("colortex5", 12);
-        m.put("gaux2", 12);
-        m.put("colortex6", 13);
-        m.put("gaux3", 13);
-        m.put("colortex7", 14);
-        m.put("gaux4", 14);
-        m.put("colortex8", 15);
-        m.put("colortex9", 16);
-        m.put("colortex10", 17);
-        m.put("colortex11", 18);
-        m.put("colortex12", 19);
-        m.put("colortex13", 20);
-        m.put("colortex14", 21);
-        m.put("colortex15", 22);
+        // Depth textures (bindings 12-14)
+        m.put("depthtex0", 12);
+        m.put("gdepthtex", 12);     // Legacy alias
+        m.put("depthtex1", 13);
+        m.put("depthtex2", 14);
 
-        // Shadow textures
-        m.put("shadowtex0", 23);
-        m.put("shadow", 23);        // Alias
-        m.put("waterShadow", 23);   // Alias
-        m.put("shadowtex1", 24);
-        m.put("shadowcolor", 25);
-        m.put("shadowcolor0", 25);
-        m.put("shadowcolor1", 26);
+        // Shadow textures (bindings 15-18)
+        m.put("shadowtex0", 15);
+        m.put("shadow", 15);        // Alias
+        m.put("waterShadow", 15);   // Alias
+        m.put("shadowtex1", 16);
+        m.put("shadowcolor", 17);
+        m.put("shadowcolor0", 17);
+        m.put("shadowcolor1", 18);
 
-        // Noise texture
-        m.put("noisetex", 27);
+        // Noise texture (binding 19)
+        m.put("noisetex", 19);
+
+        // Overlay (binding 20)
+        m.put("iris_overlay", 20);
+
+        // Extended color textures (bindings 21-28) — colortex8-15
+        // Some shader packs use >8 render targets for advanced effects.
+        m.put("colortex8", 21);
+        m.put("colortex9", 22);
+        m.put("colortex10", 23);
+        m.put("colortex11", 24);
+        m.put("colortex12", 25);
+        m.put("colortex13", 26);
+        m.put("colortex14", 27);
+        m.put("colortex15", 28);
 
         DEFAULT_SAMPLER_BINDINGS = Collections.unmodifiableMap(m);
     }
@@ -1508,7 +1538,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
         noiseImage = img.image();
         noiseImageAllocation = img.allocation();
-        LOGGER.info("[NOISE] Created {}x{} RGBA8 noise texture (noisetex binding=27)", w, h);
+        LOGGER.info("[NOISE] Created {}x{} RGBA8 noise texture (noisetex binding=19)", w, h);
     }
 
     /**
@@ -1648,8 +1678,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     compiledPrograms.containsKey(ProgramId.SHADOW) ? "shadow" :
                     compiledPrograms.containsKey(ProgramId.SHADOW_SOLID) ? "shadow_solid" :
                     "gbuffers_terrain (fallback)");
-            // CCW front face matches OpenGL winding convention.
-            // Negative-height viewport preserves winding sign in Vulkan's area formula.
+            // CCW front face for shadow pass: shadow uses POSITIVE viewport
+            // (y=0, h=height), so the shoelace formula gives positive area for
+            // OpenGL CCW triangles — CCW correctly identifies them as front-facing.
             shadowTerrainPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow terrain pipeline: {}", e.getMessage());
@@ -1714,6 +1745,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             );
             LOGGER.info("[SHADOW] Shadow entity pipeline created (entity vertex format, depth-only)");
             // CCW front face matches OpenGL winding convention.
+            // CCW: shadow uses positive viewport → standard winding preserved.
             shadowEntityPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow entity pipeline: {}", e.getMessage());
@@ -1723,6 +1755,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
     /** Returns the shadow entity pipeline, or {@code null} if not available. */
     public BasicPipeline getShadowEntityPipeline() { return shadowEntityPipeline; }
+
+    /** Returns the shadow terrain pipeline, or {@code null} if not available. */
+    public BasicPipeline getShadowTerrainPipeline() { return shadowTerrainPipeline; }
 
     /**
      * Executes the shadow rendering pass for the current frame.
@@ -1979,9 +2014,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
-            // CCW front face matches OpenGL winding convention.
-            // Vulkan's negative-height viewport (Y-flip) preserves the area sign
-            // for front-face determination — validated by VulkanMod reference.
+            // CCW front face: negative viewport (VK_KHR_maintenance1) makes the
+            // Vulkan area formula give positive area for OpenGL CCW triangles.
+            // CCW (positive = front) correctly classifies them as front-facing.
             pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
@@ -2406,13 +2441,17 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
                 vkCmdBeginRenderPass(cmd, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-                // Standard positive-height viewport for OpenGL-matching gl_FragCoord
-                // With no shader Y-flip, gl_FragCoord.y = 0 at scene bottom (matching OpenGL)
+                // Y-flipped viewport for OpenGL-matching gl_FragCoord:
+                // Vulkan normally has gl_FragCoord.y=0 at top, but OpenGL shaders
+                // expect y=0 at bottom.  Using y=height, height=-height flips the
+                // coordinate system to match, consistent with gbuffers world passes.
+                // Reference: Iris Shaders (LGPL-3.0) — OpenGL natively has y=0 at
+                // bottom; this viewport trick emulates that on Vulkan.
                 VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
                         .x(0.0f)
-                        .y(0.0f)
+                        .y((float) height)
                         .width((float) width)
-                        .height((float) height)
+                        .height((float) -height)
                         .minDepth(0.0f)
                         .maxDepth(1.0f);
                 vkCmdSetViewport(cmd, 0, viewport);
@@ -2518,7 +2557,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     subpassColorCount
             );
             mrtPipelines.put(key, pipeline);
-            // Keep CCW winding consistent with compatibility pipelines.
+            // CCW front face: negative viewport gives positive area for OpenGL CCW
+            // triangles, so CCW correctly classifies them as front-facing.
             pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
@@ -2714,8 +2754,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         }
 
         // ── Shadow texture bindings ──
-        // Bind shadow depth maps (shadowtex0 → binding 23, shadowtex1 → binding 24)
-        // and shadow color attachments (shadowcolor0 → binding 25, shadowcolor1 → binding 26)
+        // Bind shadow depth maps (shadowtex0 → binding 15, shadowtex1 → binding 16)
+        // and shadow color attachments (shadowcolor0 → binding 17, shadowcolor1 → binding 18)
         if (shadowMap != null && shadowImagesInitialized) {
             // shadowtex0 — main shadow depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
             // Composite/deferred shaders declare shadowtex0 as sampler2D (not sampler2DShadow),
@@ -2757,7 +2797,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             }
         }
 
-        // ── Noise texture binding (noisetex → binding 27) ──
+        // ── Noise texture binding (noisetex → binding 19) ──
         if (noiseImageView != VK_NULL_HANDLE && noiseSampler != VK_NULL_HANDLE) {
             bindSamplerAlias(views, samplers, "noisetex", noiseImageView, noiseSampler);
         }
