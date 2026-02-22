@@ -820,6 +820,27 @@ public class Vulkanium implements ClientModInitializer {
                 poseStackModelView, projectionMatrix);
         currentPartialTick = partialTick;
 
+        // Log world snapshot matrices at frame 100 for diagnostic
+        if (frameCounter == 100) {
+            float[] snapMV = new float[16];
+            poseStackModelView.get(snapMV);
+            float[] snapProj = new float[16];
+            projectionMatrix.get(snapProj);
+            LOGGER.info("[WORLD-SNAPSHOT] F#{} gbufferModelView=({},{},{},{} / {},{},{},{} / {},{},{},{} / {},{},{},{}) " +
+                    "gbufferProjection[0,5,10,14]=({},{},{},{})",
+                    frameCounter,
+                    String.format("%.4f", snapMV[0]), String.format("%.4f", snapMV[1]),
+                    String.format("%.4f", snapMV[2]), String.format("%.4f", snapMV[3]),
+                    String.format("%.4f", snapMV[4]), String.format("%.4f", snapMV[5]),
+                    String.format("%.4f", snapMV[6]), String.format("%.4f", snapMV[7]),
+                    String.format("%.4f", snapMV[8]), String.format("%.4f", snapMV[9]),
+                    String.format("%.4f", snapMV[10]), String.format("%.4f", snapMV[11]),
+                    String.format("%.4f", snapMV[12]), String.format("%.4f", snapMV[13]),
+                    String.format("%.4f", snapMV[14]), String.format("%.4f", snapMV[15]),
+                    String.format("%.4f", snapProj[0]), String.format("%.4f", snapProj[5]),
+                    String.format("%.4f", snapProj[10]), String.format("%.4f", snapProj[14]));
+        }
+
         // Begin MRT G-buffer pass if a shaderpack with MRT is active
         if (vulkanReady && frameStarted
                 && getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
@@ -1173,7 +1194,13 @@ public class Vulkanium implements ClientModInitializer {
                 || "position_tex_color".equals(shaderName);
     }
 
-    // ─── Pipeline name helpers (kept for future per-program state) ────
+    // ─── Pipeline name helpers and diagnostic budgets ────
+
+    /** Budget for sky draw diagnostics — logs first N sky pipeline draws then stops. */
+    private static int skyDrawDiagBudget = 40;
+    /** One-shot budget to verify draw entry paths are reached. */
+    private static int drawEntryDiagBudget = 10;
+    private static int persistEntryDiagBudget = 10;
 
     private static boolean isSkyOrCloudPipelineName(String pipelineName) {
         if (pipelineName == null) {
@@ -1291,6 +1318,21 @@ public class Vulkanium implements ClientModInitializer {
         BasicPipeline pipeline = resolvePipelineForDraw(format, vertexCount, mode);
         if (pipeline == null)
             return;
+
+        // One-shot entry diagnostic
+        if (drawEntryDiagBudget > 0) {
+            drawEntryDiagBudget--;
+            System.err.println("[DRAW-ENTRY] pipe=" + pipeline.getName()
+                + " renderMode=" + getRenderMode()
+                + " verts=" + vertexCount);
+            LOGGER.info("[DRAW-ENTRY] pipe={} mode={} shaderpackCompat={} renderMode={} verts={}",
+                    pipeline.getName(),
+                    getRenderMode(),
+                    getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                        && pipeline.getName().startsWith("shaderpack_"),
+                    getRenderMode(),
+                    vertexCount);
+        }
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
         int frameIndex = frameOrchestrator.getCurrentFrame();
@@ -1432,8 +1474,8 @@ public class Vulkanium implements ClientModInitializer {
                     modelView, modelViewInv,
                     projection, projectionInv,
                     colorMod, fogParams, texMat, chunkOffset);
-            // Unconditional diagnostic for first 5 shaderpack draws per frame, first 10 frames
-            if (frameCounter <= 10 && diagFrameDrawCount <= 5) {
+            // Diagnostic: log first few draws per frame when world is loaded (frames 100-105)
+            if (frameCounter >= 100 && frameCounter <= 105 && diagFrameDrawCount <= 8) {
                 LOGGER.info("[DRAW-DIAG] F#{} D#{} pipe={} shader='{}' terrain={} verts={} " +
                         "mv[0,5,10,15]=({},{},{},{}) proj[0,5]=({},{}) co=({},{},{}) " +
                         "blend={} cull={} depthW={}",
@@ -1447,6 +1489,29 @@ public class Vulkanium implements ClientModInitializer {
                         net.vulkanium.compat.VRenderSystem.isBlendEnabled(),
                         net.vulkanium.compat.VRenderSystem.isCullEnabled(),
                         net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled());
+            }
+            // Always log sky pipeline draws with a budget
+            if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0) {
+                skyDrawDiagBudget--;
+                LOGGER.info("[SKY-DRAW] F#{} D#{} pipe={} shader='{}' verts={} " +
+                        "mv=({},{},{},{} / {},{},{},{} / {},{},{},{} / {},{},{},{}) " +
+                        "proj[0,5,10,14]=({},{},{},{}) blend={} cull={} depthW={} depthTest={}",
+                        frameCounter, diagFrameDrawCount, pipeline.getName(),
+                        VRenderSystem.getCurrentShaderName(), vertexCount,
+                        String.format("%.4f", modelView[0]), String.format("%.4f", modelView[1]),
+                        String.format("%.4f", modelView[2]), String.format("%.4f", modelView[3]),
+                        String.format("%.4f", modelView[4]), String.format("%.4f", modelView[5]),
+                        String.format("%.4f", modelView[6]), String.format("%.4f", modelView[7]),
+                        String.format("%.4f", modelView[8]), String.format("%.4f", modelView[9]),
+                        String.format("%.4f", modelView[10]), String.format("%.4f", modelView[11]),
+                        String.format("%.4f", modelView[12]), String.format("%.4f", modelView[13]),
+                        String.format("%.4f", modelView[14]), String.format("%.4f", modelView[15]),
+                        String.format("%.4f", projection[0]), String.format("%.4f", projection[5]),
+                        String.format("%.4f", projection[10]), String.format("%.4f", projection[14]),
+                        net.vulkanium.compat.VRenderSystem.isBlendEnabled(),
+                        net.vulkanium.compat.VRenderSystem.isCullEnabled(),
+                        net.vulkanium.compat.VRenderSystem.isDepthWriteEnabled(),
+                        net.vulkanium.compat.VRenderSystem.isDepthTestEnabled());
             }
         } else {
             if (net.vulkanium.compat.VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {
@@ -1549,6 +1614,21 @@ public class Vulkanium implements ClientModInitializer {
         if (pipeline == null)
             return;
 
+        // One-shot entry diagnostic
+        if (persistEntryDiagBudget > 0) {
+            persistEntryDiagBudget--;
+            System.err.println("[PERSIST-ENTRY] pipe=" + pipeline.getName()
+                + " renderMode=" + getRenderMode()
+                + " verts=" + vertexCount);
+            LOGGER.info("[PERSIST-ENTRY] pipe={} mode={} shaderpackCompat={} renderMode={} verts={}",
+                    pipeline.getName(),
+                    getRenderMode(),
+                    getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
+                        && pipeline.getName().startsWith("shaderpack_"),
+                    getRenderMode(),
+                    vertexCount);
+        }
+
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
         int frameIndex = frameOrchestrator.getCurrentFrame();
 
@@ -1636,8 +1716,8 @@ public class Vulkanium implements ClientModInitializer {
                     modelView, modelViewInv,
                     projection, projectionInv,
                     colorMod, fogParams, texMat, chunkOffset);
-            // Unconditional diagnostic for first 5 persistent draws per frame, first 10 frames
-            if (frameCounter <= 10 && diagFrameDrawCount <= 5) {
+            // Diagnostic: log first few persistent draws when world is loaded (frames 100-105)
+            if (frameCounter >= 100 && frameCounter <= 105 && diagFrameDrawCount <= 8) {
                 LOGGER.info("[PERSIST-DIAG] F#{} D#{} pipe={} shader='{}' terrain={} verts={} " +
                         "mv[0,5,10,15]=({},{},{},{}) co=({},{},{}) blend={} cull={} depthW={}",
                         frameCounter, diagFrameDrawCount, pipeline.getName(),
@@ -1649,6 +1729,29 @@ public class Vulkanium implements ClientModInitializer {
                         VRenderSystem.isBlendEnabled(),
                         VRenderSystem.isCullEnabled(),
                         VRenderSystem.isDepthWriteEnabled());
+            }
+            // Always log sky pipeline persistent draws with a budget
+            if (isSkyOrCloudPipelineName(pipeline.getName()) && skyDrawDiagBudget > 0) {
+                skyDrawDiagBudget--;
+                LOGGER.info("[SKY-PERSIST] F#{} D#{} pipe={} shader='{}' verts={} " +
+                        "mv=({},{},{},{} / {},{},{},{} / {},{},{},{} / {},{},{},{}) " +
+                        "proj[0,5,10,14]=({},{},{},{}) blend={} cull={} depthW={} depthTest={}",
+                        frameCounter, diagFrameDrawCount, pipeline.getName(),
+                        VRenderSystem.getCurrentShaderName(), isTerrainDraw,
+                        String.format("%.4f", modelView[0]), String.format("%.4f", modelView[1]),
+                        String.format("%.4f", modelView[2]), String.format("%.4f", modelView[3]),
+                        String.format("%.4f", modelView[4]), String.format("%.4f", modelView[5]),
+                        String.format("%.4f", modelView[6]), String.format("%.4f", modelView[7]),
+                        String.format("%.4f", modelView[8]), String.format("%.4f", modelView[9]),
+                        String.format("%.4f", modelView[10]), String.format("%.4f", modelView[11]),
+                        String.format("%.4f", modelView[12]), String.format("%.4f", modelView[13]),
+                        String.format("%.4f", modelView[14]), String.format("%.4f", modelView[15]),
+                        String.format("%.4f", projection[0]), String.format("%.4f", projection[5]),
+                        String.format("%.4f", projection[10]), String.format("%.4f", projection[14]),
+                        VRenderSystem.isBlendEnabled(),
+                        VRenderSystem.isCullEnabled(),
+                        VRenderSystem.isDepthWriteEnabled(),
+                        VRenderSystem.isDepthTestEnabled());
             }
         } else {
             if (VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {

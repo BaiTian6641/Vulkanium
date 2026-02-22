@@ -517,13 +517,11 @@ public abstract class MixinVertexBuffer {
             return;
         }
 
-        // Save current VRenderSystem matrices so we can restore after this draw
-        Matrix4f prevProj = new Matrix4f(VRenderSystem.getProjectionMatrix());
-        Matrix4f prevMV = new Matrix4f(VRenderSystem.getModelViewMatrix());
-
         // Apply the per-draw matrices from the arguments.
-        // Chunk translation is expected to already be reflected in the provided
-        // modelView matrix for this draw path.
+        // Do NOT save/restore — MC expects the RenderSystem state to persist
+        // after VertexBuffer draws, and subsequent immediate draws (sun/moon via
+        // BufferUploader) rely on the model-view being the camera rotation set here.
+        // Restoring would clobber it back to a stale/identity matrix.
         VRenderSystem.setModelViewMatrix(modelViewMatrix);
         VRenderSystem.setProjectionMatrix(projectionMatrix, VRenderSystem.getVertexSorting());
 
@@ -594,12 +592,15 @@ public abstract class MixinVertexBuffer {
             this.persistentSequentialIndex);
 
         if (appliedLocalChunkOffset) {
+            // Restore the terrain chunk offset for subsequent draws.
+            // The MV and projection are intentionally NOT restored — MC expects
+            // the per-draw argument matrices to persist on RenderSystem state.
             VRenderSystem.setChunkOffset(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
+            // Reset MV back to the original argument (without baked chunk offset)
+            // so that the VRenderSystem MV reflects the camera rotation,
+            // not camera + chunk offset.
+            VRenderSystem.setModelViewMatrix(modelViewMatrix);
         }
-
-        // Restore previous matrices (other draws may depend on them)
-        VRenderSystem.setModelViewMatrix(prevMV);
-        VRenderSystem.setProjectionMatrix(prevProj, VRenderSystem.getVertexSorting());
 
         ci.cancel();
     }

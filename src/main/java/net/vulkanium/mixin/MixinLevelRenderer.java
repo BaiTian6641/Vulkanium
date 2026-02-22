@@ -54,12 +54,6 @@ public abstract class MixinLevelRenderer {
      * Saved at HEAD, restored at RETURN so entities/particles don't get double-rotated,
      * but without clobbering the camera matrix mid-layer (which broke translucent water).
      */
-    @Unique
-    private Matrix4f vulkanium$savedModelView;
-
-    @Unique
-    private Matrix4f vulkanium$savedProjection;
-
     /**
      * Intercept setupRender to use Vulkan-optimized frustum culling and chunk scheduling.
      *
@@ -106,32 +100,20 @@ public abstract class MixinLevelRenderer {
 
         Vulkanium.onTerrainLayerStart(renderType.toString());
 
-        // Save the current matrices BEFORE we set the camera matrices for this layer.
-        // At RETURN we restore these so non-terrain draws (entities, particles) don't
-        // get double-rotated. Previously we reset to identity which broke the TRANSLUCENT
-        // layer — chunks drawn after the first drawWithShader() restore would see identity
-        // instead of the proper camera matrix.
-        vulkanium$savedModelView = new Matrix4f(net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
-        vulkanium$savedProjection = new Matrix4f(net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
-
-        // Set the camera-rotated model-view for this terrain layer
+        // Set the camera-rotated model-view for this terrain layer.
+        // No save/restore needed — MixinVertexBuffer.onDrawWithShader sets the MV
+        // from MC's arguments per-draw, and after the layer finishes, the last
+        // chunk's draw leaves VRenderSystem with the camera rotation (correct state).
         net.vulkanium.compat.VRenderSystem.setModelViewMatrix(poseStack.last().pose());
         net.vulkanium.compat.VRenderSystem.setProjectionMatrix(projectionMatrix,
                 net.vulkanium.compat.VRenderSystem.getVertexSorting());
     }
 
     /**
-     * After each render layer finishes, reset ChunkOffset and restore the pre-layer
-     * matrices. This is critical because:
-     * 1. ChunkOffset must not leak into non-terrain draws (entities, particles)
-     * 2. Entity vertices are already in view space — they don't need the terrain
-     *    camera-rotated modelViewMat, so we restore what was there before this layer.
-     *
-     * Previously we reset to identity here, but that broke the TRANSLUCENT layer:
-     * MixinVertexBuffer.onDrawWithShader() saves/restores VRenderSystem matrices
-     * per-chunk. If the "previous" to restore was identity (from a prior layer's
-     * RETURN), subsequent chunks in the TRANSLUCENT pass lost the camera rotation
-     * and water/glass would glitch when rotating the view.
+     * After each render layer finishes, reset ChunkOffset.
+     * The model-view and projection are NOT restored — they stay as whatever
+     * the last per-draw call set (camera rotation from MC's drawWithShader
+     * arguments), which is the correct rendering context.
      */
     @Inject(method = "renderChunkLayer", at = @At("RETURN"))
     private void afterRenderSectionLayer(RenderType renderType, PoseStack poseStack,
@@ -140,14 +122,6 @@ public abstract class MixinLevelRenderer {
         if (!Vulkanium.isVulkanReady()) return;
         Vulkanium.onTerrainLayerEnd();
         net.vulkanium.compat.VRenderSystem.setChunkOffset(0.0f, 0.0f, 0.0f);
-        // Restore the matrices that were active before this layer started
-        if (vulkanium$savedModelView != null) {
-            net.vulkanium.compat.VRenderSystem.setModelViewMatrix(vulkanium$savedModelView);
-        }
-        if (vulkanium$savedProjection != null) {
-            net.vulkanium.compat.VRenderSystem.setProjectionMatrix(vulkanium$savedProjection,
-                    net.vulkanium.compat.VRenderSystem.getVertexSorting());
-        }
     }
 
     /**
