@@ -1363,6 +1363,10 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetX = net.vulkanium.compat.VRenderSystem.getChunkOffsetX();
             float chunkOffsetY = net.vulkanium.compat.VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = net.vulkanium.compat.VRenderSystem.getChunkOffsetZ();
+            net.vulkanium.render.program.WorldRenderingPhase.Phase phase =
+                net.vulkanium.render.program.WorldRenderingPhase.getPhase();
+            boolean isSkyCloudPhase = net.vulkanium.render.program.WorldRenderingPhase.isSky()
+                || phase == net.vulkanium.render.program.WorldRenderingPhase.Phase.CLOUDS;
 
             // ── Model-view matrix selection ──
             // Sky programs (sun/moon/sunset quads): vertices arrive via
@@ -1390,12 +1394,13 @@ public class Vulkanium implements ClientModInitializer {
                     || pipeline.getName().contains("star")
                     || pipeline.getName().contains("sunset")
                     || pipeline.getName().contains("void");
+                boolean isPretransformedSkyOrCloudDraw = isCelestialPretransformedDraw || isSkyCloudPhase;
             boolean isTerrainDraw = isTerrainLikeFormat(format);
             boolean isShadowEntityDraw = net.vulkanium.render.shadow.ShadowRenderer.ACTIVE
-                    && !isCelestialPretransformedDraw && !isTerrainDraw;
+                    && !isPretransformedSkyOrCloudDraw && !isTerrainDraw;
             org.joml.Matrix4f modelViewMat;
             org.joml.Matrix4f projectionMat;
-                if (isCelestialPretransformedDraw) {
+                if (isPretransformedSkyOrCloudDraw) {
                 // BufferUploader sky draws: vertices are pre-transformed by
                 // Camera×Celestial, so use identity model-view to avoid
                 // double-applying the camera rotation.
@@ -1448,6 +1453,11 @@ public class Vulkanium implements ClientModInitializer {
             new org.joml.Matrix4f(modelViewMat).invert().get(modelViewInv);
             float[] projectionInv = new float[16];
             new org.joml.Matrix4f(projectionMat).invert().get(projectionInv);
+            if (!isTerrainDraw) {
+                chunkOffsetX = 0.0f;
+                chunkOffsetY = 0.0f;
+                chunkOffsetZ = 0.0f;
+            }
             float[] chunkOffset = {
                     chunkOffsetX,
                     chunkOffsetY,
@@ -1515,15 +1525,11 @@ public class Vulkanium implements ClientModInitializer {
         }
 
         // Update dynamic viewport/scissor if MC changed them since last draw.
-        // Two-lane split:
-        // 1) Shaderpack compatibility draws: shader transform already handles
-        // clip-space conversion,
-        // so avoid extra viewport Y flip.
-        // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
-        // 3) Shadow pass: viewport was already set by ShadowRenderer.setShadowViewport();
-        //    do NOT overwrite it with the main window dimensions.
+        // Use OpenGL-style Y-up screen convention (negative-height Vulkan viewport)
+        // for both shaderpack and fallback world/UI draws.
+        // Shadow pass uses its own explicit viewport and must not be overridden.
         if (!net.vulkanium.render.shadow.ShadowRenderer.ACTIVE) {
-            updateViewportScissor(cmd, !shaderpackCompat);
+            updateViewportScissor(cmd, true);
         }
 
         // Bind the per-draw descriptor set with dynamic UBO offset
@@ -1606,13 +1612,20 @@ public class Vulkanium implements ClientModInitializer {
             float chunkOffsetY = VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = VRenderSystem.getChunkOffsetZ();
             boolean hasChunkOffset = chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f;
+            boolean isTerrainDraw = isTerrainLikeFormat(format);
 
             org.joml.Matrix4f modelViewMat = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix());
-            if (hasChunkOffset) {
+            if (hasChunkOffset && isTerrainDraw) {
                 // Stabilize terrain compatibility path: apply section translation in CPU
                 // model-view
                 // and zero the explicit chunk offset uniform to avoid double application.
                 modelViewMat.translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
+                chunkOffsetX = 0.0f;
+                chunkOffsetY = 0.0f;
+                chunkOffsetZ = 0.0f;
+            } else if (!isTerrainDraw) {
+                // Never leak stale terrain section offsets into non-terrain draws
+                // (sky, clouds, entities, hand, etc).
                 chunkOffsetX = 0.0f;
                 chunkOffsetY = 0.0f;
                 chunkOffsetZ = 0.0f;
@@ -1718,15 +1731,11 @@ public class Vulkanium implements ClientModInitializer {
         }
 
         // Update viewport/scissor.
-        // Two-lane split:
-        // 1) Shaderpack compatibility draws: shader transform already handles
-        // clip-space conversion,
-        // so avoid extra viewport Y flip.
-        // 2) Non-shaderpack draws (UI/fallback): keep legacy viewport Y flip.
-        // 3) Shadow pass: viewport was already set by ShadowRenderer.setShadowViewport();
-        //    do NOT overwrite it with the main window dimensions.
+        // Use OpenGL-style Y-up screen convention (negative-height Vulkan viewport)
+        // for both shaderpack and fallback world/UI draws.
+        // Shadow pass uses its own explicit viewport and must not be overridden.
         if (!net.vulkanium.render.shadow.ShadowRenderer.ACTIVE) {
-            updateViewportScissor(cmd, !shaderpackCompat);
+            updateViewportScissor(cmd, true);
         }
 
         // Bind descriptor set

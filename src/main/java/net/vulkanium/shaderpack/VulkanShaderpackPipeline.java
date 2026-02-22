@@ -1978,10 +1978,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
-            // Shaderpack compatibility path uses positive viewport height and no
-            // shader-side Y flip. In Vulkan this requires CW front faces to match
-            // OpenGL-facing geometry, otherwise back-face culling appears inside-out.
-            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_CLOCKWISE);
+            // Compatibility path uses Y-flipped Vulkan viewport (negative height)
+            // to preserve OpenGL screen convention. Keep CCW front face so
+            // culling matches Minecraft/OpenGL winding.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("Failed to create compatibility pipeline for {}: {}", requestedProgram, e.getMessage());
