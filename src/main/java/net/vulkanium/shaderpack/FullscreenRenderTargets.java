@@ -40,6 +40,9 @@ public class FullscreenRenderTargets {
     /** Maximum depth targets (depthtex0, depthtex1, depthtex2). */
     public static final int MAX_DEPTH_TARGETS = 3;
 
+    /** Diagnostic budget for blit logging. */
+    private int blitDiagBudget = 5;
+
     // ── Double-buffered color targets ──
     // [targetIndex][0=main, 1=alt]
     private final RenderTarget[][] colorTargets = new RenderTarget[MAX_COLOR_TARGETS][2];
@@ -849,6 +852,12 @@ public class FullscreenRenderTargets {
         //   srcOffset[1].y = 0       (end at top of source image = ground)
         // This copies the source upside-down into the destination, correcting
         // the on-screen orientation.
+        if (blitDiagBudget > 0) {
+            blitDiagBudget--;
+            LOGGER.info("[BLIT] Y-flip blit: src={}x{} (img=0x{}) → dst={}x{} (img=0x{})",
+                    width, height, Long.toHexString(read0.getImage()),
+                    dstWidth, dstHeight, Long.toHexString(swapchainImage));
+        }
         try (var stack = stackPush()) {
             VkImageBlit.Buffer blitRegion = VkImageBlit.calloc(1, stack);
             blitRegion.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)

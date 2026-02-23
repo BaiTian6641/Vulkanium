@@ -508,15 +508,46 @@ public class DrawBatcher {
         }
 
         // Write Projection matrix (offset 128)
-        long projectionPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PROJECTION;
-        for (int i = 0; i < 16 && i < projectionMatrix.length; i++) {
-            MemoryUtil.memPutFloat(projectionPtr + i * 4L, projectionMatrix[i]);
-        }
+        // IMPORTANT: Shaderpacks (OptiFine/Iris convention) expect ALL projection
+        // matrices to use OpenGL [-1,1] depth convention.  Shaders do depth
+        // reconstruction like: clip.z = depth * 2.0 - 1.0; view = projectionInverse * clip;
+        // If projectionMatrix were [0,1], this math breaks.
+        //
+        // Vulkanium's MixinMatrix4f produces [0,1] depth (zZeroToOne=true).  We convert
+        // the per-draw projection to [-1,1] before uploading, matching Iris exactly.
+        // The vertex shader depth remap (injected by the GLSL transformer) converts
+        // gl_Position.z back from [-1,1] to [0,1] for Vulkan clip space.
+        //
+        // Conversion:  m22_gl = 2*m22_vk + 1,  m32_gl = 2*m32_vk
+        // Reference: Iris Shaders (LGPL-3.0) — runs on OpenGL where [-1,1] is native.
+        if (projectionMatrix.length >= 16) {
+            org.joml.Matrix4f perDrawProj = new org.joml.Matrix4f();
+            perDrawProj.set(projectionMatrix);
+            perDrawProj.m22(2.0f * perDrawProj.m22() + 1.0f);  // Vulkan→OpenGL depth
+            perDrawProj.m32(2.0f * perDrawProj.m32());          // Vulkan→OpenGL depth
+            float[] glProjArr = new float[16];
+            perDrawProj.get(glProjArr);
+            long projectionPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PROJECTION;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(projectionPtr + i * 4L, glProjArr[i]);
+            }
 
-        // Write Projection inverse matrix (offset 192)
-        long projectionInvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PROJECTION_INV;
-        for (int i = 0; i < 16 && i < projectionMatrixInverse.length; i++) {
-            MemoryUtil.memPutFloat(projectionInvPtr + i * 4L, projectionMatrixInverse[i]);
+            // Write Projection inverse matrix (offset 192) — inverse of [-1,1] version
+            float[] glProjInvArr = new float[16];
+            new org.joml.Matrix4f(perDrawProj).invert().get(glProjInvArr);
+            long projectionInvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PROJECTION_INV;
+            for (int i = 0; i < 16; i++) {
+                MemoryUtil.memPutFloat(projectionInvPtr + i * 4L, glProjInvArr[i]);
+            }
+        } else {
+            long projectionPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PROJECTION;
+            for (int i = 0; i < 16 && i < projectionMatrix.length; i++) {
+                MemoryUtil.memPutFloat(projectionPtr + i * 4L, projectionMatrix[i]);
+            }
+            long projectionInvPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PROJECTION_INV;
+            for (int i = 0; i < 16 && i < projectionMatrixInverse.length; i++) {
+                MemoryUtil.memPutFloat(projectionInvPtr + i * 4L, projectionMatrixInverse[i]);
+            }
         }
 
         // Write color modulator (offset 928)
@@ -690,13 +721,21 @@ public class DrawBatcher {
             org.joml.Matrix4f prevMV = net.vulkanium.compat.VRenderSystem.getPrevWorldRenderModelView();
             org.joml.Matrix4f prevProj = net.vulkanium.compat.VRenderSystem.getPrevWorldRenderProjection();
             float[] prevMVArr = new float[16];
-            float[] prevProjArr = new float[16];
             prevMV.get(prevMVArr);
-            prevProj.get(prevProjArr);
             long prevMVPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_MODEL_VIEW;
-            long prevProjPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_PROJECTION;
             for (int i = 0; i < 16; i++) {
                 MemoryUtil.memPutFloat(prevMVPtr + i * 4L, prevMVArr[i]);
+            }
+
+            // Convert previous projection from Vulkan [0,1] to OpenGL [-1,1]
+            // for consistency with the current-frame per-draw projection.
+            org.joml.Matrix4f prevProjGL = new org.joml.Matrix4f(prevProj);
+            prevProjGL.m22(2.0f * prevProjGL.m22() + 1.0f);
+            prevProjGL.m32(2.0f * prevProjGL.m32());
+            float[] prevProjArr = new float[16];
+            prevProjGL.get(prevProjArr);
+            long prevProjPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_PREV_PROJECTION;
+            for (int i = 0; i < 16; i++) {
                 MemoryUtil.memPutFloat(prevProjPtr + i * 4L, prevProjArr[i]);
             }
         }

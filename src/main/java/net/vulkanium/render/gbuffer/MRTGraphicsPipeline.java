@@ -96,6 +96,9 @@ public class MRTGraphicsPipeline {
 
         /** Face culling */
         public int cullMode = VK_CULL_MODE_BACK_BIT;
+        // Positive-height viewport: OpenGL CCW triangles keep CCW signed area
+        // in Vulkan, so VK_FRONT_FACE_COUNTER_CLOCKWISE is correct.
+        // (Matches the 4 CCW sites already set in VulkanShaderpackPipeline.)
         public int frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
         /** Polygon mode (for wireframe debug) */

@@ -200,7 +200,13 @@ public class VulkaniumASTTransformer {
 
     private static final Map<String, String> GL_BUILTIN_REMAP = new LinkedHashMap<>();
     static {
-        GL_BUILTIN_REMAP.put("gl_FogFragCoord", "0.0");
+        // NOTE: gl_FogFragCoord is NOT mapped here.  It is a VARYING, not a constant.
+        //       In Iris (OpenGL), gl_FogFragCoord is:
+        //         vertex:   out float iris_FogFragCoord; (initialized to 0.0, shader writes it)
+        //         fragment: in  float iris_FogFragCoord; (shader reads interpolated value)
+        //       Handled by handleFogVarying() in the AST step and injectFogVarying()
+        //       in postPrintFixups.
+
         GL_BUILTIN_REMAP.put("gl_FrontColor", "vec4(1.0)");
 
         // NOTE: gl_TextureMatrix[N] is handled in postPrintFixups (regex)
@@ -664,6 +670,16 @@ public class VulkaniumASTTransformer {
                 root.replaceReferenceExpressions(transformer, oldName, newExpr);
             }
         }
+
+        // ── gl_FogFragCoord → iris_FogFragCoord (varying, NOT a constant) ──
+        // In Iris (OpenGL), gl_FogFragCoord is a varying:
+        //   vertex:   out float iris_FogFragCoord; (initialized to 0.0, shader writes it)
+        //   fragment: in  float iris_FogFragCoord; (shader reads interpolated value for fog)
+        // We rename the identifier here; the declaration injection and initialization
+        // are handled in postPrintFixups.injectFogVarying().
+        if (root.identifierIndex.has("gl_FogFragCoord")) {
+            root.rename("gl_FogFragCoord", "iris_FogFragCoord");
+        }
     }
 
     /**
@@ -739,8 +755,8 @@ public class VulkaniumASTTransformer {
                 injectCodeBlock(tree, TERRAIN_VERTEX_DECODE_FN);
                 tree.prependMainFunctionBody(transformer, "vkm_decodeVertex();");
                 remap = TERRAIN_VERTEX_REMAP;
-                // No depth remap needed: MixinMatrix4f already produces [0,1] depth
-                // via zZeroToOne=true on setPerspective/setOrtho.
+                // Per-draw projection is now [-1,1] (OpenGL convention) — depth remap
+                // injected at end of transformVertex() converts back to Vulkan [0,1].
             }
             case SHADOW -> {
                 injectCodeBlock(tree, TERRAIN_VERTEX_INPUTS);
@@ -748,27 +764,24 @@ public class VulkaniumASTTransformer {
                 injectCodeBlock(tree, TERRAIN_VERTEX_DECODE_FN);
                 tree.prependMainFunctionBody(transformer, "vkm_decodeVertex();");
                 remap = TERRAIN_VERTEX_REMAP;
-
-                // Shadow projection matrices (ShadowMatrices.createOrthoMatrix /
-                // createPerspectiveMatrix) now natively produce Vulkan [0,1] depth
-                // (zZeroToOne=true).  No shader-side depth remap is needed.
-                // Reference: Iris Shaders (LGPL-3.0) uses [-1,1] natively on OpenGL.
+                // Shadow projection (UBO) is already [-1,1] (DrawBatcher converts).
+                // Depth remap injected at end of transformVertex().
             }
             case ENTITY, HAND -> {
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
-                // No depth remap: MixinMatrix4f handles [0,1] depth.
+                // Depth remap injected at end of transformVertex().
             }
             case SKY -> {
                 // Sky uses position + optional UV — entity-like format
                 injectCodeBlock(tree, ENTITY_VERTEX_INPUTS);
                 remap = ENTITY_VERTEX_REMAP;
-                // No depth remap: MixinMatrix4f handles [0,1] depth.
+                // Depth remap injected at end of transformVertex().
             }
             case PARTICLE -> {
                 injectCodeBlock(tree, PARTICLE_VERTEX_INPUTS);
                 remap = PARTICLE_VERTEX_REMAP;
-                // No depth remap: MixinMatrix4f handles [0,1] depth.
+                // Depth remap injected at end of transformVertex().
             }
             default -> {
                 remap = Collections.emptyMap();
@@ -802,6 +815,21 @@ public class VulkaniumASTTransformer {
             String ftransformExpr = getFtransformExpr(params.passType);
             root.replaceReferenceExpressions(transformer, "ftransform", ftransformExpr);
         }
+
+        // ── Vulkan depth remap: [-1,1] NDC Z → [0,1] for Vulkan clip space ──
+        // The per-draw projection matrix (iris_ProjectionMatrix) is now supplied in
+        // OpenGL [-1,1] depth convention so shaderpack fragment code can do standard
+        // depth reconstruction (depth * 2.0 - 1.0 + projectionMatrixInverse * clip).
+        // This remap converts the vertex output back to Vulkan's [0,1] NDC:
+        //   gl_Position.z = gl_Position.z * 0.5 + gl_Position.w * 0.5
+        // MUST be the LAST thing in main() so it runs after all shader modifications
+        // to gl_Position (including the composite override).
+        // For composites: z was set to 0.0 → becomes 0.5, which is harmless since
+        // depth test is disabled for fullscreen passes.
+        // Reference: Iris Shaders (OpenGL) doesn't need this because the GPU's
+        // viewport transform maps [-1,1] → [0,1] automatically.  Vulkan does NOT.
+        tree.appendMainFunctionBody(transformer,
+                "gl_Position.z = gl_Position.z * 0.5 + gl_Position.w * 0.5;");
     }
 
     /**
@@ -869,6 +897,11 @@ public class VulkaniumASTTransformer {
         //    find all bare in/out declarations.
         source = fixLegacyQualifiers(source, params);
 
+        // 1.5. Inject iris_FogFragCoord varying declarations.
+        //      MUST run BEFORE location assignment (step 2) so that the varying
+        //      gets a layout(location=N) assigned, matching across vertex/fragment.
+        source = injectFogVarying(source, params);
+
         // 2. Assign layout(location=N) to bare in/out varyings
         source = VulkaniumGlslTransformer.assignVaryingLocationsOnly(source, params);
 
@@ -926,6 +959,89 @@ public class VulkaniumASTTransformer {
         // 10. Fix UBO l-value assignments (shader modifies a uniform in-place → shadow with local variable)
         source = fixUBOLValueAssignments(source);
 
+        return source;
+    }
+
+    // ── iris_FogFragCoord varying injection ──
+    //
+    // In Iris (OpenGL), gl_FogFragCoord is a varying between vertex and fragment:
+    //   vertex:   out float iris_FogFragCoord; (initialized to 0.0, shader writes it,
+    //             e.g. iris_FogFragCoord = length((modelViewMatrix * vertex).xyz))
+    //   fragment: in  float iris_FogFragCoord; (reads interpolated value for fog/atmo)
+    //
+    // This method injects the declaration if the identifier was renamed by the AST
+    // step (renameGLBuiltins), then initializes the vertex-side default to 0.0.
+    // The location assignment (step 2 in postPrintFixups) will give it a matching
+    // location across vertex/fragment.
+
+    private static String injectFogVarying(String source, TransformParams params) {
+        if (!source.contains("iris_FogFragCoord")) return source;
+
+        if (params.isVertex) {
+            // Inject 'out float iris_FogFragCoord;' if not already declared
+            if (!source.contains("out float iris_FogFragCoord")
+                    && !source.contains("out highp float iris_FogFragCoord")
+                    && !source.contains("out mediump float iris_FogFragCoord")) {
+                source = injectDeclarationAfterUBO(source, "out float iris_FogFragCoord;");
+            }
+            // Initialize to 0.0 at start of main() (shader can override)
+            if (!source.contains("iris_FogFragCoord = 0.0")
+                    && !source.contains("iris_FogFragCoord=0.0")) {
+                source = prependToMainBody(source, "  iris_FogFragCoord = 0.0;");
+            }
+        } else if (params.isFragment) {
+            // Inject 'in float iris_FogFragCoord;' if not already declared
+            if (!source.contains("in float iris_FogFragCoord")
+                    && !source.contains("in highp float iris_FogFragCoord")
+                    && !source.contains("in mediump float iris_FogFragCoord")) {
+                source = injectDeclarationAfterUBO(source, "in float iris_FogFragCoord;");
+            }
+        }
+        return source;
+    }
+
+    /**
+     * Injects a declaration line after the VulkaniumUniforms UBO closing brace.
+     * Falls back to inserting before the first in/out/uniform/void declaration.
+     */
+    private static String injectDeclarationAfterUBO(String source, String declaration) {
+        // Try to find the UBO closing brace: "};\n" after "VulkaniumUniforms"
+        int uboIdx = source.indexOf("VulkaniumUniforms");
+        if (uboIdx >= 0) {
+            int closeBrace = source.indexOf("};", uboIdx);
+            if (closeBrace >= 0) {
+                int insertPos = closeBrace + 2;
+                // Skip any trailing newline
+                if (insertPos < source.length() && source.charAt(insertPos) == '\n') {
+                    insertPos++;
+                }
+                return source.substring(0, insertPos) + declaration + "\n" + source.substring(insertPos);
+            }
+        }
+        // Fallback: insert before the first function definition or global declaration
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "^(void|int|float|vec|mat|struct)\\s", java.util.regex.Pattern.MULTILINE)
+                .matcher(source);
+        if (m.find()) {
+            int insertPos = m.start();
+            return source.substring(0, insertPos) + declaration + "\n" + source.substring(insertPos);
+        }
+        // Last resort: append
+        return source + "\n" + declaration + "\n";
+    }
+
+    /**
+     * Prepends a statement at the beginning of main()'s body.
+     */
+    private static String prependToMainBody(String source, String statement) {
+        // Find "void main()" or "void main(void)" and the opening brace
+        java.util.regex.Pattern mainPattern = java.util.regex.Pattern.compile(
+                "(void\\s+main\\s*\\(\\s*(void)?\\s*\\)\\s*\\{)");
+        java.util.regex.Matcher m = mainPattern.matcher(source);
+        if (m.find()) {
+            int insertPos = m.end();
+            return source.substring(0, insertPos) + "\n" + statement + "\n" + source.substring(insertPos);
+        }
         return source;
     }
 

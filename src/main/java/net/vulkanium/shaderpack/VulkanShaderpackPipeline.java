@@ -237,6 +237,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     /** Current phase (for tracking active pipeline) */
     private ShaderPhase currentPhase = null;
 
+    /** Parsed sunPathRotation from shaderpack directives (degrees). */
+    private float sunPathRotation = 0.0f;
+
     /** Runtime compatibility pipelines (ProgramId + vertex format key -> BasicPipeline). */
     private final Map<String, BasicPipeline> compatibilityPipelines = new HashMap<>();
         private final Set<String> warnedGeometryCompatBypass = new HashSet<>();
@@ -1341,6 +1344,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (sprValue != null) {
             try { sunPathRotation = Float.parseFloat(sprValue); } catch (NumberFormatException ignored) {}
         }
+        this.sunPathRotation = sunPathRotation;
 
         int resolution = shadowDirectives.getResolution();
         LOGGER.info("[SHADOW] Initializing shadow map: {}x{}, distance={}, interval={}",
@@ -1678,9 +1682,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     compiledPrograms.containsKey(ProgramId.SHADOW) ? "shadow" :
                     compiledPrograms.containsKey(ProgramId.SHADOW_SOLID) ? "shadow_solid" :
                     "gbuffers_terrain (fallback)");
-            // CCW front face for shadow pass: shadow uses POSITIVE viewport
-            // (y=0, h=height), so the shoelace formula gives positive area for
-            // OpenGL CCW triangles — CCW correctly identifies them as front-facing.
+            // World/shadow paths use a positive-height viewport (no Y inversion),
+            // so OpenGL CCW winding remains CCW in Vulkan.
+            // Keep front face CCW to preserve gl_FrontFacing semantics.
             shadowTerrainPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow terrain pipeline: {}", e.getMessage());
@@ -1744,8 +1748,7 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     sharedDescriptorSetLayout
             );
             LOGGER.info("[SHADOW] Shadow entity pipeline created (entity vertex format, depth-only)");
-            // CCW front face matches OpenGL winding convention.
-            // CCW: shadow uses positive viewport → standard winding preserved.
+            // Positive-height viewport preserves winding; keep OpenGL-compatible CCW.
             shadowEntityPipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
         } catch (Exception e) {
             LOGGER.error("[SHADOW] Failed to create shadow entity pipeline: {}", e.getMessage());
@@ -2014,6 +2017,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
+            // Positive-height viewport (world rendering) preserves winding.
+            // OpenGL front faces remain CCW in Vulkan.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("Failed to create compatibility pipeline for {}: {}", requestedProgram, e.getMessage());
@@ -2555,12 +2561,19 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     subpassColorCount
             );
             mrtPipelines.put(key, pipeline);
+            // Composite/MRT path uses positive-height viewport; preserve CCW winding.
+            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("[FULLSCREEN] Failed to create MRT pipeline for {} (targets={}): {}",
                     id.getSourceName(), java.util.Arrays.toString(targets), e.getMessage());
             return null;
         }
+    }
+
+    /** Returns parsed sunPathRotation from shaderpack directives (degrees). */
+    public float getSunPathRotation() {
+        return sunPathRotation;
     }
 
     /**

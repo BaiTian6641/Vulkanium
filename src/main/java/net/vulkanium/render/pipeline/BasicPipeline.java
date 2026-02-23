@@ -157,11 +157,10 @@ public class BasicPipeline {
      * winding as seen by the rasteriser: triangles that are counter-clockwise
      * (front-facing) in OpenGL's clip space become clockwise after the Y-flip.
      *
-     * <p>The Vulkan spec area formula (with implicit Y-down compensation) means
-     * that negative-viewport + CCW correctly classifies OpenGL CCW triangles as
-     * front-facing (positive area).  Back-face culling ({@code VK_CULL_MODE_BACK_BIT})
-     * then culls the correct faces.  This is confirmed by the VK_KHR_maintenance1
-     * negative viewport specification and VulkanMod's reference implementation.
+     * <p>Default is CCW for GUI rendering (negative viewport).  World-rendering
+     * pipelines (G-buffer, shadow, composite) override to CW via
+     * {@link #setFrontFace} because they use positive viewport, which removes
+     * the Y-flip that would otherwise reverse the winding.</p>
      */
     private int frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 

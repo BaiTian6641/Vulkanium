@@ -1,6 +1,7 @@
 package net.vulkanium.mixin;
 
 import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.math.Axis;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -8,15 +9,18 @@ import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.LightTexture;
 import net.minecraft.client.renderer.RenderType;
+import com.mojang.blaze3d.systems.RenderSystem;
 import net.vulkanium.Vulkanium;
 import net.vulkanium.render.program.WorldRenderingPhase;
 import net.vulkanium.world.VulkaniumWorldRenderer;
 import org.joml.Matrix4f;
+import org.joml.Quaternionf;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Slice;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import javax.annotation.Nullable;
@@ -193,6 +197,10 @@ public abstract class MixinLevelRenderer {
                                      CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.CUSTOM_SKY);
+
+        // Match Iris behavior: phase changes here, but vanilla may continue using
+        // a previously selected shader until explicitly refreshed.
+        RenderSystem.setShader(GameRenderer::getPositionShader);
     }
 
     /**
@@ -291,6 +299,33 @@ public abstract class MixinLevelRenderer {
                                       Runnable runnable, CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.VOID);
+    }
+
+    /**
+     * Inside renderSky(): apply shaderpack sunPathRotation to the sky pose stack.
+     *
+     * <p>Mirrors Iris's renderSky tilt injection so shaderpack sky orientation
+     * matches vanilla/Iris behavior.</p>
+     */
+    @Inject(method = "renderSky",
+            at = @At(value = "INVOKE",
+                     target = "Lnet/minecraft/client/multiplayer/ClientLevel;getTimeOfDay(F)F"),
+            slice = @Slice(from = @At(value = "FIELD",
+                                      target = "Lcom/mojang/math/Axis;YP:Lcom/mojang/math/Axis;")))
+    private void vulkanium$tiltSun(PoseStack poseStack, Matrix4f projectionMatrix,
+                                    float f, Camera camera, boolean bl,
+                                    Runnable runnable, CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        var manager = Vulkanium.getShaderpackManager();
+        if (manager == null) return;
+        var active = manager.getActivePipeline();
+        if (active instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline
+                && vkPipeline.isLoaded()) {
+            Quaternionf tilt = Axis.ZP.rotationDegrees(vkPipeline.getSunPathRotation());
+            if (tilt != null) {
+                poseStack.mulPose(tilt);
+            }
+        }
     }
 
     /**

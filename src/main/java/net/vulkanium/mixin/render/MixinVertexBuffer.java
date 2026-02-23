@@ -544,9 +544,11 @@ public abstract class MixinVertexBuffer {
 
         if (vulkanium$isTerrainFormat(this.format)
                 && (chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f)) {
-            Matrix4f modelViewWithOffset = new Matrix4f(VRenderSystem.getModelViewMatrix())
-                    .translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-            VRenderSystem.setModelViewMatrix(modelViewWithOffset);
+            // The drawWithShader modelView parameter (PoseStack) already
+            // includes the section translation (sectionPos - cameraPos).
+            // Do NOT bake chunkOffset into the MV — that would apply the
+            // section offset twice.  Just zero chunkOffset so the shader's
+            // (gl_Vertex + chunkOffset) doesn't double-count it.
             VRenderSystem.setChunkOffset(0.0f, 0.0f, 0.0f);
             appliedLocalChunkOffset = true;
         }
@@ -627,14 +629,12 @@ public abstract class MixinVertexBuffer {
             float chunkOffsetY = VRenderSystem.getChunkOffsetY();
             float chunkOffsetZ = VRenderSystem.getChunkOffsetZ();
             boolean appliedLocalChunkOffset = false;
-            Matrix4f prevMV = null;
 
             if (vulkanium$isTerrainFormat(this.format)
                     && (chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f)) {
-                prevMV = new Matrix4f(VRenderSystem.getModelViewMatrix());
-                Matrix4f modelViewWithOffset = new Matrix4f(VRenderSystem.getModelViewMatrix())
-                        .translate(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-                VRenderSystem.setModelViewMatrix(modelViewWithOffset);
+                // The draw() path uses VRenderSystem's MV which was set by
+                // drawWithShader (PoseStack including section translation).
+                // Do NOT bake chunkOffset — just zero it to prevent double-count.
                 VRenderSystem.setChunkOffset(0.0f, 0.0f, 0.0f);
                 appliedLocalChunkOffset = true;
             }
@@ -647,9 +647,6 @@ public abstract class MixinVertexBuffer {
 
             if (appliedLocalChunkOffset) {
                 VRenderSystem.setChunkOffset(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-                if (prevMV != null) {
-                    VRenderSystem.setModelViewMatrix(prevMV);
-                }
             }
         }
         ci.cancel();

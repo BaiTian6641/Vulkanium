@@ -1712,11 +1712,12 @@ public class VulkaniumGlslTransformer {
     // ═══════════════════════════════════════════════════════════════
 
     private static String transformFragment(String source, TransformParams params) {
-        // gl_FogFragCoord — inject as varying input if used
-        if (source.contains("gl_FogFragCoord")) {
-            source = insertAfterUBO(source,
-                    "float iris_FogFragCoord = 0.0; // [Vulkanium] legacy fog coord\n");
-        }
+        // gl_FogFragCoord handling:
+        // NOTE: The main path uses VulkaniumASTTransformer, which renames
+        // gl_FogFragCoord → iris_FogFragCoord (varying) and injects declarations
+        // in postPrintFixups.  This regex path is only used as a fallback when
+        // the AST transformer is not used (e.g., assignVaryingLocationsOnly utility).
+        // Left as a no-op — the AST path handles it correctly as a varying.
 
         return source;
     }
