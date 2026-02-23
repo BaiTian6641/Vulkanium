@@ -241,16 +241,13 @@ public class VulkaniumASTTransformer {
         TERRAIN_VERTEX_REMAP.put("vaPosition", "iris_vk_Vertex.xyz");
         TERRAIN_VERTEX_REMAP.put("vaNormal", "iris_compat_Normal");
         TERRAIN_VERTEX_REMAP.put("at_tangent", "iris_compat_Tangent");
-        // mc_Entity: x = block state ID, y = render type (-1 = solid default).
-        // Iris convention: y=-1 for solid, 1 for fluid/translucent.
-        // We default to -1.0 (solid) since most terrain is solid blocks.
-        TERRAIN_VERTEX_REMAP.put("mc_Entity", "vec4(float(iris_vk_EntityId), -1.0, 0.0, 0.0)");
-        // TODO: at_midBlock requires per-vertex block-center offset computed during
-        // chunk building (offset from block center in 1/64ths). Currently always zero.
-        TERRAIN_VERTEX_REMAP.put("at_midBlock", "vec4(0.0)");
-        // TODO: mc_midTexCoord should be the sprite center (mean of quad corner UVs),
-        // identical for all 4 quad vertices. Currently uses per-vertex corner UV as
-        // a fallback. Proper fix requires BufferBuilder mixin to compute per-quad.
+        // mc_Entity: x = block state ID, y = render type (-1 = solid, 1 = fluid).
+        TERRAIN_VERTEX_REMAP.put("mc_Entity", "vec4(float(iris_vk_EntityId), float(iris_vk_RenderType), 0.0, 0.0)");
+        // at_midBlock: block-center offset computed per-vertex during chunk building.
+        // iris_vk_MidBlock is in block units (decoded from SNORM × 127/64).
+        TERRAIN_VERTEX_REMAP.put("at_midBlock", "vec4(iris_vk_MidBlock, 0.0)");
+        // mc_midTexCoord: average of the quad's 4 corner UVs, computed per-quad
+        // during chunk building by fillExtendedData().
         TERRAIN_VERTEX_REMAP.put("mc_midTexCoord", "vec4(iris_vk_MidTexCoord, 0.0, 1.0)");
         for (int i = 3; i <= 7; i++) {
             TERRAIN_VERTEX_REMAP.put("gl_MultiTexCoord" + i, "vec4(0.0)");
@@ -360,10 +357,12 @@ public class VulkaniumASTTransformer {
             """;
 
     // Terrain vertex inputs — MUST match BasicPipeline.createAttributeDescriptions
-    // for DefaultVertexFormat.BLOCK (32 bytes):
+    // for VulkaniumVertexFormats.TERRAIN (52 bytes):
     //   0=Position(vec3,R32G32B32_SFLOAT), 1=UV0(vec2,R32G32_SFLOAT),
     //   2=Color(vec4,R8G8B8A8_UNORM), 3=UV2/lightmap(ivec2,R16G16_SINT),
-    //   4=Normal(vec4,R8G8B8A8_SNORM), 5=mc_Entity(ivec2,R16G16_SINT)
+    //   4=Normal(vec4,R8G8B8A8_SNORM), 5=mc_Entity(ivec2,R16G16_SINT),
+    //   6=mc_midTexCoord(vec2,R32G32_SFLOAT), 7=at_tangent(vec4,R8G8B8A8_SNORM),
+    //   8=at_midBlock(vec4,R8G8B8A8_SNORM)
     private static final String TERRAIN_VERTEX_INPUTS = """
             layout(location = 0) in vec3 vkm_Position;
             layout(location = 1) in vec2 vkm_TexCoord;
@@ -371,6 +370,9 @@ public class VulkaniumASTTransformer {
             layout(location = 3) in ivec2 vkm_LightCoord;
             layout(location = 4) in vec4 vkm_NormalPacked;
             layout(location = 5) in ivec2 vkm_Entity;
+            layout(location = 6) in vec2 vkm_MidTexCoord;
+            layout(location = 7) in vec4 vkm_TangentPacked;
+            layout(location = 8) in vec4 vkm_MidBlockPacked;
             """;
 
     private static final String TERRAIN_VERTEX_DECODED_VARS = """
@@ -381,7 +383,9 @@ public class VulkaniumASTTransformer {
             vec3 iris_compat_Normal;
             vec4 iris_compat_Tangent;
             vec2 iris_vk_MidTexCoord;
+            vec3 iris_vk_MidBlock;
             int  iris_vk_EntityId;
+            int  iris_vk_RenderType;
             """;
 
     private static final String TERRAIN_VERTEX_DECODE_FN = """
@@ -390,35 +394,31 @@ public class VulkaniumASTTransformer {
                 iris_vk_Color = vkm_Color;
                 iris_vk_TexCoord0 = vkm_TexCoord;
                 iris_vk_LightCoord = vec2(vkm_LightCoord);
+
+                // Normal: read from vertex data (overwritten with face normal for quads)
                 vec3 rawNormal = vkm_NormalPacked.xyz;
                 float normalLen = length(rawNormal);
                 iris_compat_Normal = normalLen > 0.0001 ? normalize(rawNormal) : vec3(0.0, 1.0, 0.0);
-                // Synthesize tangent from normal to match MC's standard block UV mapping.
-                // Each cardinal face has a well-defined texture → tangent direction:
-                //   UP/DOWN  (Y-dominant): tangent = +X       (U increases along +X)
-                //   NORTH/SOUTH (Z-dominant): tangent = sign(Z)*X  (SOUTH: +X, NORTH: -X)
-                //   EAST/WEST   (X-dominant): tangent = -sign(X)*Z (WEST: +Z, EAST: -Z)
-                // Tangent w = 1.0: standard right-handed TBN for all MC cube faces
-                // (bitangent = cross(tangent, normal) * w matches MC's V-axis direction).
-                // Note: non-axis-aligned faces (stairs, rotated models) use the
-                // Y-dominant fallback (tangent = +X) which is approximate.
-                float ax = abs(iris_compat_Normal.x);
-                float ay = abs(iris_compat_Normal.y);
-                float az = abs(iris_compat_Normal.z);
-                vec3 synthTangent;
-                if (az > ax && az > ay) {
-                    // NORTH/SOUTH face: tangent follows sign of Z
-                    synthTangent = vec3(sign(iris_compat_Normal.z), 0.0, 0.0);
-                } else if (ax > ay) {
-                    // EAST/WEST face: tangent follows -sign of X
-                    synthTangent = vec3(0.0, 0.0, -sign(iris_compat_Normal.x));
-                } else {
-                    // UP/DOWN face (and fallback): tangent = +X
-                    synthTangent = vec3(1.0, 0.0, 0.0);
-                }
-                iris_compat_Tangent = vec4(synthTangent, 1.0);
-                iris_vk_MidTexCoord = vkm_TexCoord;
+
+                // Tangent: read real tangent computed from UV gradients by NormalHelper.
+                // xyz = tangent direction (SNORM), w = handedness (±1 packed as SNORM).
+                // Decode the w: SNORM ±(1/127) rounds to ±0.0079, so sign() recovers ±1.
+                vec3 rawTangent = vkm_TangentPacked.xyz;
+                float tangentLen = length(rawTangent);
+                vec3 tangentDir = tangentLen > 0.0001 ? normalize(rawTangent) : vec3(1.0, 0.0, 0.0);
+                float tangentW = sign(vkm_TangentPacked.w);
+                if (tangentW == 0.0) tangentW = 1.0;
+                iris_compat_Tangent = vec4(tangentDir, tangentW);
+
+                // Mid-texture coordinate: average of the quad's 4 corner UVs
+                iris_vk_MidTexCoord = vkm_MidTexCoord;
+
+                // Mid-block offset: (blockCenter - vertexPos) * 64, packed as SNORM bytes.
+                // Decode: multiply by 127 to get the raw byte value, then divide by 64.
+                iris_vk_MidBlock = vkm_MidBlockPacked.xyz * (127.0 / 64.0);
+
                 iris_vk_EntityId = vkm_Entity.x; // block material ID from block.properties
+                iris_vk_RenderType = vkm_Entity.y; // render type: -1 = solid, 1 = fluid
             }
             """;
 

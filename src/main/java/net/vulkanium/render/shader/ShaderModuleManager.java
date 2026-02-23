@@ -111,7 +111,7 @@ public class ShaderModuleManager {
     /** Per-pack transformed GLSL cache */
     private Path translatedCacheDir;
 
-    private static final String TRANSLATED_CACHE_VERSION = "v29-tangent-remap";
+    private static final String TRANSLATED_CACHE_VERSION = "v30-extended-vertex";
 
     @FunctionalInterface
     public interface CompileStageListener {

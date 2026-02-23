@@ -419,11 +419,11 @@ public class BasicPipeline {
         //   UV index 1 = overlay (hurt/flash, entity-only — skipped)
         //   UV index 2 = lightmap (UV2)
         boolean hasUV = false, hasColor = false, hasUV2 = false, hasNormal = false;
-        boolean hasGeneric = false;
+        int genericCount = 0;
         for (VertexFormatElement e : elements) {
             if (e.getUsage() == VertexFormatElement.Usage.COLOR) hasColor = true;
             if (e.getUsage() == VertexFormatElement.Usage.NORMAL) hasNormal = true;
-            if (e.getUsage() == VertexFormatElement.Usage.GENERIC) hasGeneric = true;
+            if (e.getUsage() == VertexFormatElement.Usage.GENERIC) genericCount++;
             if (e.getUsage() == VertexFormatElement.Usage.UV) {
                 if (e.getIndex() == 0) hasUV = true;
                 else if (e.getIndex() == 2) hasUV2 = true;
@@ -436,7 +436,7 @@ public class BasicPipeline {
         if (hasColor) attrCount++;
         if (hasUV2) attrCount++;
         if (hasNormal) attrCount++;
-        if (hasGeneric) attrCount++;
+        attrCount += genericCount;
 
         VkVertexInputAttributeDescription.Buffer attrs = VkVertexInputAttributeDescription.calloc(attrCount, stack);
         int attrIdx = 0;
@@ -502,9 +502,19 @@ public class BasicPipeline {
                 default -> {} // Unhandled usage types
             }
 
-            // GENERIC elements (mc_Entity etc.) — assign after standard elements
+            // GENERIC elements — map by element index to shader locations:
+            //   index 11 (mc_Entity)      → location 5
+            //   index 12 (mc_midTexCoord) → location 6
+            //   index 13 (at_tangent)     → location 7
+            //   index 14 (at_midBlock)    → location 8
             if (element.getUsage() == VertexFormatElement.Usage.GENERIC && loc < 0) {
-                loc = 5; // mc_Entity at location 5 (ivec2)
+                loc = switch (element.getIndex()) {
+                    case 11 -> 5;  // mc_Entity
+                    case 12 -> 6;  // mc_midTexCoord
+                    case 13 -> 7;  // at_tangent
+                    case 14 -> 8;  // at_midBlock
+                    default -> 5;  // fallback
+                };
             }
 
             if (loc >= 0 && attrIdx < attrCount) {
@@ -547,6 +557,12 @@ public class BasicPipeline {
             case GENERIC -> switch (type) {
                 case SHORT -> count == 2 ? VK_FORMAT_R16G16_SINT : VK_FORMAT_R16_SINT;
                 case INT -> VK_FORMAT_R32_SINT;
+                case FLOAT -> count == 2 ? VK_FORMAT_R32G32_SFLOAT
+                            : count == 3 ? VK_FORMAT_R32G32B32_SFLOAT
+                            : VK_FORMAT_R32G32B32A32_SFLOAT;
+                case BYTE -> count == 4 ? VK_FORMAT_R8G8B8A8_SNORM
+                           : count == 3 ? VK_FORMAT_R8G8B8A8_SNORM  // 3 bytes padded to 4
+                           : VK_FORMAT_R8G8B8A8_SNORM;
                 default -> VK_FORMAT_R32_SINT;
             };
             default -> VK_FORMAT_R32G32B32A32_SFLOAT;

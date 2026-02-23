@@ -13,9 +13,9 @@ import java.util.regex.Pattern;
  *
  * <h3>Key Differences from Iris's VulkanTransformer</h3>
  * <ul>
- *   <li><b>Richer vertex format:</b> Vulkanium's 32-byte terrain format provides REAL
- *       per-vertex normals and tangents (octahedral encoded), mid-texture coordinates,
- *       and entity IDs — features VulkanMod must fake with defaults</li>
+ *   <li><b>Richer vertex format:</b> Vulkanium's 52-byte terrain format provides REAL
+ *       per-vertex normals, UV-gradient tangents with handedness, mid-texture coordinates,
+ *       mid-block offsets, and entity IDs — features VulkanMod must fake with defaults</li>
  *   <li><b>Larger UBO:</b> 2048 bytes with 60+ uniforms (vs VulkanMod's 720-byte IrisData).
  *       Supports biome data, depth params, extended weather, player state, etc.</li>
  *   <li><b>Native MRT:</b> Direct {@code layout(location=N)} outputs from preprocessor stage,
@@ -78,7 +78,7 @@ public class VulkaniumGlslTransformer {
      * Shader pass type — determines which vertex decode and UBO bindings to use.
      */
     public enum PassType {
-        /** Terrain (gbuffers_terrain, gbuffers_water) — 32-byte compressed vertex format */
+        /** Terrain (gbuffers_terrain, gbuffers_water) — 52-byte extended vertex format */
         TERRAIN,
         /** Shadow pass — same vertex format as terrain, different matrices */
         SHADOW,
@@ -1438,12 +1438,16 @@ public class VulkaniumGlslTransformer {
      */
     private static String transformTerrainVertex(String source) {
         String inputs = """
-                // ── Vulkanium Terrain Vertex Inputs (compatibility layout) ──
+                // ── Vulkanium Terrain Vertex Inputs (52-byte extended format) ──
                 layout(location = 0) in vec3 vkm_Position;
                 layout(location = 1) in vec2 vkm_TexCoord;
                 layout(location = 2) in vec4 vkm_Color;
                 layout(location = 3) in ivec2 vkm_LightCoord;
                 layout(location = 4) in vec4 vkm_NormalPacked;
+                layout(location = 5) in ivec2 vkm_Entity;
+                layout(location = 6) in vec2 vkm_MidTexCoord;
+                layout(location = 7) in vec4 vkm_TangentPacked;
+                layout(location = 8) in vec4 vkm_MidBlockPacked;
                 
                 // ── Decoded vertex variables ──
                 vec4 iris_vk_Vertex;
@@ -1453,7 +1457,9 @@ public class VulkaniumGlslTransformer {
                 vec3 iris_compat_Normal;
                 vec4 iris_compat_Tangent;
                 vec2 iris_vk_MidTexCoord;
+                vec3 iris_vk_MidBlock;
                 int  iris_vk_EntityId;
+                int  iris_vk_RenderType;
                 """;
 
         String decode = """
@@ -1468,14 +1474,18 @@ public class VulkaniumGlslTransformer {
                     float normalLen = length(rawNormal);
                     iris_compat_Normal = normalLen > 0.0001 ? normalize(rawNormal) : vec3(0.0, 1.0, 0.0);
 
-                    vec3 tangentRef = abs(iris_compat_Normal.y) < 0.999
-                            ? vec3(0.0, 1.0, 0.0)
-                            : vec3(1.0, 0.0, 0.0);
-                    vec3 tangent = normalize(cross(tangentRef, iris_compat_Normal));
-                    iris_compat_Tangent = vec4(tangent, 1.0);
+                    // Tangent: real UV-gradient tangent from vertex data
+                    vec3 rawTangent = vkm_TangentPacked.xyz;
+                    float tangentLen = length(rawTangent);
+                    vec3 tangentDir = tangentLen > 0.0001 ? normalize(rawTangent) : vec3(1.0, 0.0, 0.0);
+                    float tangentW = sign(vkm_TangentPacked.w);
+                    if (tangentW == 0.0) tangentW = 1.0;
+                    iris_compat_Tangent = vec4(tangentDir, tangentW);
 
-                    iris_vk_MidTexCoord = vkm_TexCoord;
-                    iris_vk_EntityId = -1;
+                    iris_vk_MidTexCoord = vkm_MidTexCoord;
+                    iris_vk_MidBlock = vkm_MidBlockPacked.xyz * (127.0 / 64.0);
+                    iris_vk_EntityId = vkm_Entity.x;
+                    iris_vk_RenderType = vkm_Entity.y;
                 }
                 """;
 
@@ -1484,7 +1494,8 @@ public class VulkaniumGlslTransformer {
         source = insertDecodeCallAtMainStart(source, decode, "vkm_decodeVertex();");
 
         source = removeLegacyAttributeDeclarations(source,
-            "at_tangent", "mc_Entity", "at_midBlock", "mc_midTexCoord");
+            "at_tangent", "mc_Entity", "at_midBlock", "mc_midTexCoord",
+            "vaPosition", "vaNormal");
 
         // Map GL builtins to decoded variables
         source = source.replaceAll("\\bgl_Vertex\\b", "iris_vk_Vertex");
@@ -1497,10 +1508,12 @@ public class VulkaniumGlslTransformer {
             source = source.replaceAll("\\bgl_MultiTexCoord" + i + "\\b", "vec4(0.0)");
         }
 
-        // Map pack-specific attributes
+        // Map pack-specific attributes and Sodium-style vertex accessors
+        source = source.replaceAll("\\bvaPosition\\b", "iris_vk_Vertex.xyz");
+        source = source.replaceAll("\\bvaNormal\\b", "iris_compat_Normal");
         source = source.replaceAll("\\bat_tangent\\b", "iris_compat_Tangent");
-        source = source.replaceAll("\\bmc_Entity\\b", "vec4(float(iris_vk_EntityId), 0.0, 0.0, 0.0)");
-        source = source.replaceAll("\\bat_midBlock\\b", "vec4(0.0)");
+        source = source.replaceAll("\\bmc_Entity\\b", "vec4(float(iris_vk_EntityId), float(iris_vk_RenderType), 0.0, 0.0)");
+        source = source.replaceAll("\\bat_midBlock\\b", "vec4(iris_vk_MidBlock, 0.0)");
         source = source.replaceAll("\\bmc_midTexCoord\\b", "vec4(iris_vk_MidTexCoord, 0.0, 1.0)");
 
         // ftransform() replacement
