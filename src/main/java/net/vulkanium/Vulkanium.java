@@ -2039,6 +2039,15 @@ public class Vulkanium implements ClientModInitializer {
      * Respects VRenderSystem.isScissorEnabled() for scroll area clipping.
      */
     private static void updateViewportScissor(VkCommandBuffer cmd, boolean flipViewportY) {
+        // ── World rendering (G-buffer / shadow) uses POSITIVE viewport ──
+        // Positive viewport stores the G-buffer with OpenGL texture convention
+        // (V=0 = bottom of scene, V=1 = top) so that composite shader depth
+        // reconstruction (texcoord * 2.0 - 1.0) produces correct NDC Y values.
+        // GUI rendering retains negative viewport for correct on-screen layout.
+        if (flipViewportY && isWorldRendering()) {
+            flipViewportY = false;
+        }
+
         // Read current viewport from VRenderSystem (set by
         // MixinGlStateManager._viewport)
         int vpX = VRenderSystem.getViewportX();
@@ -2401,6 +2410,34 @@ public class Vulkanium implements ClientModInitializer {
 
     public static boolean didFrameRenderWorld() {
         return frameHadWorldRender;
+    }
+
+    /**
+     * Returns true when the current draw is part of world rendering
+     * (G-buffer pass or shadow pass), as opposed to GUI/HUD rendering.
+     *
+     * <p>During world rendering, the viewport must use POSITIVE height
+     * so that G-buffer and shadow textures store data with the OpenGL
+     * texture V convention (V=0 = bottom of scene).  This ensures
+     * composite shader depth reconstruction ({@code texcoord * 2.0 - 1.0})
+     * produces correct NDC Y values for position/shadow reconstruction.</p>
+     */
+    private static boolean isWorldRendering() {
+        // Shadow pass active → world rendering context
+        if (net.vulkanium.render.shadow.ShadowRenderer.ACTIVE) {
+            return true;
+        }
+        // G-buffer pass active → world rendering context
+        if (isShaderpackPipelineActive() && shaderpackManager != null) {
+            var pipe = shaderpackManager.getActivePipeline();
+            if (pipe instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkp) {
+                var gbuf = vkp.getGBufferManager();
+                if (gbuf != null && gbuf.isWorldPassActive()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
 }

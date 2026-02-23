@@ -2014,10 +2014,6 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     colorAttachmentCount
             );
             compatibilityPipelines.put(cacheKey, pipeline);
-            // CCW front face: negative viewport (VK_KHR_maintenance1) makes the
-            // Vulkan area formula give positive area for OpenGL CCW triangles.
-            // CCW (positive = front) correctly classifies them as front-facing.
-            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("Failed to create compatibility pipeline for {}: {}", requestedProgram, e.getMessage());
@@ -2441,17 +2437,19 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
                 vkCmdBeginRenderPass(cmd, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-                // Y-flipped viewport for OpenGL-matching gl_FragCoord:
-                // Vulkan normally has gl_FragCoord.y=0 at top, but OpenGL shaders
-                // expect y=0 at bottom.  Using y=height, height=-height flips the
-                // coordinate system to match, consistent with gbuffers world passes.
-                // Reference: Iris Shaders (LGPL-3.0) — OpenGL natively has y=0 at
-                // bottom; this viewport trick emulates that on Vulkan.
+                // Positive viewport: composite textures must use the same V
+                // convention as the G-buffer (V=0 = bottom of scene = NDC y=-1).
+                // This ensures that composite shader depth reconstruction
+                // (texcoord * 2.0 - 1.0) produces correct NDC Y values, and
+                // that texture reads from colortex0-N are self-consistent
+                // across all composite passes in the chain.
+                // The scene appears "upside down" in the framebuffer; a Y-flip
+                // blit to the swapchain corrects this for display.
                 VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
                         .x(0.0f)
-                        .y((float) height)
+                        .y(0.0f)
                         .width((float) width)
-                        .height((float) -height)
+                        .height((float) height)
                         .minDepth(0.0f)
                         .maxDepth(1.0f);
                 vkCmdSetViewport(cmd, 0, viewport);
@@ -2557,9 +2555,6 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     subpassColorCount
             );
             mrtPipelines.put(key, pipeline);
-            // CCW front face: negative viewport gives positive area for OpenGL CCW
-            // triangles, so CCW correctly classifies them as front-facing.
-            pipeline.setFrontFace(org.lwjgl.vulkan.VK10.VK_FRONT_FACE_COUNTER_CLOCKWISE);
             return pipeline;
         } catch (Exception e) {
             LOGGER.warn("[FULLSCREEN] Failed to create MRT pipeline for {} (targets={}): {}",

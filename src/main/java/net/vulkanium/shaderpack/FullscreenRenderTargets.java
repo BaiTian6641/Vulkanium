@@ -841,12 +841,20 @@ public class FullscreenRenderTargets {
                 VK_IMAGE_ASPECT_COLOR_BIT);
 
         // Blit (handles format conversion + rescale if src/dst sizes differ)
+        // Y-FLIP: the G-buffer and composite passes use positive viewport,
+        // storing the scene with OpenGL texture convention (V=0 = ground at top
+        // of Vulkan image, V=1 = sky at bottom).  The display swapchain needs
+        // sky at the top of the screen (row 0), so we flip the source Y:
+        //   srcOffset[0].y = height  (start from bottom of source image = sky)
+        //   srcOffset[1].y = 0       (end at top of source image = ground)
+        // This copies the source upside-down into the destination, correcting
+        // the on-screen orientation.
         try (var stack = stackPush()) {
             VkImageBlit.Buffer blitRegion = VkImageBlit.calloc(1, stack);
             blitRegion.srcSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                     .mipLevel(0).baseArrayLayer(0).layerCount(1);
-            blitRegion.srcOffsets(0).set(0, 0, 0);
-            blitRegion.srcOffsets(1).set(width, height, 1);
+            blitRegion.srcOffsets(0).set(0, height, 0);
+            blitRegion.srcOffsets(1).set(width, 0, 1);
             blitRegion.dstSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
                     .mipLevel(0).baseArrayLayer(0).layerCount(1);
             blitRegion.dstOffsets(0).set(0, 0, 0);

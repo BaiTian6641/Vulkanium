@@ -321,24 +321,24 @@ public class VulkaniumASTTransformer {
     //  Vertex decode preambles (injected as external declarations)
     // ═══════════════════════════════════════════════════════════════
 
-    // UV.y is flipped (0.5 - y*0.5) to account for Vulkan's top-down texture layout.
+    // UV.y is flipped (0.5 - y*0.5) because the negative-height viewport makes
+    // ── Composite fullscreen triangle: Iris-compatible [0,1] convention ──
+    // With positive viewport, the G-buffer stores V=0 = NDC y=-1 (ground) and
+    // V=1 = NDC y=+1 (sky), matching the OpenGL texture convention.
+    // gl_Vertex and texcoord are provided in [0,1] matching Iris's convention.
     // Fullscreen triangle positions generated from gl_VertexIndex.
-    // With the positive-viewport approach (no gl_Position.y flip), we use standard
-    // Vulkan positive-height viewport. gl_FragCoord.y = 0 at NDC y=-1].
-    // The scene is stored bottom-up in the framebuffer:
-    //   - NDC y=-1 (scene bottom) → framebuffer row 0 → texture V=0
-    //   - NDC y=+1 (scene top)    → framebuffer last row → texture V=1
-    // This matches OpenGL convention: texcoord V=0 at bottom, V=1 at top.
-    // NDC reconstruction (texcoord * 2 - 1) gives correct OpenGL NDC.
+    // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer
     private static final String COMPOSITE_VERTEX_PREAMBLE = """
             vec2 vkm_composite_TexCoord;
             vec4 vkm_composite_ClipPos;
             vec4 vkm_composite_Position() {
-                float x = -1.0 + float((gl_VertexIndex & 1) << 2);
-                float y = -1.0 + float((gl_VertexIndex & 2) << 1);
-                vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
-                vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
-                return vec4(x, -y, 0.0, 1.0);
+                float x_ndc = -1.0 + float((gl_VertexIndex & 1) << 2);
+                float y_ndc = -1.0 + float((gl_VertexIndex & 2) << 1);
+                float u = x_ndc * 0.5 + 0.5;
+                float v = y_ndc * 0.5 + 0.5;
+                vkm_composite_TexCoord = vec2(u, v);
+                vkm_composite_ClipPos = vec4(x_ndc, y_ndc, 0.0, 1.0);
+                return vec4(u, v, 0.0, 1.0);
             }
             """;
 

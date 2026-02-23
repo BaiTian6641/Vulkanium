@@ -396,12 +396,18 @@ public class GBufferManager {
 
             vkCmdBeginRenderPass(cmd, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-            // Set Y-flipped viewport (to match OpenGL convention)
+            // Positive viewport: stores G-buffer in OpenGL texture convention
+            // (V=0 = NDC y=-1 = ground, V=1 = NDC y=+1 = sky).
+            // This makes composite shader depth reconstruction (texcoord*2-1)
+            // produce correct NDC Y values.  The scene renders "upside down"
+            // in the framebuffer, corrected by a Y-flip blit to the swapchain.
+            // VK_KHR_maintenance1 ensures CCW winding is correct regardless
+            // of viewport height sign.
             VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
                     .x(0.0f)
-                    .y((float) height)
+                    .y(0.0f)
                     .width((float) width)
-                    .height((float) -height)
+                    .height((float) height)
                     .minDepth(0.0f)
                     .maxDepth(1.0f);
             vkCmdSetViewport(cmd, 0, viewport);

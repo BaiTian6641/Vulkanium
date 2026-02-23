@@ -1605,9 +1605,12 @@ public class VulkaniumGlslTransformer {
     private static String transformSkyVertex(String source) {
         String inputs = """
                 // ── Vulkanium Sky Vertex Inputs ──
-                // Only Position — Color is NOT a vertex attribute for sky because
-                // POSITION-only draws (sky dome) have no Color data in the buffer.
+                // Position is always present. UV0 is present for skytextured
+                // draws (sun/moon) and absent for basic sky dome draws.
+                // When absent, reading location 1 yields default/undefined values
+                // that are harmless for shaders that do not consume UV0.
                 layout(location = 0) in vec3 vkm_Sky_Position;
+                layout(location = 1) in vec2 vkm_Sky_TexCoord;
                 """;
 
         source = insertAfterUBO(source, inputs);
@@ -1618,7 +1621,7 @@ public class VulkaniumGlslTransformer {
         // fallback when inputs.hasColor() == false).
         source = source.replaceAll("\\bgl_Color\\b", "iris_ColorModulator");
         source = source.replaceAll("\\bgl_Normal\\b", "vec3(0.0, 1.0, 0.0)");
-        source = source.replaceAll("\\bgl_MultiTexCoord0\\b", "vec4(0.0)");
+        source = source.replaceAll("\\bgl_MultiTexCoord0\\b", "vec4(vkm_Sky_TexCoord, 0.0, 1.0)");
         source = source.replaceAll("\\bgl_MultiTexCoord1\\b", "vec4(1.0, 1.0, 0.0, 1.0)");
 
         if (source.contains("ftransform")) {
@@ -1633,33 +1636,46 @@ public class VulkaniumGlslTransformer {
      * Composite vertex transform: fullscreen triangle from gl_VertexIndex.
      */
     private static String transformCompositeVertex(String source) {
-        // The fullscreen triangle position is computed procedurally from
-        // gl_VertexIndex.  We store it in vkm_composite_ClipPos so we can
-        // unconditionally override gl_Position at the END of main(),
-        // preventing camera projection/modelview matrices from distorting
-        // the triangle (those matrices stay available for the fragment
-        // shader's gbufferProjection / gbufferModelView aliases).
+        // ── Composite fullscreen triangle: Iris-compatible [0,1] convention ──
         //
-        // The Y-flipped Vulkan viewport (y=height, height=-height) handles
-        // the coordinate system conversion, so UV and gl_Vertex use standard
-        // OpenGL conventions (y=0 at bottom).  gl_Vertex and gl_Position
-        // use the SAME coordinates for consistency.
+        // Iris (OpenGL) provides composite vertex data in [0,1] range:
+        //   gl_Vertex = vec4(Position, 1.0)  where Position.xy ∈ [0,1]
+        //   gl_MultiTexCoord0 = vec4(UV0, 0, 1)  where UV0 ∈ [0,1]
+        //   gl_ProjectionMatrix = scale+translate mapping [0,1] → [-1,1] NDC
         //
-        // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer — Iris
-        // provides gl_Vertex = vec4(Position, 1.0) on OpenGL where the
-        // vertex positions are already in [0,1] space.  Vulkanium generates
-        // the fullscreen triangle in [-1,1] NDC directly.
+        // In Iris on OpenGL:
+        //   vertex (0,0) → NDC (-1,-1) → screen bottom-left → texcoord (0,0)
+        //   vertex (1,1) → NDC (+1,+1) → screen top-right   → texcoord (1,1)
+        //
+        // With POSITIVE viewport (Vulkanium):
+        //   NDC (-1,-1) → fb row 0 (top of Vulkan image) → V=0
+        //   NDC (+1,+1) → fb row H (bottom of image)     → V=1
+        //   G-buffer stores: V=0 → NDC y=-1 (ground), V=1 → NDC y=+1 (sky)
+        //   This matches OpenGL texture convention (V=0 = bottom of scene)!
+        //
+        // Therefore depth reconstruction (texcoord * 2.0 - 1.0) correctly maps
+        //   texcoord 0 → clip.y=-1 (ground direction) ← matches V=0 content
+        //   texcoord 1 → clip.y=+1 (sky direction)    ← matches V=1 content
+        //
+        // The composite output framebuffer has sky at bottom and ground at top
+        // (from Vulkan's display perspective), corrected by a Y-flip blit to
+        // the swapchain at the end of the fullscreen pass chain.
+        //
+        // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer
         String compute = """
                 // ── Vulkanium Composite Fullscreen Triangle ──
-                // Reference: Iris Shaders (LGPL-3.0) composite pass vertex handling
+                // Provides gl_Vertex in [0,1] matching Iris convention.
+                // Reference: Iris Shaders (LGPL-3.0) CompositeTransformer
                 vec2 vkm_composite_TexCoord;
                 vec4 vkm_composite_ClipPos;
                 vec4 vkm_composite_Position() {
-                    float x = -1.0 + float((gl_VertexIndex & 1) << 2);
-                    float y = -1.0 + float((gl_VertexIndex & 2) << 1);
-                    vkm_composite_TexCoord = vec2(x * 0.5 + 0.5, y * 0.5 + 0.5);
-                    vkm_composite_ClipPos = vec4(x, y, 0.0, 1.0);
-                    return vec4(x, y, 0.0, 1.0);
+                    float x_ndc = -1.0 + float((gl_VertexIndex & 1) << 2);
+                    float y_ndc = -1.0 + float((gl_VertexIndex & 2) << 1);
+                    float u = x_ndc * 0.5 + 0.5;
+                    float v = y_ndc * 0.5 + 0.5;
+                    vkm_composite_TexCoord = vec2(u, v);
+                    vkm_composite_ClipPos = vec4(x_ndc, y_ndc, 0.0, 1.0);
+                    return vec4(u, v, 0.0, 1.0);
                 }
                 """;
 

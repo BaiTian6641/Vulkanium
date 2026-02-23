@@ -456,14 +456,13 @@ public class ShadowRenderer {
 
     /**
      * Sets viewport and scissor to shadow map dimensions.
-     * Uses negative-height viewport (VK_KHR_maintenance1 / Vulkan 1.1) to match
-     * Sets the dynamic viewport and scissor for shadow map rendering.
      *
-     * <p>Uses standard positive-height viewport (no Y-flip). Since shaderpack
-     * vertex shaders no longer inject gl_Position.y = -gl_Position.y, the shadow
-     * map is stored bottom-up (matching OpenGL convention). Shadow coordinate
-     * reconstruction in composite shaders uses the same OpenGL projection matrix,
-     * so V=0 correctly maps to the bottom of the shadow scene.</p>
+     * <p>Uses standard positive-height viewport, consistent with the G-buffer
+     * and composite passes.  With positive viewport, the shadow map stores
+     * NDC y=-1 at texture V=0 and NDC y=+1 at V=1, matching the OpenGL
+     * texture convention.  Shadow coordinate reconstruction in composite
+     * shaders ({@code shadowNDC.xy * 0.5 + 0.5}) correctly indexes into
+     * the shadow texture because the V-to-NDC mapping is self-consistent.</p>
      */
     private void setShadowViewport(long commandBuffer, int width, int height) {
         VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
