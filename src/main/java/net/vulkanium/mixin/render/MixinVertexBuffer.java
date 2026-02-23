@@ -382,8 +382,12 @@ public abstract class MixinVertexBuffer {
 
                 // Notify RT pipeline about terrain mesh uploads for BLAS construction
                 if (vulkanium$isTerrainFormat(this.format)) {
-                    Vulkanium.notifyChunkMeshUploaded(vkVertexBuffer, persistentVertexCount,
-                            this.format.getVertexSize(), dataSize);
+                    Vulkanium.notifyChunkMeshUploaded(
+                            0, 0, 0,
+                            vkVertexBuffer, 0L, persistentVertexCount,
+                            VK_NULL_HANDLE, 0L, 0,
+                            this.format.getVertexSize(),
+                            false);
                 }
             }
             // For index-only uploads (re-sorts), vertex buffer is preserved as-is.

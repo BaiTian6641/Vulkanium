@@ -1,6 +1,6 @@
 package net.vulkanium.render.terrain.upload;
 
-import net.vulkanium.core.VulkaniumCommand;
+import net.vulkanium.Vulkanium;
 import net.vulkanium.core.VulkaniumMemory;
 import net.vulkanium.core.VulkaniumQueues;
 import net.vulkanium.render.terrain.ChunkVertexFormat;
@@ -145,6 +145,14 @@ public class ChunkUploadManager {
             // Record GPU slot for draw commands
             section.setGPUSlot(pass, vertexOffset, indexOffset,
                     meshData.vertexCount(), meshData.indexCount());
+
+                // Feed terrain section geometry to RT module (with exact region buffer offsets)
+                Vulkanium.notifyChunkMeshUploaded(
+                    section.getSectionX(), section.getSectionY(), section.getSectionZ(),
+                    buffers.getVertexBuffer(), vertexOffset, meshData.vertexCount(),
+                    buffers.getIndexBuffer(), indexOffset, meshData.indexCount(),
+                    ChunkVertexFormat.STRIDE,
+                    pass == TerrainPassType.TRANSLUCENT);
 
             bytesUploadedThisFrame += meshData.vertexData().remaining() + meshData.indexData().remaining();
         }

@@ -10,13 +10,12 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.util.Collection;
 
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.*;
+
+import static org.lwjgl.vulkan.KHRAccelerationStructure.*;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
-import static org.lwjgl.vulkan.VK10.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-import static org.lwjgl.vulkan.VK10.vkCmdPipelineBarrier;
+import static org.lwjgl.vulkan.VK10.*;
 
 /**
  * Top-Level Acceleration Structure (TLAS) builder for ray tracing.
@@ -79,6 +78,11 @@ public class TLASBuilder {
     private long scratchBuffer = 0;
     private long scratchAllocation = 0;
     private long scratchSize = 0;
+    private long scratchDeviceAddress = 0;
+    private long instanceBufferDeviceAddress = 0;
+
+    /** Real VkAccelerationStructureKHR handle (0 if not yet created) */
+    private long tlasHandle = 0;
 
     /** Number of instances written this frame */
     private int instanceCount = 0;
@@ -134,10 +138,13 @@ public class TLASBuilder {
             scratchBuffer = scratchResult[0];
             scratchAllocation = scratchResult[1];
             this.scratchSize = scratchSize;
+            this.scratchDeviceAddress = getBufferDeviceAddress(scratchBuffer);
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to allocate TLAS scratch buffer ({} KB)", scratchSize / 1024);
             throw e;
         }
+
+        instanceBufferDeviceAddress = getBufferDeviceAddress(instanceBuffer);
 
         LOGGER.info("TLAS builder initialized (max instances: {}, instance buffer: {} KB, scratch: {} KB)",
                 MAX_INSTANCES, instanceBufferSize / 1024, scratchSize / 1024);
@@ -218,27 +225,125 @@ public class TLASBuilder {
      *
      * @param commandBuffer Active VkCommandBuffer
      */
-    public void buildTLAS(long commandBuffer) {
-        if (instanceCount == 0 || !tlas.isDirty()) return;
+    public void buildTLAS(VkCommandBuffer commandBuffer) {
+        if (instanceCount == 0 || !tlas.isDirty() || commandBuffer == null) return;
 
         long startNs = System.nanoTime();
+        VkDevice device = Vulkanium.getVulkanDevice().getLogicalDevice();
 
-        if (tlas.getBuffer() == 0) {
-            long size = Math.max(256 * 1024L, instanceCount * 128L);
-            long[] alloc = memory.allocateBuffer(size,
-                    0x00200000 | 0x00020000,
-                    0x00000002);
-            tlas.setBuffer(alloc[0], alloc[1]);
-            tlas.setSize(size);
-            tlas.setHandle(alloc[0]);
-            tlas.setDeviceAddress(getBufferDeviceAddress(alloc[0]));
-            LOGGER.debug("Allocated TLAS storage: {} KB", size / 1024);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // Geometry: instances
+            var instanceData = VkAccelerationStructureGeometryInstancesDataKHR.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR)
+                    .arrayOfPointers(false);
+            instanceData.data().deviceAddress(instanceBufferDeviceAddress);
+
+            var geometry = VkAccelerationStructureGeometryKHR.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+                    .geometryType(VK_GEOMETRY_TYPE_INSTANCES_KHR)
+                    .flags(VK_GEOMETRY_OPAQUE_BIT_KHR);
+            geometry.get(0).geometry().instances(instanceData);
+
+            // Query build sizes (use buffer of 1 for vkCmdBuildAccelerationStructuresKHR)
+            var buildInfoBuf = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+            var buildInfo = buildInfoBuf.get(0)
+                    .sType(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+                    .type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
+                    .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)
+                    .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                    .pGeometries(geometry);
+
+            var sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR);
+            vkGetAccelerationStructureBuildSizesKHR(
+                    device,
+                    VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                    buildInfo,
+                    stack.ints(instanceCount),
+                    sizes);
+
+            long requiredSize = sizes.accelerationStructureSize();
+            long scratchRequired = sizes.buildScratchSize();
+
+            // Resize scratch if needed
+            if (scratchRequired > scratchSize) {
+                if (scratchBuffer != 0) {
+                    memory.freeBuffer(scratchBuffer, scratchAllocation);
+                }
+                long newSize = Math.max(scratchRequired, scratchSize * 2);
+                long[] r = memory.allocateBuffer(newSize, 0x00000020 | 0x00020000, 0x00000002);
+                scratchBuffer = r[0];
+                scratchAllocation = r[1];
+                scratchSize = newSize;
+                scratchDeviceAddress = getBufferDeviceAddress(scratchBuffer);
+            }
+
+            // (Re)allocate TLAS storage if needed
+            if (tlas.getBuffer() == 0 || tlas.getSize() < requiredSize) {
+                if (tlasHandle != 0) {
+                    vkDestroyAccelerationStructureKHR(device, tlasHandle, null);
+                    tlasHandle = 0;
+                    tlas.setHandle(0);
+                }
+                if (tlas.getBuffer() != 0) {
+                    memory.freeBuffer(tlas.getBuffer(), tlas.getBufferAllocation());
+                }
+                long[] alloc = memory.allocateBuffer(requiredSize,
+                        0x00200000 | 0x00020000, 0x00000002); // AS_STORAGE | BDA | GPU_ONLY
+                tlas.setBuffer(alloc[0], alloc[1]);
+                tlas.setSize(requiredSize);
+                LOGGER.debug("Allocated TLAS storage: {} KB", requiredSize / 1024);
+            }
+
+            // Create VkAccelerationStructureKHR if needed
+            if (tlasHandle == 0) {
+                var createInfo = VkAccelerationStructureCreateInfoKHR.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR)
+                        .buffer(tlas.getBuffer())
+                        .offset(0)
+                        .size(requiredSize)
+                        .type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
+                var pAS = stack.mallocLong(1);
+                int res = vkCreateAccelerationStructureKHR(device, createInfo, null, pAS);
+                if (res != VK_SUCCESS) {
+                    LOGGER.error("vkCreateAccelerationStructureKHR (TLAS) failed: {}", res);
+                    tlas.markClean();
+                    lastBuildTimeNs = System.nanoTime() - startNs;
+                    return;
+                }
+                tlasHandle = pAS.get(0);
+                tlas.setHandle(tlasHandle);
+
+                var addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR)
+                        .accelerationStructure(tlasHandle);
+                long asAddr = vkGetAccelerationStructureDeviceAddressKHR(device, addrInfo);
+                tlas.setDeviceAddress(asAddr);
+            }
+
+            // Build
+            buildInfo.dstAccelerationStructure(tlasHandle)
+                     .scratchData().deviceAddress(scratchDeviceAddress);
+
+            var rangeInfo = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack)
+                    .primitiveCount(instanceCount)
+                    .primitiveOffset(0)
+                    .firstVertex(0)
+                    .transformOffset(0);
+
+            vkCmdBuildAccelerationStructuresKHR(
+                    commandBuffer,
+                    buildInfoBuf,
+                    stack.pointers(rangeInfo));
+
+        } catch (Exception e) {
+            LOGGER.error("Failed to build TLAS: {}", e.getMessage(), e);
         }
 
         tlas.markClean();
         lastBuildTimeNs = System.nanoTime() - startNs;
-        LOGGER.debug("TLAS build completed: instances={} buildTime={}µs scratchKB={}",
-                instanceCount, lastBuildTimeNs / 1000, scratchSize / 1024);
+        LOGGER.debug("TLAS build completed: instances={} buildTime={}µs",
+                instanceCount, lastBuildTimeNs / 1000);
     }
 
     /**
@@ -246,16 +351,16 @@ public class TLASBuilder {
      *
      * @param commandBuffer Active VkCommandBuffer
      */
-    public void recordBuildBarrier(long commandBuffer) {
-        if (commandBuffer == 0 || Vulkanium.getVulkanDevice() == null) return;
-        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
-            org.lwjgl.vulkan.VkMemoryBarrier.Buffer barrier = org.lwjgl.vulkan.VkMemoryBarrier.calloc(1, stack)
+    public void recordBuildBarrier(VkCommandBuffer commandBuffer) {
+        if (commandBuffer == null || Vulkanium.getVulkanDevice() == null) return;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkMemoryBarrier.Buffer barrier = VkMemoryBarrier.calloc(1, stack)
                     .sType(VK_STRUCTURE_TYPE_MEMORY_BARRIER)
                     .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
                     .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
 
             vkCmdPipelineBarrier(
-                    new org.lwjgl.vulkan.VkCommandBuffer(commandBuffer, Vulkanium.getVulkanDevice().getLogicalDevice()),
+                    commandBuffer,
                     VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                     VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                     0,
@@ -283,6 +388,11 @@ public class TLASBuilder {
     // ── Lifecycle ──
 
     public void destroy() {
+        VkDevice device = Vulkanium.getVulkanDevice() != null ? Vulkanium.getVulkanDevice().getLogicalDevice() : null;
+        if (tlasHandle != 0 && device != null) {
+            vkDestroyAccelerationStructureKHR(device, tlasHandle, null);
+            tlasHandle = 0;
+        }
         if (tlas != null) {
             if (tlas.getBuffer() != 0) {
                 memory.freeBuffer(tlas.getBuffer(), tlas.getBufferAllocation());

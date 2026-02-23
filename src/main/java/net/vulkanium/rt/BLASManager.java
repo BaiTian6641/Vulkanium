@@ -3,6 +3,8 @@ package net.vulkanium.rt;
 import net.vulkanium.Vulkanium;
 import net.vulkanium.core.VulkaniumMemory;
 import net.vulkanium.core.VulkaniumQueues;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,16 +63,24 @@ public class BLASManager {
     /** Scratch buffer size (grown as needed) */
     private static final long INITIAL_SCRATCH_SIZE = 64 * 1024 * 1024; // 64 MB
 
+    /** Per-BLAS geometry parameters needed for vkCmdBuildAccelerationStructuresKHR. */
+    record GeometryInfo(long vertexBuffer, long vertexOffset, int vertexCount, int vertexStride,
+                        long indexBuffer, long indexOffset, int indexCount, boolean useUint32) {}
+
     // ── State ──
     private final VulkaniumMemory memory;
 
     /** Section key → BLAS mapping */
     private final Map<Long, AccelerationStructure> blasMap = new ConcurrentHashMap<>();
 
+    /** Section key → geometry info */
+    private final Map<Long, GeometryInfo> geometryInfoMap = new ConcurrentHashMap<>();
+
     /** Shared scratch buffer for BLAS builds */
     private long scratchBuffer = 0;
     private long scratchAllocation = 0;
     private long scratchSize = 0;
+    private long scratchDeviceAddress = 0;
 
     /** Statistics */
     private int totalBLASCount = 0;
@@ -158,6 +168,9 @@ public class BLASManager {
         }
 
         blas.setPrimitiveCount(indexCount / 3);
+        geometryInfoMap.put(sectionKey, new GeometryInfo(
+                vertexBuffer, vertexOffset, vertexCount, vertexStride,
+                indexBuffer, indexOffset, indexCount, useUint32));
         if (!blas.isDirty()) {
             blas.markDirty();
             dirtyBLASCount++;
@@ -189,38 +202,148 @@ public class BLASManager {
 
     /**
      * Builds dirty BLASes up to the per-frame budget.
+     * Records vkCmdBuildAccelerationStructuresKHR for each into the given command buffer.
      *
+     * @param commandBuffer active VkCommandBuffer (must be recording, outside any render pass)
      * @return Number of BLASes built this frame
      */
-    public int buildDirtyBLASes() {
-        if (!rtAvailable || dirtyBLASCount == 0) return 0;
+    public int buildDirtyBLASes(VkCommandBuffer commandBuffer) {
+        if (!rtAvailable || dirtyBLASCount == 0 || commandBuffer == null) return 0;
+        VkDevice device = Vulkanium.getVulkanDevice().getLogicalDevice();
 
         buildsThisFrame = 0;
 
-        for (AccelerationStructure blas : blasMap.values()) {
+        for (Map.Entry<Long, AccelerationStructure> entry : blasMap.entrySet()) {
+            AccelerationStructure blas = entry.getValue();
             if (!blas.isDirty()) continue;
             if (buildsThisFrame >= MAX_BUILDS_PER_FRAME) break;
 
-            if (blas.getPrimitiveCount() <= 0) {
+            long sectionKey = entry.getKey();
+            GeometryInfo geo = geometryInfoMap.get(sectionKey);
+            if (geo == null || blas.getPrimitiveCount() <= 0 || geo.vertexCount() <= 0) {
                 blas.markClean();
                 dirtyBLASCount--;
                 continue;
             }
 
-            long requiredSize = estimateBLASSizeBytes(blas.getPrimitiveCount());
-            if (blas.getBuffer() == 0 || blas.getSize() < requiredSize) {
-                allocateOrResizeBLASStorage(blas, requiredSize);
-            }
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                // Get vertex/index buffer device addresses
+                long vertexDA = getBufferDeviceAddress(geo.vertexBuffer());
+                long indexDA = geo.indexBuffer() != 0 ? getBufferDeviceAddress(geo.indexBuffer()) : 0;
+                if (vertexDA == 0) {
+                    blas.markClean();
+                    dirtyBLASCount--;
+                    continue;
+                }
 
-            if (blas.getHandle() == 0 && blas.getBuffer() != 0) {
-                // Runtime fallback handle until full VK_KHR_acceleration_structure creation path is wired.
-                // This keeps TLAS/dispatch flow alive and debuggable.
-                blas.setHandle(blas.getBuffer());
-            }
+                // Geometry description
+                var triangles = VkAccelerationStructureGeometryTrianglesDataKHR.calloc(stack)
+                        .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR)
+                        .vertexFormat(VK10.VK_FORMAT_R32G32B32_SFLOAT)
+                        .maxVertex(geo.vertexCount() - 1)
+                        .vertexStride(geo.vertexStride());
+                triangles.vertexData().deviceAddress(vertexDA + geo.vertexOffset());
 
-            if (blas.getDeviceAddress() == 0 && blas.getBuffer() != 0) {
-                long address = getBufferDeviceAddress(blas.getBuffer());
-                blas.setDeviceAddress(address);
+                if (indexDA != 0 && geo.indexCount() > 0) {
+                    triangles.indexType(geo.useUint32() ? VK10.VK_INDEX_TYPE_UINT32 : VK10.VK_INDEX_TYPE_UINT16);
+                    triangles.indexData().deviceAddress(indexDA + geo.indexOffset());
+                } else {
+                    triangles.indexType(KHRAccelerationStructure.VK_INDEX_TYPE_NONE_KHR);
+                }
+
+                var geometry = VkAccelerationStructureGeometryKHR.calloc(1, stack)
+                        .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR)
+                        .geometryType(KHRAccelerationStructure.VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+                        .flags(KHRAccelerationStructure.VK_GEOMETRY_OPAQUE_BIT_KHR);
+                geometry.get(0).geometry().triangles(triangles);
+
+                int primitiveCount = blas.getPrimitiveCount();
+
+                // Query build sizes (use buffer of 1 for vkCmdBuildAccelerationStructuresKHR)
+                var buildInfoBuf = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+                var buildInfo = buildInfoBuf.get(0)
+                        .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR)
+                        .type(KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                        .flags(KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+                        .mode(KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR)
+                        .pGeometries(geometry);
+
+                var sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack)
+                        .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR);
+                KHRAccelerationStructure.vkGetAccelerationStructureBuildSizesKHR(
+                        device,
+                        KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                        buildInfo,
+                        stack.ints(primitiveCount),
+                        sizes);
+
+                long requiredSize = sizes.accelerationStructureSize();
+                long scratchRequired = sizes.buildScratchSize();
+
+                // Ensure scratch is big enough
+                if (scratchRequired > scratchSize) {
+                    allocateScratch(Math.max(scratchRequired, scratchSize * 2));
+                }
+
+                // (Re)allocate AS storage buffer if needed
+                if (blas.getBuffer() == 0 || blas.getSize() < requiredSize) {
+                    if (blas.getHandle() != 0) {
+                        KHRAccelerationStructure.vkDestroyAccelerationStructureKHR(device, blas.getHandle(), null);
+                        blas.setHandle(0);
+                    }
+                    if (blas.getBuffer() != 0) {
+                        memory.freeBuffer(blas.getBuffer(), blas.getBufferAllocation());
+                        totalBLASMemory -= blas.getSize();
+                    }
+                    // VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                    long[] alloc = memory.allocateBuffer(requiredSize, 0x00200000 | 0x00020000, 0x00000002);
+                    blas.setBuffer(alloc[0], alloc[1]);
+                    blas.setSize(requiredSize);
+                    totalBLASMemory += requiredSize;
+                }
+
+                // Create VkAccelerationStructureKHR if we don't have one
+                if (blas.getHandle() == 0) {
+                    var createInfo = VkAccelerationStructureCreateInfoKHR.calloc(stack)
+                            .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR)
+                            .buffer(blas.getBuffer())
+                            .offset(0)
+                            .size(requiredSize)
+                            .type(KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                    var pAS = stack.mallocLong(1);
+                    int res = KHRAccelerationStructure.vkCreateAccelerationStructureKHR(device, createInfo, null, pAS);
+                    if (res != VK10.VK_SUCCESS) {
+                        LOGGER.warn("vkCreateAccelerationStructureKHR failed for BLAS {}: {}", sectionKey, res);
+                        blas.markClean();
+                        dirtyBLASCount--;
+                        continue;
+                    }
+                    blas.setHandle(pAS.get(0));
+                    // Query device address of the AS
+                    var addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
+                            .sType(KHRAccelerationStructure.VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR)
+                            .accelerationStructure(pAS.get(0));
+                    long asAddr = KHRAccelerationStructure.vkGetAccelerationStructureDeviceAddressKHR(device, addrInfo);
+                    blas.setDeviceAddress(asAddr);
+                }
+
+                // Build the BLAS
+                buildInfo.dstAccelerationStructure(blas.getHandle())
+                         .scratchData().deviceAddress(scratchDeviceAddress);
+
+                var rangeInfo = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack)
+                        .primitiveCount(primitiveCount)
+                        .primitiveOffset(0)
+                        .firstVertex(0)
+                        .transformOffset(0);
+
+                KHRAccelerationStructure.vkCmdBuildAccelerationStructuresKHR(
+                        commandBuffer,
+                        buildInfoBuf,
+                        stack.pointers(rangeInfo));
+
+            } catch (Exception e) {
+                LOGGER.warn("Failed to build BLAS for section {}: {}", sectionKey, e.getMessage());
             }
 
             blas.markClean();
@@ -291,12 +414,14 @@ public class BLASManager {
             scratchBuffer = result[0];
             scratchAllocation = result[1];
             scratchSize = size;
+            scratchDeviceAddress = getBufferDeviceAddress(scratchBuffer);
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to allocate scratch buffer ({} MB) — RT extensions may not be enabled at device level",
                     size / (1024 * 1024));
             scratchBuffer = 0;
             scratchAllocation = 0;
             scratchSize = 0;
+            scratchDeviceAddress = 0;
             rtAvailable = false;
         }
     }
@@ -304,13 +429,18 @@ public class BLASManager {
     // ── Lifecycle ──
 
     public void destroy() {
+        VkDevice device = Vulkanium.getVulkanDevice() != null ? Vulkanium.getVulkanDevice().getLogicalDevice() : null;
         for (AccelerationStructure blas : blasMap.values()) {
+            if (blas.getHandle() != 0 && device != null) {
+                KHRAccelerationStructure.vkDestroyAccelerationStructureKHR(device, blas.getHandle(), null);
+            }
             if (blas.getBuffer() != 0) {
                 memory.freeBuffer(blas.getBuffer(), blas.getBufferAllocation());
             }
             blas.reset();
         }
         blasMap.clear();
+        geometryInfoMap.clear();
 
         if (scratchBuffer != 0) {
             memory.freeBuffer(scratchBuffer, scratchAllocation);

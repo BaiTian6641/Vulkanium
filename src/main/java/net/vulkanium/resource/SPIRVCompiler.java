@@ -127,6 +127,38 @@ public class SPIRVCompiler {
         return compile(source, shaderc_geometry_shader, filename);
     }
 
+    // ── Ray Tracing shader stages ──
+
+    /** Compile a ray generation shader (GL_EXT_ray_tracing). */
+    public ByteBuffer compileRayGen(String source, String filename) {
+        return compile(source, shaderc_raygen_shader, filename);
+    }
+
+    /** Compile a miss shader (GL_EXT_ray_tracing). */
+    public ByteBuffer compileMiss(String source, String filename) {
+        return compile(source, shaderc_miss_shader, filename);
+    }
+
+    /** Compile a closest-hit shader (GL_EXT_ray_tracing). */
+    public ByteBuffer compileClosestHit(String source, String filename) {
+        return compile(source, shaderc_closesthit_shader, filename);
+    }
+
+    /** Compile an any-hit shader (GL_EXT_ray_tracing). */
+    public ByteBuffer compileAnyHit(String source, String filename) {
+        return compile(source, shaderc_anyhit_shader, filename);
+    }
+
+    /** Compile an intersection shader (GL_EXT_ray_tracing). */
+    public ByteBuffer compileIntersection(String source, String filename) {
+        return compile(source, shaderc_intersection_shader, filename);
+    }
+
+    /** Compile a callable shader (GL_EXT_ray_tracing). */
+    public ByteBuffer compileCallable(String source, String filename) {
+        return compile(source, shaderc_callable_shader, filename);
+    }
+
     /**
      * Loads GLSL source from the classpath and compiles to SPIR-V.
      *
@@ -199,6 +231,12 @@ public class SPIRVCompiler {
         if (filename.endsWith(".geom") || filename.endsWith(".gsh")) return shaderc_geometry_shader;
         if (filename.endsWith(".tesc")) return shaderc_tess_control_shader;
         if (filename.endsWith(".tese")) return shaderc_tess_evaluation_shader;
+        if (filename.endsWith(".rgen"))  return shaderc_raygen_shader;
+        if (filename.endsWith(".rmiss")) return shaderc_miss_shader;
+        if (filename.endsWith(".rchit")) return shaderc_closesthit_shader;
+        if (filename.endsWith(".rahit")) return shaderc_anyhit_shader;
+        if (filename.endsWith(".rint"))  return shaderc_intersection_shader;
+        if (filename.endsWith(".rcall")) return shaderc_callable_shader;
         throw new IllegalArgumentException("Unknown shader extension: " + filename);
     }
 }

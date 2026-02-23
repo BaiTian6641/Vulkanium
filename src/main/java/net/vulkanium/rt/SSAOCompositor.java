@@ -582,14 +582,12 @@ public class SSAOCompositor {
                 // Sample SSAO value (R8 texture, bilinear upscale from half-res)
                 float ao = texture(ssaoTexture, fragUV).r;
 
-                                // Safety floor to avoid full-screen blackouts from invalid AO reads.
-                                // Valid SSAO should remain near [0.3, 1.0], so this clamps only catastrophic cases.
-                                float safeAo = clamp(ao, 0.2, 1.0);
+                // Safety floor: even if the compute shader produces unexpected
+                // values, the scene should never be darkened below 60 %.
+                float safeAo = clamp(ao, 0.60, 1.0);
 
                 // Output AO as RGB — multiplicative blending applies: scene * ao
-                // AO = 1.0 means no occlusion (no darkening)
-                // AO = 0.0 means fully occluded (black)
-                                outColor = vec4(safeAo, safeAo, safeAo, 1.0);
+                outColor = vec4(safeAo, safeAo, safeAo, 1.0);
             }
             """;
 }

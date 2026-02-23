@@ -18,6 +18,7 @@ import static net.vulkanium.core.VulkaniumInstance.checkResult;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.memFree;
 import static org.lwjgl.vulkan.VK10.*;
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 
 /**
  * Ray Tracing Renderer — integrates RT capabilities into the Vulkanium frame lifecycle.
@@ -214,9 +215,15 @@ public class RayTracingRenderer {
         this.frameIndex = frameIdx;
 
         // 1. Hardware RT pass (if available)
-        if (rtModuleManager != null && rtModuleManager.isEnabled()) {
+        boolean hwRTDispatched = false;
+        if (rtModuleManager != null && rtModuleManager.isEnabled() && rtModuleManager.isRTPipelineReady()) {
             try {
                 rtModuleManager.executeFrame(commandBuffer, frameIdx);
+                // If RT pipeline is ready and has output, blit RT output to swapchain
+                if (rtModuleManager.getRTOutputImage() != 0 && rtModuleManager.getRTWidth() > 0) {
+                    blitRTOutputToSwapchain(commandBuffer, swapchainImageIndex);
+                    hwRTDispatched = true;
+                }
             } catch (Exception e) {
                 if (totalSSAODispatches < 5) {
                     LOGGER.warn("Hardware RT dispatch failed: {}", e.getMessage());
@@ -224,8 +231,8 @@ public class RayTracingRenderer {
             }
         }
 
-        // 2. Compute SSAO pass (always available on all Vulkan GPUs)
-        if (ssaoEnabled) {
+        // 2. Compute SSAO pass (skip if hardware RT already did full path tracing)
+        if (ssaoEnabled && !hwRTDispatched) {
             dispatchSSAO(commandBuffer, depthImage, depthImageView);
 
             // 3. Composite SSAO onto the swapchain image
@@ -233,6 +240,81 @@ public class RayTracingRenderer {
                 ssaoCompositor.composite(commandBuffer, swapchainImageIndex);
             }
         }
+    }
+
+    /**
+     * Blits the RT output image (RGBA16F) onto the current swapchain image.
+     */
+    private void blitRTOutputToSwapchain(VkCommandBuffer commandBuffer, int swapchainImageIndex) {
+        long rtImage = rtModuleManager.getRTOutputImage();
+        int rtW = rtModuleManager.getRTWidth();
+        int rtH = rtModuleManager.getRTHeight();
+        if (rtImage == 0 || rtW == 0 || rtH == 0) return;
+
+        // Get swapchain image
+        long[] swapImages = Vulkanium.getVulkanSwapchain().getImages();
+        if (swapchainImageIndex < 0 || swapchainImageIndex >= swapImages.length) return;
+        long swapImage = swapImages[swapchainImageIndex];
+
+        // Transition RT output: GENERAL → TRANSFER_SRC
+        VulkaniumCommand.transitionImageLayout(commandBuffer, rtImage,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Transition swapchain image: COLOR_ATTACHMENT → TRANSFER_DST
+        VulkaniumCommand.transitionImageLayout(commandBuffer, swapImage,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Blit
+        try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            var region = VkImageBlit.calloc(1, stack);
+            region.get(0).srcSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.get(0).srcOffsets(0).set(0, 0, 0);
+            region.get(0).srcOffsets(1).set(rtW, rtH, 1);
+            region.get(0).dstSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.get(0).dstOffsets(0).set(0, 0, 0);
+            region.get(0).dstOffsets(1).set(width, height, 1);
+
+            vkCmdBlitImage(commandBuffer,
+                    rtImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    region, VK_FILTER_LINEAR);
+        }
+
+        // Transition RT output back: TRANSFER_SRC → GENERAL
+        VulkaniumCommand.transitionImageLayout(commandBuffer, rtImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                VK_IMAGE_ASPECT_COLOR_BIT);
+
+        // Transition swapchain image back: TRANSFER_DST → COLOR_ATTACHMENT
+        VulkaniumCommand.transitionImageLayout(commandBuffer, swapImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT);
     }
 
     /**
@@ -782,14 +864,13 @@ public class RayTracingRenderer {
             #version 450
             layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-            // Output: AO + contact shadow mask (R8_UNORM at half resolution)
+            // Output: AO mask (R8_UNORM at half resolution)
             layout(binding = 0, r8) uniform writeonly image2D aoOutput;
 
             // Input: depth buffer from the raster pass
             layout(binding = 1) uniform sampler2D depthBuffer;
 
             // Push constants: 12 floats = 48 bytes
-            // screenWidth/screenHeight are in HALF-RES pixels (matching output)
             layout(push_constant) uniform PushConstants {
                 float camX, camY, camZ;
                 float sunX, sunY, sunZ;
@@ -802,13 +883,6 @@ public class RayTracingRenderer {
             } pc;
 
             // ── Pseudo-random hash for per-pixel noise ──
-            float hash(vec2 p) {
-                vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
-                p3 += dot(p3, p3.yzx + 33.33);
-                return fract((p3.x + p3.y) * p3.z);
-            }
-
-            // Two-component hash for better 2D distribution
             vec2 hash2(vec2 p) {
                 vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
                 p3 += dot(p3, p3.yzx + 33.33);
@@ -816,58 +890,29 @@ public class RayTracingRenderer {
             }
 
             // Linearize depth value to view-space distance.
-            // MC 1.20.1 uses standard perspective with near=0.05.
-            // Far plane = renderDistance * 16 blocks. We use 256 as reasonable default,
-            // but the formula is robust — far plane only affects extreme-distance AO.
             float linearizeDepth(float d) {
                 float near = 0.05;
                 float far = 256.0;
                 return near * far / (far - d * (far - near));
             }
 
-            // ── Screen-space contact shadow from sun direction ──
-            // Marches rays in screen space toward the sun, checking for occluders.
-            // Uses the HALF-RES output dimensions for correct screen-space math.
-            float computeContactShadow(vec2 uv, float linDepth) {
-                // Project sun direction to approximate screen-space direction
-                vec2 sunScreenDir = normalize(vec2(pc.sunX, -pc.sunY) + vec2(0.001));
+            // Reconstruct view-space normal from depth buffer cross-derivatives.
+            // Uses the smaller derivative at edges to avoid halo artifacts.
+            vec3 reconstructNormal(vec2 uv) {
+                vec2 texel = 1.0 / vec2(pc.screenWidth, pc.screenHeight);
 
-                float shadow = 1.0;
-                const int SHADOW_STEPS = 10;
-                // Scale march length based on depth (shorter for close objects)
-                float marchLength = min(32.0, 20.0 / max(linDepth * 0.1, 0.1));
+                float c  = linearizeDepth(texture(depthBuffer, uv).r);
+                float l  = linearizeDepth(texture(depthBuffer, uv - vec2(texel.x, 0.0)).r);
+                float r  = linearizeDepth(texture(depthBuffer, uv + vec2(texel.x, 0.0)).r);
+                float t  = linearizeDepth(texture(depthBuffer, uv - vec2(0.0, texel.y)).r);
+                float b  = linearizeDepth(texture(depthBuffer, uv + vec2(0.0, texel.y)).r);
 
-                for (int s = 1; s <= SHADOW_STEPS; s++) {
-                    float t = float(s) / float(SHADOW_STEPS);
-                    // Accelerating step size for better near-field precision
-                    float stepT = t * t;
-                    vec2 samplePos = uv + sunScreenDir * stepT * marchLength
-                                    / vec2(pc.screenWidth, pc.screenHeight);
+                // Pick the derivative with the smaller absolute value to
+                // avoid crossing depth discontinuities (e.g. block edges).
+                float dx = abs(r - c) < abs(c - l) ? (r - c) : (c - l);
+                float dy = abs(b - c) < abs(c - t) ? (b - c) : (c - t);
 
-                    // Bounds check
-                    if (samplePos.x < 0.001 || samplePos.x > 0.999 ||
-                        samplePos.y < 0.001 || samplePos.y > 0.999) break;
-
-                    float sampleDepth = texture(depthBuffer, samplePos).r;
-
-                    // Skip sky samples
-                    if (sampleDepth >= 0.9999) continue;
-
-                    float sampleLin = linearizeDepth(sampleDepth);
-                    float heightDiff = linDepth - sampleLin;
-
-                    // If sample is closer to camera by a meaningful amount,
-                    // it's between us and the sun -> shadow.
-                    // Use tight range to avoid self-shadowing and distant artifacts
-                    if (heightDiff > 0.05 && heightDiff < 1.5) {
-                        // Gradual falloff based on distance along ray and depth difference
-                        float depthFalloff = smoothstep(0.05, 1.5, heightDiff);
-                        float distFalloff = 1.0 - t;
-                        shadow *= mix(1.0, 0.7, (1.0 - depthFalloff) * distFalloff);
-                    }
-                }
-
-                return clamp(shadow, 0.0, 1.0);
+                return normalize(vec3(-dx, -dy, 1.0));
             }
 
             void main() {
@@ -876,85 +921,73 @@ public class RayTracingRenderer {
 
                 if (pos.x >= outSize.x || pos.y >= outSize.y) return;
 
-                // UV coordinates in [0, 1]
                 vec2 uv = (vec2(pos) + 0.5) / vec2(outSize);
-
-                // Sample center depth
                 float depth = texture(depthBuffer, uv).r;
 
-                // Skip sky/invalid pixels.
-                // Some transient depth states can produce 0.0 samples; treat these as non-occluding
-                // to avoid full-screen black AO artifacts.
+                // Skip sky / invalid pixels — output "no occlusion" (white).
                 if (depth >= 0.9999 || depth <= 0.000001) {
                     imageStore(aoOutput, pos, vec4(1.0));
                     return;
                 }
 
                 float linDepth = linearizeDepth(depth);
+                vec3 normal = reconstructNormal(uv);
 
-                // ======================================================
-                //  1. SSAO: hemisphere sampling around the center pixel
-                // ======================================================
-                float ao = 0.0;
+                // ── Hemisphere-oriented SSAO ──
+                float occlusion = 0.0;
+                int validSamples = 0;
                 int samples = int(pc.numSamples);
 
-                // Per-pixel random rotation angle via hash (prevents banding)
                 vec2 noise = hash2(vec2(pos) + pc.frameIndex * 1.7);
 
-                // Scale sample radius inversely with depth for perspective-correct AO.
-                // Use half-res screen dimensions for correct pixel-space scaling.
+                // Perspective-correct radius (smaller for distant geometry)
                 float radius = pc.aoRadius / max(linDepth, 0.1);
-
-                // Pixel-space radius (clamped to prevent excessive range)
-                float pixRadius = min(radius * 30.0, 40.0);
+                float pixRadius = min(radius * 20.0, 30.0);
 
                 for (int i = 0; i < samples; i++) {
-                    // Per-sample angle using golden angle spiral + per-pixel noise
                     float fi = float(i) + noise.x;
                     float angle = fi * 2.39996323 + noise.y * 6.2831853;
-                    float r = sqrt(fi / float(samples)) * pixRadius;
+                    float dist = sqrt(fi / float(samples)) * pixRadius;
 
-                    // Sample offset in half-res pixel space -> UV space
-                    vec2 offset = vec2(cos(angle), sin(angle)) * r;
+                    vec2 offset = vec2(cos(angle), sin(angle)) * dist;
                     vec2 sampleUV = uv + offset / vec2(pc.screenWidth, pc.screenHeight);
                     sampleUV = clamp(sampleUV, vec2(0.001), vec2(0.999));
 
                     float sampleDepth = texture(depthBuffer, sampleUV).r;
+                    if (sampleDepth >= 0.9999 || sampleDepth <= 0.000001) continue;
 
-                    // Skip sky samples entirely — they should not contribute occlusion
-                    if (sampleDepth >= 0.9999) continue;
+                    float sampleLin = linearizeDepth(sampleDepth);
+                    float depthDiff = linDepth - sampleLin;
 
-                    float sampleLinDepth = linearizeDepth(sampleDepth);
+                    // Build a rough 3D sample direction for hemisphere check
+                    vec3 sampleDir = vec3(offset / vec2(pc.screenWidth, pc.screenHeight), -depthDiff);
+                    float nDotS = dot(normal, normalize(sampleDir));
 
-                    // Depth difference: positive = sample is closer (occluder)
-                    float depthDiff = linDepth - sampleLinDepth;
+                    // Reject samples below the surface (back-hemisphere)
+                    if (nDotS < 0.05) continue;
 
-                    // Range check: large depth discontinuities indicate different
-                    // surfaces (e.g., player hand vs distant terrain). These MUST
-                    // be rejected to prevent halo artifacts around edges.
+                    validSamples++;
+
+                    // Range check: reject depth jumps > AO radius (different surfaces)
                     float absDiff = abs(depthDiff);
                     float maxRange = pc.aoRadius * 0.5;
                     float rangeCheck = 1.0 - smoothstep(maxRange * 0.3, maxRange, absDiff);
 
-                    // Only count as occluder if sample is meaningfully closer
-                    ao += step(0.005, depthDiff) * rangeCheck;
+                    // Occluder: sample must be meaningfully closer than center
+                    occlusion += step(0.025, depthDiff) * rangeCheck;
                 }
 
-                ao = 1.0 - (ao / float(samples));
+                float ao = 1.0;
+                if (validSamples > 2) {
+                    ao = 1.0 - (occlusion / float(validSamples));
+                }
                 ao = clamp(ao, 0.0, 1.0);
 
-                // Gentle power curve for natural AO falloff
-                ao = pow(ao, 1.3);
-
-                // ======================================================
-                //  2. Contact shadows from sun direction
-                // ======================================================
-                float shadow = computeContactShadow(uv, linDepth);
-
-                // ======================================================
-                //  3. Combine AO and contact shadow
-                // ======================================================
-                float final_ao = ao * shadow;
+                // ── Conservative output ──
+                // Blend with white at low intensity so AO is a subtle enhancement,
+                // not an aggressive darkening filter.
+                float final_ao = mix(1.0, ao, 0.30);          // 30 % effect strength
+                final_ao = clamp(final_ao, 0.70, 1.0);        // never below 70 % brightness
 
                 imageStore(aoOutput, pos, vec4(final_ao));
             }

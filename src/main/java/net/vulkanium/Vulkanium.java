@@ -89,24 +89,28 @@ public class Vulkanium implements ClientModInitializer {
             .synchronizedList(new java.util.ArrayList<>());
 
     /**
-     * Records a newly uploaded terrain chunk mesh for RT processing.
-     * Called from MixinVertexBuffer.onUpload() when a terrain-format buffer is
-     * uploaded.
-     *
-     * @param vkBuffer    The VkBuffer handle of the uploaded mesh
-     * @param vertexCount Number of vertices
-     * @param vertexSize  Stride in bytes
-     * @param bufferSize  Total buffer size in bytes
+     * Records a newly uploaded terrain section mesh for RT processing.
      */
-    public static void notifyChunkMeshUploaded(long vkBuffer, int vertexCount,
-            int vertexSize, int bufferSize) {
-        if (rtRenderer == null || !rtRenderer.isEnabled())
+    public static void notifyChunkMeshUploaded(int sectionX, int sectionY, int sectionZ,
+            long vertexBuffer, long vertexOffset, int vertexCount,
+            long indexBuffer, long indexOffset, int indexCount,
+            int vertexStride, boolean translucent) {
+        if (rtRenderer == null || !rtRenderer.isEnabled()) {
             return;
-        pendingChunkMeshes.add(new ChunkMeshUpload(vkBuffer, vertexCount, vertexSize, bufferSize, frameCounter));
+        }
+        pendingChunkMeshes.add(new ChunkMeshUpload(
+                sectionX, sectionY, sectionZ,
+                vertexBuffer, vertexOffset, vertexCount,
+                indexBuffer, indexOffset, indexCount,
+                vertexStride, translucent,
+                frameCounter));
     }
 
-    private record ChunkMeshUpload(long vkBuffer, int vertexCount, int vertexSize,
-            int bufferSize, long uploadedAtFrame) {
+    private record ChunkMeshUpload(int sectionX, int sectionY, int sectionZ,
+            long vertexBuffer, long vertexOffset, int vertexCount,
+            long indexBuffer, long indexOffset, int indexCount,
+            int vertexStride, boolean translucent,
+            long uploadedAtFrame) {
     }
 
     // Placeholder 1x1 white texture
@@ -645,6 +649,7 @@ public class Vulkanium implements ClientModInitializer {
         diagFrameDrawCount = 0;
         frameHadWorldRender = false;
         fullscreenPassesExecuted = false;
+        rtPassExecutedThisFrame = false;
 
         // Log frame-start state for diagnostic frames
         if (isDebugLogging() && (frameCounter < 15 || (frameCounter >= 295 && frameCounter <= 305))) {
@@ -723,52 +728,20 @@ public class Vulkanium implements ClientModInitializer {
         }
         fullscreenPassesExecuted = false;
 
-        // ── RT pass: feed chunk meshes to RT pipeline, then dispatch ──
-        // Run RT whenever it's enabled in config (SSAO works in any render mode)
-        if (frameHadWorldRender
-            && getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
-            && config.rayTracingEnabled
-            && rtRenderer != null
-            && rtRenderer.isEnabled()) {
-            try {
-                // Feed any newly uploaded terrain meshes to the RT module manager
-                // so it can build BLASes for ray-traced shadow computation
-                if (!pendingChunkMeshes.isEmpty()) {
-                    var rtModule = rtRenderer.getRTModuleManager();
-                    if (rtModule != null && rtModule.isEnabled()) {
-                        for (ChunkMeshUpload upload : pendingChunkMeshes) {
-                            // Derive approximate section coordinates from the buffer
-                            // (the section key is used for BLAS deduplication)
-                            int sectionKey = (int) (upload.vkBuffer % 0x3FFFFF);
-                            rtModule.onChunkMeshChanged(
-                                    sectionKey & 0x3FF, (sectionKey >> 10) & 0xFF,
-                                    (sectionKey >> 18) & 0x3FF,
-                                    upload.vkBuffer, 0 /* no index buffer */,
-                                    upload.vertexCount, 0);
-                        }
-                        if (isDebugLogging() && frameCounter % 300 == 0) {
-                            LOGGER.info("[RT] Fed {} chunk meshes to RT pipeline", pendingChunkMeshes.size());
-                        }
-                    }
-                    pendingChunkMeshes.clear();
-                }
-
-                long depthImage = vulkanSwapchain.getDepthImage();
-                long depthView = vulkanSwapchain.getDepthImageView();
-                int frameIdx = frameOrchestrator.getCurrentFrame();
-                int swapImageIdx = frameOrchestrator.getCurrentImageIndex();
-                rtRenderer.executeFrame(cmd, depthImage, depthView, frameIdx, swapImageIdx, frameHadWorldRender);
-            } catch (Exception e) {
-                if (isDebugLogging() && (frameCounter < 5 || frameCounter % 300 == 0)) {
-                    LOGGER.warn("[RT] Frame dispatch error: {}", e.getMessage());
-                }
-            }
+        // ── RT pass cleanup ──
+        // RT/SSAO is now executed exclusively in onWorldRenderEnd() for the
+        // VANILLA_RT pipeline so AO never darkens the HUD/UI.  If the world-end
+        // hook did not fire this frame (e.g. menu screens), clear pending meshes
+        // so they don't accumulate indefinitely.
+        if (!rtPassExecutedThisFrame && !pendingChunkMeshes.isEmpty()) {
+            pendingChunkMeshes.clear();
         }
 
         // End frame: end cmd → submit → present
         boolean rendered = frameOrchestrator.endFrame();
         frameStarted = false;
         frameCounter++;
+        rtPassExecutedThisFrame = false;
 
         // Flush deferred buffer frees (safe now that in-flight frames have advanced)
         flushDeferredBufferFrees();
@@ -821,6 +794,8 @@ public class Vulkanium implements ClientModInitializer {
 
     /** Whether the fullscreen composite/deferred passes already executed this frame. */
     private static boolean fullscreenPassesExecuted = false;
+    /** Whether RT/SSAO already executed this frame at world end. */
+    private static boolean rtPassExecutedThisFrame = false;
 
     /**
      * Called at renderLevel HEAD with the actual camera matrices from MC.
@@ -943,6 +918,53 @@ public class Vulkanium implements ClientModInitializer {
                 // 4. Restart main render pass for GUI/HUD rendering
                 //    The fullscreen blit already wrote the composite result to swapchain;
                 //    beginPreserve loads existing content so GUI draws on top.
+                mainRenderPass.beginPreserve(cmd, imageIndex,
+                        vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
+            }
+        }
+
+        // Vanilla RT path: run RT/SSAO right after world rendering and before HUD/UI,
+        // so AO does not darken menu/hotbar text.
+        if (frameHadWorldRender
+            && getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
+            && config.rayTracingEnabled
+            && rtRenderer != null
+            && rtRenderer.isEnabled()) {
+            VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
+            int imageIndex = frameOrchestrator.getCurrentImageIndex();
+            try {
+                // Feed any newly uploaded terrain meshes to the RT module manager
+                // so it can build BLASes for ray-traced shadow computation
+                if (!pendingChunkMeshes.isEmpty()) {
+                    var rtModule = rtRenderer.getRTModuleManager();
+                    if (rtModule != null && rtModule.isEnabled()) {
+                        for (ChunkMeshUpload upload : pendingChunkMeshes) {
+                            rtModule.onChunkMeshChanged(
+                                    upload.sectionX(), upload.sectionY(), upload.sectionZ(),
+                                    upload.vertexBuffer(), upload.vertexOffset(),
+                                    upload.indexBuffer(), upload.indexOffset(),
+                                    upload.vertexCount(), upload.indexCount(),
+                                    upload.vertexStride(), upload.translucent());
+                        }
+                        if (isDebugLogging() && frameCounter % 300 == 0) {
+                            LOGGER.info("[RT] Fed {} chunk meshes to RT pipeline", pendingChunkMeshes.size());
+                        }
+                    }
+                    pendingChunkMeshes.clear();
+                }
+
+                long depthImage = vulkanSwapchain.getDepthImage();
+                long depthView = vulkanSwapchain.getDepthImageView();
+                int frameIdx = frameOrchestrator.getCurrentFrame();
+
+                mainRenderPass.end(cmd);
+                rtRenderer.executeFrame(cmd, depthImage, depthView, frameIdx, imageIndex, true);
+                rtPassExecutedThisFrame = true;
+            } catch (Exception e) {
+                if (isDebugLogging() && (frameCounter < 5 || frameCounter % 300 == 0)) {
+                    LOGGER.warn("[RT] World-end dispatch error: {}", e.getMessage());
+                }
+            } finally {
                 mainRenderPass.beginPreserve(cmd, imageIndex,
                         vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
             }
@@ -2372,17 +2394,14 @@ public class Vulkanium implements ClientModInitializer {
         net.vulkanium.render.RenderMode previous = config.getRenderMode();
         config.setRenderMode(mode);
 
-        if (mode == net.vulkanium.render.RenderMode.VANILLA_RT) {
-            config.rayTracingEnabled = true;
-            if (rtRenderer != null) {
-                rtRenderer.setEnabled(true);
+        boolean rtShouldRun = mode == net.vulkanium.render.RenderMode.VANILLA_RT
+                && config.rayTracingEnabled;
+
+        if (rtRenderer != null) {
+            rtRenderer.setEnabled(rtShouldRun);
+            if (mode == net.vulkanium.render.RenderMode.VANILLA_RT) {
                 rtRenderer.setSSAOEnabled(config.ssaoEnabled);
                 rtRenderer.setAOSamples(config.ssaoSamples);
-            }
-        } else {
-            config.rayTracingEnabled = false;
-            if (rtRenderer != null) {
-                rtRenderer.setEnabled(false);
             }
         }
 
@@ -2405,10 +2424,11 @@ public class Vulkanium implements ClientModInitializer {
         }
 
         config.save();
-        LOGGER.info("Render mode changed: {} -> {} (RT enabled={})",
+        LOGGER.info("Render mode changed: {} -> {} (RT active={}, RT pref={})",
                 previous.getDisplayName(),
                 mode.getDisplayName(),
-                config.rayTracingEnabled);
+            rtShouldRun,
+            config.rayTracingEnabled);
     }
 
     public static VulkaniumInstance getVulkanInstance() {
