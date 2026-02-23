@@ -5,10 +5,9 @@
 // If the closest-hit shader is invoked instead, the shadow payload stays true
 
 layout(location = 1) rayPayloadInEXT struct ShadowPayload {
-    bool inShadow;
+    float visibility;
 } payload;
 
 void main() {
-    // Ray reached the light source without obstruction
-    payload.inShadow = false;
+    payload.visibility = 1.0;
 }

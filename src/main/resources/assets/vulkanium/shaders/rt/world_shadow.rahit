@@ -1,0 +1,70 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+layout(location = 1) rayPayloadInEXT struct ShadowPayload {
+    float visibility;
+} payload;
+
+struct Material {
+    float roughness;
+    float metallic;
+    float emission;
+    float ior;
+    float opacity;
+    float subsurface;
+    uint flags;
+    uint padding;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer Materials { Material materials[]; };
+
+const uint FLAG_CUTOUT = 128u;
+const uint FLAG_TRANSLUCENT = 256u;
+const uint FLAG_FOLIAGE = 512u;
+
+float hash13(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+void main() {
+    uint materialId = gl_InstanceCustomIndexEXT;
+    Material mat = materials[materialId];
+
+    vec3 hitPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+
+    bool isCutout = (mat.flags & FLAG_CUTOUT) != 0u || (mat.flags & FLAG_FOLIAGE) != 0u;
+    bool isTranslucent = (mat.flags & FLAG_TRANSLUCENT) != 0u || mat.opacity < 0.98;
+
+    if (isCutout) {
+        float coverage = clamp(mat.opacity, 0.2, 0.8);
+        float noise = hash13(hitPos * 3.7 + vec3(gl_PrimitiveID, materialId, 0.0));
+        if (noise > coverage) {
+            ignoreIntersectionEXT();
+            return;
+        }
+
+        payload.visibility = max(payload.visibility * (1.0 - coverage), 0.0);
+        if (payload.visibility <= 0.02) {
+            terminateRayEXT();
+        } else {
+            ignoreIntersectionEXT();
+        }
+        return;
+    }
+
+    if (isTranslucent) {
+        float transmittance = clamp(1.0 - mat.opacity, 0.05, 0.95);
+        payload.visibility *= transmittance;
+        if (payload.visibility <= 0.02) {
+            terminateRayEXT();
+        } else {
+            ignoreIntersectionEXT();
+        }
+        return;
+    }
+
+    payload.visibility = 0.0;
+    terminateRayEXT();
+}

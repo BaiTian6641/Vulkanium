@@ -1,5 +1,6 @@
 package net.vulkanium.rt;
 
+import net.vulkanium.Vulkanium;
 import net.vulkanium.core.VulkaniumMemory;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.slf4j.Logger;
@@ -146,15 +147,62 @@ public class ShaderBindingTable {
         sbtBuffer = result[0];
         sbtBufferAllocation = result[1];
 
-        // TODO Phase 10: Get device address
-        // VkBufferDeviceAddressInfo addrInfo = ...
-        // sbtBufferDeviceAddress = vkGetBufferDeviceAddress(device, addrInfo)
+        sbtBufferDeviceAddress = queryBufferDeviceAddress(sbtBuffer);
+        if (sbtBufferDeviceAddress == 0) {
+            LOGGER.warn("SBT buffer device address unavailable; ray tracing dispatch will be skipped");
+            ready = false;
+            return;
+        }
 
-        // TODO Phase 10: Copy shader group handles into SBT
-        // 1. int totalGroups = 1 + missShaderCount + hitGroupCount + callableCount;
-        // 2. byte[] handles = new byte[totalGroups * shaderGroupHandleSize];
-        // 3. vkGetRayTracingShaderGroupHandlesKHR(device, rtPipeline, 0, totalGroups, handles);
-        // 4. Map SBT buffer and copy each handle to its aligned region offset
+        int totalGroups = 1 + missShaderCount + hitGroupCount + callableCount;
+        java.nio.ByteBuffer handles = org.lwjgl.BufferUtils.createByteBuffer(totalGroups * shaderGroupHandleSize);
+
+        int res = org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupHandlesKHR(
+                Vulkanium.getVulkanDevice().getLogicalDevice(),
+                rtPipeline,
+                0,
+                totalGroups,
+                handles
+        );
+        if (res != org.lwjgl.vulkan.VK10.VK_SUCCESS) {
+            LOGGER.warn("Failed to fetch RT shader group handles (VkResult {})", res);
+            ready = false;
+            return;
+        }
+
+        java.nio.ByteBuffer mapped = memory.mapBuffer(sbtBufferAllocation);
+        if (mapped == null) {
+            LOGGER.warn("Failed to map SBT buffer for handle upload");
+            ready = false;
+            return;
+        }
+
+        long mappedAddr = org.lwjgl.system.MemoryUtil.memAddress(mapped);
+        long handlesAddr = org.lwjgl.system.MemoryUtil.memAddress(handles);
+
+        // Raygen group at index 0
+        org.lwjgl.system.MemoryUtil.memCopy(handlesAddr, mappedAddr + rayGenOffset, shaderGroupHandleSize);
+
+        int groupIndex = 1;
+        for (int i = 0; i < missShaderCount; i++, groupIndex++) {
+            long dst = mappedAddr + missOffset + (long) i * recordStride;
+            long src = handlesAddr + (long) groupIndex * shaderGroupHandleSize;
+            org.lwjgl.system.MemoryUtil.memCopy(src, dst, shaderGroupHandleSize);
+        }
+
+        for (int i = 0; i < hitGroupCount; i++, groupIndex++) {
+            long dst = mappedAddr + hitOffset + (long) i * recordStride;
+            long src = handlesAddr + (long) groupIndex * shaderGroupHandleSize;
+            org.lwjgl.system.MemoryUtil.memCopy(src, dst, shaderGroupHandleSize);
+        }
+
+        for (int i = 0; i < callableCount; i++, groupIndex++) {
+            long dst = mappedAddr + callableOffset + (long) i * recordStride;
+            long src = handlesAddr + (long) groupIndex * shaderGroupHandleSize;
+            org.lwjgl.system.MemoryUtil.memCopy(src, dst, shaderGroupHandleSize);
+        }
+
+        memory.unmapBuffer(sbtBufferAllocation);
 
         ready = true;
         LOGGER.info("SBT built: {} bytes (raygen: 1, miss: {}, hit: {}, callable: {})",
@@ -197,7 +245,40 @@ public class ShaderBindingTable {
      */
     public void cmdTraceRays(VkCommandBuffer commandBuffer, int width, int height) {
         if (!ready) return;
-        // TODO Phase 10: vkCmdTraceRaysKHR with region addresses from this SBT
+        if (sbtBufferDeviceAddress == 0) {
+            LOGGER.warn("SBT trace skipped: device address is not initialized yet");
+            return;
+        }
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            var raygen = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(getRayGenAddress())
+                .stride(getRayGenStride())
+                .size(getRayGenSize());
+            var miss = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(getMissAddress())
+                .stride(getMissStride())
+                .size(getMissSize());
+            var hit = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(getHitAddress())
+                .stride(getHitStride())
+                .size(getHitSize());
+            var callable = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(getCallableAddress())
+                .stride(getCallableStride())
+                .size(getCallableSize());
+
+            org.lwjgl.vulkan.KHRRayTracingPipeline.vkCmdTraceRaysKHR(
+                commandBuffer,
+                raygen,
+                miss,
+                hit,
+                callable,
+                width,
+                height,
+                1
+            );
+        }
+        LOGGER.debug("SBT vkCmdTraceRaysKHR dispatched at {}x{}", width, height);
     }
 
     // ── Utility ──
@@ -217,8 +298,24 @@ public class ShaderBindingTable {
             memory.freeBuffer(sbtBuffer, sbtBufferAllocation);
             sbtBuffer = 0;
             sbtBufferAllocation = 0;
+            sbtBufferDeviceAddress = 0;
         }
         ready = false;
         LOGGER.info("SBT destroyed");
+    }
+
+    private long queryBufferDeviceAddress(long buffer) {
+        if (buffer == 0 || Vulkanium.getVulkanDevice() == null) {
+            return 0;
+        }
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            var addrInfo = org.lwjgl.vulkan.VkBufferDeviceAddressInfo.calloc(stack)
+                    .sType(org.lwjgl.vulkan.VK12.VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO)
+                    .buffer(buffer);
+            return org.lwjgl.vulkan.VK12.vkGetBufferDeviceAddress(Vulkanium.getVulkanDevice().getLogicalDevice(), addrInfo);
+        } catch (Throwable t) {
+            LOGGER.debug("SBT device address query failed: {}", t.getMessage());
+            return 0;
+        }
     }
 }

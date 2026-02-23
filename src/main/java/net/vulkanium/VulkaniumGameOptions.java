@@ -49,6 +49,10 @@ public class VulkaniumGameOptions {
     // ─── Video ─────────────────────────────────────────────────────────
 
     public static class VideoSettings {
+        /** Primary render mode selector exposed in Video Settings. */
+        @SerializedName("render_mode")
+        public RenderModeSetting renderMode = RenderModeSetting.VANILLA;
+
         /** Frames in flight: 2=double buffer, 3=triple buffer */
         public int framesInFlight = 3;
 
@@ -88,6 +92,39 @@ public class VulkaniumGameOptions {
                     case FIFO -> 2;       // VK_PRESENT_MODE_FIFO_KHR
                     case MAILBOX -> 1;    // VK_PRESENT_MODE_MAILBOX_KHR
                     case IMMEDIATE -> 0;  // VK_PRESENT_MODE_IMMEDIATE_KHR
+                };
+            }
+        }
+
+        public enum RenderModeSetting implements TextProvider {
+            VANILLA("Vanilla"),
+            VANILLA_RT("Vanilla + RT"),
+            SHADERPACK("Shaderpack");
+
+            private final String name;
+
+            RenderModeSetting(String name) {
+                this.name = name;
+            }
+
+            @Override
+            public String getLocalizedName() {
+                return name;
+            }
+
+            public net.vulkanium.render.RenderMode toCoreMode() {
+                return switch (this) {
+                    case VANILLA -> net.vulkanium.render.RenderMode.VANILLA;
+                    case VANILLA_RT -> net.vulkanium.render.RenderMode.VANILLA_RT;
+                    case SHADERPACK -> net.vulkanium.render.RenderMode.SHADERPACK;
+                };
+            }
+
+            public static RenderModeSetting fromCoreMode(net.vulkanium.render.RenderMode mode) {
+                return switch (mode) {
+                    case VANILLA -> VANILLA;
+                    case VANILLA_RT -> VANILLA_RT;
+                    case SHADERPACK -> SHADERPACK;
                 };
             }
         }

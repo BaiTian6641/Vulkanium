@@ -97,6 +97,7 @@ public class AccelerationStructure {
     public BuildQuality getQuality() { return quality; }
     public long getHandle() { return handle; }
     public long getBuffer() { return buffer; }
+    public long getBufferAllocation() { return bufferAllocation; }
     public long getDeviceAddress() { return deviceAddress; }
     public long getSize() { return size; }
     public boolean isDirty() { return dirty; }

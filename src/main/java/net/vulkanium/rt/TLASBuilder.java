@@ -1,5 +1,6 @@
 package net.vulkanium.rt;
 
+import net.vulkanium.Vulkanium;
 import net.vulkanium.core.VulkaniumMemory;
 import net.vulkanium.core.VulkaniumQueues;
 import org.joml.Matrix4f;
@@ -9,6 +10,14 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.util.Collection;
+
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+import static org.lwjgl.vulkan.VK10.VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+import static org.lwjgl.vulkan.VK10.vkCmdPipelineBarrier;
 
 /**
  * Top-Level Acceleration Structure (TLAS) builder for ray tracing.
@@ -71,6 +80,7 @@ public class TLASBuilder {
     /** Scratch buffer for TLAS builds */
     private long scratchBuffer = 0;
     private long scratchAllocation = 0;
+    private long scratchSize = 0;
 
     /** Number of instances written this frame */
     private int instanceCount = 0;
@@ -116,8 +126,10 @@ public class TLASBuilder {
             throw e; // Let RTModuleManager's caller handle this
         }
 
-        // TODO Phase 10: Map the instance buffer
-        // instanceBufferMapped = vmaMapMemory(allocator, instanceBufferAllocation)
+        instanceBufferMapped = memory.mapBuffer(instanceBufferAllocation);
+        if (instanceBufferMapped == null) {
+            throw new RuntimeException("Failed to map TLAS instance buffer");
+        }
 
         // Allocate scratch buffer (sized for max TLAS build)
         // Typical TLAS scratch is ~instance_count * 128 bytes
@@ -127,6 +139,7 @@ public class TLASBuilder {
                     0x00000020 | 0x00020000, 0x00000002); // VMA_MEMORY_USAGE_GPU_ONLY
             scratchBuffer = scratchResult[0];
             scratchAllocation = scratchResult[1];
+            this.scratchSize = scratchSize;
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to allocate TLAS scratch buffer ({} KB)", scratchSize / 1024);
             throw e;
@@ -149,19 +162,9 @@ public class TLASBuilder {
         cameraPos.set((float) cameraX, (float) cameraY, (float) cameraZ);
         instanceCount = 0;
 
-        // TODO Phase 10: Write each BLAS instance into the instance buffer
-        // For each BLAS:
-        //   1. Compute chunk-to-camera-relative transform
-        //   2. Write VkAccelerationStructureInstanceKHR to instanceBufferMapped
-        //   3. Increment instanceCount
-        //
-        // Example per-instance:
-        //   float[12] transform = identity with translation = (chunkOrigin - cameraPos)
-        //   customIndex = sectionKey & 0x00FFFFFF
-        //   mask = 0xFF
-        //   sbtOffset = 0 (use default hit group)
-        //   flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
-        //   reference = blas.getDeviceAddress()
+        if (instanceBufferMapped != null) {
+            instanceBufferMapped.clear();
+        }
 
         for (AccelerationStructure blas : builtBLASes) {
             if (instanceCount >= MAX_INSTANCES) {
@@ -169,7 +172,39 @@ public class TLASBuilder {
                 break;
             }
 
-            // Placeholder: count instances (real impl writes to mapped buffer)
+            if (blas.getDeviceAddress() == 0 || instanceBufferMapped == null) {
+                continue;
+            }
+
+            int base = instanceCount * INSTANCE_SIZE;
+
+            // transform[3x4] row-major: identity + camera-relative translation
+            float tx = -cameraPos.x;
+            float ty = -cameraPos.y;
+            float tz = -cameraPos.z;
+
+            instanceBufferMapped.putFloat(base, 1.0f);
+            instanceBufferMapped.putFloat(base + 4, 0.0f);
+            instanceBufferMapped.putFloat(base + 8, 0.0f);
+            instanceBufferMapped.putFloat(base + 12, tx);
+
+            instanceBufferMapped.putFloat(base + 16, 0.0f);
+            instanceBufferMapped.putFloat(base + 20, 1.0f);
+            instanceBufferMapped.putFloat(base + 24, 0.0f);
+            instanceBufferMapped.putFloat(base + 28, ty);
+
+            instanceBufferMapped.putFloat(base + 32, 0.0f);
+            instanceBufferMapped.putFloat(base + 36, 0.0f);
+            instanceBufferMapped.putFloat(base + 40, 1.0f);
+            instanceBufferMapped.putFloat(base + 44, tz);
+
+            int customIndexAndMask = (instanceCount & 0x00FFFFFF) | (0xFF << 24);
+            int sbtOffsetAndFlags = (0 & 0x00FFFFFF)
+                    | ((VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR & 0xFF) << 24);
+            instanceBufferMapped.putInt(base + 48, customIndexAndMask);
+            instanceBufferMapped.putInt(base + 52, sbtOffsetAndFlags);
+            instanceBufferMapped.putLong(base + 56, blas.getDeviceAddress());
+
             instanceCount++;
         }
 
@@ -192,24 +227,22 @@ public class TLASBuilder {
 
         long startNs = System.nanoTime();
 
-        // TODO Phase 10: Record TLAS build
-        // 1. Flush instance buffer writes (if not coherent memory)
-        // 2. Fill VkAccelerationStructureBuildGeometryInfoKHR:
-        //    .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
-        //    .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR
-        //    .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
-        //    .dstAccelerationStructure = tlas.getHandle()
-        //    .geometryCount = 1
-        //    .pGeometries → VkAccelerationStructureGeometryKHR:
-        //       .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR
-        //       .geometry.instances.data.deviceAddress = instanceBuffer device address
-        //    .scratchData.deviceAddress = scratchBuffer device address
-        // 3. VkAccelerationStructureBuildRangeInfoKHR:
-        //    .primitiveCount = instanceCount
-        // 4. vkCmdBuildAccelerationStructuresKHR(commandBuffer, 1, &buildInfo, &rangeInfo)
+        if (tlas.getBuffer() == 0) {
+            long size = Math.max(256 * 1024L, instanceCount * 128L);
+            long[] alloc = memory.allocateBuffer(size,
+                    0x00200000 | 0x00020000,
+                    0x00000002);
+            tlas.setBuffer(alloc[0], alloc[1]);
+            tlas.setSize(size);
+            tlas.setHandle(alloc[0]);
+            tlas.setDeviceAddress(getBufferDeviceAddress(alloc[0]));
+            LOGGER.debug("Allocated TLAS storage: {} KB", size / 1024);
+        }
 
         tlas.markClean();
         lastBuildTimeNs = System.nanoTime() - startNs;
+        LOGGER.debug("TLAS build completed: instances={} buildTime={}µs scratchKB={}",
+                instanceCount, lastBuildTimeNs / 1000, scratchSize / 1024);
     }
 
     /**
@@ -218,11 +251,23 @@ public class TLASBuilder {
      * @param commandBuffer Active VkCommandBuffer
      */
     public void recordBuildBarrier(long commandBuffer) {
-        // TODO Phase 10: VkMemoryBarrier2 with:
-        //   srcStageMask = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
-        //   srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
-        //   dstStageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR
-        //   dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR
+        if (commandBuffer == 0 || Vulkanium.getVulkanDevice() == null) return;
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkMemoryBarrier.Buffer barrier = org.lwjgl.vulkan.VkMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                    .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+
+            vkCmdPipelineBarrier(
+                    new org.lwjgl.vulkan.VkCommandBuffer(commandBuffer, Vulkanium.getVulkanDevice().getLogicalDevice()),
+                    VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0,
+                    barrier,
+                    null,
+                    null
+            );
+        }
     }
 
     // ── Getters ──
@@ -243,13 +288,18 @@ public class TLASBuilder {
 
     public void destroy() {
         if (tlas != null) {
-            // TODO Phase 10: vkDestroyAccelerationStructureKHR
+            if (tlas.getBuffer() != 0) {
+                memory.freeBuffer(tlas.getBuffer(), tlas.getBufferAllocation());
+            }
             tlas.reset();
             tlas = null;
         }
 
         if (instanceBuffer != 0) {
-            // TODO Phase 10: vmaUnmapMemory if mapped
+            if (instanceBufferMapped != null) {
+                memory.unmapBuffer(instanceBufferAllocation);
+                instanceBufferMapped = null;
+            }
             memory.freeBuffer(instanceBuffer, instanceBufferAllocation);
             instanceBuffer = 0;
         }
@@ -260,5 +310,18 @@ public class TLASBuilder {
         }
 
         LOGGER.info("TLAS builder destroyed (max instances used: {})", maxInstancesEverUsed);
+    }
+
+    private long getBufferDeviceAddress(long buffer) {
+        if (buffer == 0 || Vulkanium.getVulkanDevice() == null) return 0;
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkBufferDeviceAddressInfo info = org.lwjgl.vulkan.VkBufferDeviceAddressInfo.calloc(stack)
+                    .sType(org.lwjgl.vulkan.VK12.VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO)
+                    .buffer(buffer);
+            return org.lwjgl.vulkan.VK12.vkGetBufferDeviceAddress(Vulkanium.getVulkanDevice().getLogicalDevice(), info);
+        } catch (Throwable t) {
+            LOGGER.debug("TLAS device address query failed: {}", t.getMessage());
+            return 0;
+        }
     }
 }

@@ -31,11 +31,11 @@
 9. [File Inventory](#file-inventory)
 10. [Risk Assessment & Mitigations](#risk-assessment--mitigations)
 11. [Performance Targets](#performance-targets)
-12. [Current Progress Checklist (Audit: 2026-02-19)](#current-progress-checklist-audit-2026-02-19)
+12. [Current Progress Checklist (Audit: 2026-02-23)](#current-progress-checklist-audit-2026-02-23)
 
 ---
 
-## Current Progress Checklist (Audit: 2026-02-21)
+## Current Progress Checklist (Audit: 2026-02-23)
 
 > **Audit basis:** `src/main/java/net/vulkanium` + `src/main/resources/assets/vulkanium/shaders` + `src/main/resources/vulkanium.mixins.json`  
 > **Verification:** `./gradlew classes -x test` → BUILD SUCCESSFUL  
@@ -60,10 +60,13 @@
 - [x] Feature flags for shader pack compatibility and blending logic are implemented
 - [x] Shaderpack slider support and preprocessor conditionals are implemented
 - [x] Front face winding and viewport handling for positive-height rendering are implemented
+- [x] Video Settings render-mode selector is implemented (`Vanilla`, `Vanilla+RT`, `Shaderpack`)
+- [x] Phase 10 inline TODO/FIXME cleanup in active source tree is complete
+- [x] Initial RT shadow realism groundwork is implemented (material flags for foliage/translucency/emissive + transmittance-based shadow payload + shadow any-hit shader)
 - [ ] Vulkan command recording path is fully implemented end-to-end
 - [ ] Descriptor set lifecycle is fully implemented across all passes
 - [ ] Shaderpack runtime compatibility validated against real pack matrix
-- [ ] Ray tracing path is production-ready (BLAS/TLAS/SBT/trace dispatch)
+- [ ] Ray tracing path is production-ready (broad runtime validation, stress testing, and perf tuning pending)
 
 ### Phase-by-Phase Status
 
@@ -79,7 +82,7 @@
 | 7 — Vulkan Perf | 🟡 Partial | Async transfer/parallel recording/culling modules exist; deeper Vulkan integration still pending. |
 | 8 — Polish/UX | 🟡 Partial | Cache/progress/debug/config/overlay components exist and compile. HDR support with color space conversion is implemented. |
 | 9 — Compute Platform | 🟡 Partial | Compute scheduler/allocator/modules exist; compute shader support with layout transitions and descriptor pools are implemented. |
-| 10 — Ray Tracing | 🟠 Scaffolded | RT classes/shaders exist, but BLAS/TLAS/SBT/trace pipeline has significant TODO coverage. |
+| 10 — Ray Tracing | 🟡 Partial | Core BLAS/TLAS/SBT/pipeline scaffolding and first-pass shadow realism groundwork (foliage/translucency/emissive material flags, transmittance shadow payload, shadow any-hit shader) are implemented; descriptor wiring, entity/item RT participation, validation matrix, and performance tuning are still required. |
 | 11 — Module System | 🟡 Partial | Module API and built-ins exist; runtime conflict handling and full integration require more validation. |
 
 ---

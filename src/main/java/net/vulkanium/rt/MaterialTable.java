@@ -60,6 +60,9 @@ public class MaterialTable {
     public static final int FLAG_ICE = 16;
     public static final int FLAG_METAL = 32;
     public static final int FLAG_SUBSURFACE = 64;
+        public static final int FLAG_CUTOUT = 128;
+        public static final int FLAG_TRANSLUCENT = 256;
+        public static final int FLAG_FOLIAGE = 512;
 
     /**
      * PBR material definition.
@@ -98,7 +101,11 @@ public class MaterialTable {
         );
 
         public static final Material LEAVES = new Material(
-                0.9f, 0.0f, 0.0f, 1.0f, 0.7f, 0.5f, FLAG_LEAF | FLAG_SUBSURFACE
+                0.9f, 0.0f, 0.0f, 1.0f, 0.7f, 0.5f, FLAG_LEAF | FLAG_SUBSURFACE | FLAG_CUTOUT | FLAG_FOLIAGE
+        );
+
+        public static final Material FOLIAGE_CUTOUT = new Material(
+                0.92f, 0.0f, 0.0f, 1.0f, 0.45f, 0.55f, FLAG_CUTOUT | FLAG_FOLIAGE | FLAG_SUBSURFACE
         );
 
         public static final Material ICE = new Material(
@@ -125,6 +132,8 @@ public class MaterialTable {
         registerMaterial("minecraft:glass", Material.GLASS);
         registerMaterial("minecraft:glass_pane", Material.GLASS);
         registerMaterial("minecraft:white_stained_glass", Material.GLASS);
+        registerMaterial("minecraft:tinted_glass", new Material(
+                0.02f, 0.0f, 0.0f, 1.5f, 0.2f, 0.0f, FLAG_GLASS | FLAG_TRANSLUCENT));
         registerMaterial("minecraft:glowstone", Material.GLOWSTONE);
         registerMaterial("minecraft:sea_lantern", Material.GLOWSTONE);
         registerMaterial("minecraft:shroomlight", Material.GLOWSTONE);
@@ -146,9 +155,44 @@ public class MaterialTable {
             registerMaterial("minecraft:" + type + "_leaves", Material.LEAVES);
         }
 
+                // Grass, crops, and flowers (alpha cutout casters)
+                registerMaterial("minecraft:grass", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:tall_grass", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:fern", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:large_fern", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:vine", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:weeping_vines", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:twisting_vines", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:sugar_cane", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:bamboo", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:dandelion", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:poppy", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:blue_orchid", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:allium", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:azure_bluet", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:red_tulip", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:orange_tulip", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:white_tulip", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:pink_tulip", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:oxeye_daisy", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:cornflower", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:lily_of_the_valley", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:sunflower", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:lilac", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:rose_bush", Material.FOLIAGE_CUTOUT);
+                registerMaterial("minecraft:peony", Material.FOLIAGE_CUTOUT);
+
         // Emissive blocks
         registerMaterial("minecraft:torch", new Material(
                 0.9f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+        registerMaterial("minecraft:lantern", new Material(
+                0.85f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+        registerMaterial("minecraft:soul_lantern", new Material(
+                0.85f, 0.0f, 12.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+        registerMaterial("minecraft:end_rod", new Material(
+                0.7f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+        registerMaterial("minecraft:sea_pickle", new Material(
+                0.7f, 0.0f, 11.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
         registerMaterial("minecraft:lava", new Material(
                 0.95f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
         registerMaterial("minecraft:redstone_lamp", new Material(
@@ -180,8 +224,36 @@ public class MaterialTable {
      * Gets the material ID for a block.
      */
     public int getMaterialId(String blockName) {
-        return nameToId.getOrDefault(blockName, 0);
+                Integer exact = nameToId.get(blockName);
+                if (exact != null) return exact;
+
+                Material inferred = inferMaterial(blockName);
+                if (inferred != null) {
+                        return registerMaterial(blockName, inferred);
+                }
+                return 0;
     }
+
+        private Material inferMaterial(String blockName) {
+                if (blockName == null) return null;
+
+                if (blockName.contains("leaves") || blockName.contains("azalea")) {
+                        return Material.LEAVES;
+                }
+                if (blockName.contains("grass") || blockName.contains("fern") || blockName.contains("flower")
+                                || blockName.contains("tulip") || blockName.contains("daisy") || blockName.contains("vine")
+                                || blockName.contains("crop") || blockName.contains("sapling")) {
+                        return Material.FOLIAGE_CUTOUT;
+                }
+                if (blockName.contains("glass") || blockName.contains("ice") || blockName.contains("water")) {
+                        return new Material(0.03f, 0.0f, 0.0f, 1.4f, 0.35f, 0.0f, FLAG_TRANSLUCENT);
+                }
+                if (blockName.contains("lantern") || blockName.contains("torch") || blockName.contains("shroomlight")
+                                || blockName.contains("glow") || blockName.contains("magma") || blockName.contains("lava")) {
+                        return new Material(0.85f, 0.0f, 12.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE);
+                }
+                return null;
+        }
 
     /**
      * Gets a material by ID.

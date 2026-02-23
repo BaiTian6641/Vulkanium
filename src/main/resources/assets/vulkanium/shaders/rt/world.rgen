@@ -43,7 +43,7 @@ void main() {
 
     traceRayEXT(
         topLevelAS,
-        gl_RayFlagsOpaqueEXT,
+        gl_RayFlagsNoneEXT,
         0xFF,              // cull mask
         0,                 // SBT record offset
         0,                 // SBT record stride

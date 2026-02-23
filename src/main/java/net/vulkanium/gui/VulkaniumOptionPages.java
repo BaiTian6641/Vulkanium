@@ -41,6 +41,18 @@ public class VulkaniumOptionPages {
 
         // Render/simulation distance — bind to vanilla MC options
         groups.add(OptionGroup.createBuilder()
+                .add(OptionImpl.createBuilder(VideoSettings.RenderModeSetting.class, storage)
+                        .setName("Render Mode")
+                        .setTooltip("Select the active render pipeline.\n" +
+                                "• Vanilla — standard Vulkan rasterization\n" +
+                                "• Vanilla + RT — rasterization with built-in RT effects\n" +
+                                "• Shaderpack — external shaderpack pipeline")
+                        .setControl(opt -> new CyclingControl<>(opt, VideoSettings.RenderModeSetting.class))
+                        .setBinding((opts, v) -> opts.video.renderMode = v,
+                                opts -> opts.video.renderMode)
+                        .setImpact(OptionImpact.EXTREME)
+                        .setFlags(OptionFlag.REQUIRES_RENDERER_RELOAD, OptionFlag.REQUIRES_SHADER_RELOAD)
+                        .build())
                 .add(OptionImpl.createBuilder(int.class, storage)
                         .setName("Render Distance")
                         .setTooltip("Controls how far chunks are visible. Higher values require more GPU memory and bandwidth.")

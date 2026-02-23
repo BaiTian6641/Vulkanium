@@ -245,19 +245,115 @@ public class VulkaniumRayTracingPipeline {
         // Clamp recursion depth
         int clampedRecursion = Math.min(maxRecursion, Math.min(maxRayRecursionDepth, MAX_RECURSION_LIMIT));
 
-        // TODO Phase 10: Create RT pipeline
-        // 1. Build VkPipelineShaderStageCreateInfo[] from shader groups
-        // 2. Build VkRayTracingShaderGroupCreateInfoKHR[] from shader groups
-        // 3. VkRayTracingPipelineCreateInfoKHR:
-        //    .stageCount = total stages
-        //    .pStages = stage array
-        //    .groupCount = shaderGroups.size()
-        //    .pGroups = group array
-        //    .maxPipelineRayRecursionDepth = clampedRecursion
-        //    .layout = pipelineLayout
-        // 4. vkCreateRayTracingPipelinesKHR(device, VK_NULL_HANDLE, vkPipelineCache, 1, &createInfo, null, &pipeline)
+        long pipeline = 0;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            java.util.ArrayList<Integer> stageKinds = new java.util.ArrayList<>();
+            java.util.ArrayList<Long> stageModules = new java.util.ArrayList<>();
+            java.util.ArrayList<org.lwjgl.vulkan.VkRayTracingShaderGroupCreateInfoKHR> groupInfos = new java.util.ArrayList<>();
 
-        long pipeline = 0; // Placeholder
+            for (int groupIndex = 0; groupIndex < shaderGroups.size(); groupIndex++) {
+                ShaderGroup group = shaderGroups.get(groupIndex);
+
+                if (group.type() == ShaderGroupType.GENERAL) {
+                    long module = group.generalShader();
+                    if (module == ShaderGroup.SHADER_UNUSED || module == 0) {
+                        LOGGER.warn("RT pipeline '{}' group {} has no general shader module", name, groupIndex);
+                        continue;
+                    }
+
+                    int stage = groupIndex < rayGenCount
+                            ? org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_RAYGEN_BIT_KHR
+                            : (groupIndex < rayGenCount + missCount
+                                ? org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_MISS_BIT_KHR
+                                : org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_CALLABLE_BIT_KHR);
+
+                    int stageIndex = stageModules.size();
+                    stageKinds.add(stage);
+                    stageModules.add(module);
+
+                    groupInfos.add(org.lwjgl.vulkan.VkRayTracingShaderGroupCreateInfoKHR.calloc(stack)
+                            .sType(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR)
+                            .type(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
+                            .generalShader(stageIndex)
+                            .closestHitShader(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR)
+                            .anyHitShader(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR)
+                            .intersectionShader(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR));
+                } else {
+                    int closestHitIndex = org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR;
+                    int anyHitIndex = org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR;
+                    int intersectionIndex = org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR;
+
+                    if (group.closestHitShader() != ShaderGroup.SHADER_UNUSED && group.closestHitShader() != 0) {
+                        closestHitIndex = stageModules.size();
+                        stageKinds.add(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+                        stageModules.add(group.closestHitShader());
+                    }
+                    if (group.anyHitShader() != ShaderGroup.SHADER_UNUSED && group.anyHitShader() != 0) {
+                        anyHitIndex = stageModules.size();
+                        stageKinds.add(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_ANY_HIT_BIT_KHR);
+                        stageModules.add(group.anyHitShader());
+                    }
+                    if (group.intersectionShader() != ShaderGroup.SHADER_UNUSED && group.intersectionShader() != 0) {
+                        intersectionIndex = stageModules.size();
+                        stageKinds.add(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_INTERSECTION_BIT_KHR);
+                        stageModules.add(group.intersectionShader());
+                    }
+
+                    int groupType = group.type() == ShaderGroupType.PROCEDURAL_HIT_GROUP
+                            ? org.lwjgl.vulkan.KHRRayTracingPipeline.VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR
+                            : org.lwjgl.vulkan.KHRRayTracingPipeline.VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+
+                    groupInfos.add(org.lwjgl.vulkan.VkRayTracingShaderGroupCreateInfoKHR.calloc(stack)
+                            .sType(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR)
+                            .type(groupType)
+                            .generalShader(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_UNUSED_KHR)
+                            .closestHitShader(closestHitIndex)
+                            .anyHitShader(anyHitIndex)
+                            .intersectionShader(intersectionIndex));
+                }
+            }
+
+            if (groupInfos.isEmpty() || stageModules.isEmpty()) {
+                LOGGER.warn("RT pipeline '{}' creation skipped: no valid shader stages/groups", name);
+            } else {
+                var stages = org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo.calloc(stageModules.size(), stack);
+                java.nio.ByteBuffer entryName = stack.UTF8("main");
+                for (int i = 0; i < stageModules.size(); i++) {
+                    stages.get(i)
+                            .sType(VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+                            .stage(stageKinds.get(i))
+                            .module(stageModules.get(i))
+                            .pName(entryName);
+                }
+
+                var groups = org.lwjgl.vulkan.VkRayTracingShaderGroupCreateInfoKHR.calloc(groupInfos.size(), stack);
+                for (int i = 0; i < groupInfos.size(); i++) {
+                    groups.get(i).set(groupInfos.get(i));
+                }
+
+                var ci = org.lwjgl.vulkan.VkRayTracingPipelineCreateInfoKHR.calloc(1, stack)
+                        .sType(org.lwjgl.vulkan.KHRRayTracingPipeline.VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR)
+                        .pStages(stages)
+                        .pGroups(groups)
+                        .maxPipelineRayRecursionDepth(clampedRecursion)
+                        .layout(pipelineLayout);
+
+                java.nio.LongBuffer pPipeline = stack.mallocLong(1);
+                int result = org.lwjgl.vulkan.KHRRayTracingPipeline.vkCreateRayTracingPipelinesKHR(
+                        device.getLogicalDevice(),
+                        VK_NULL_HANDLE,
+                        vkPipelineCache,
+                        ci,
+                        null,
+                        pPipeline
+                );
+                if (result == VK_SUCCESS) {
+                    pipeline = pPipeline.get(0);
+                } else {
+                    LOGGER.warn("vkCreateRayTracingPipelinesKHR failed for '{}' (VkResult {})", name, result);
+                }
+            }
+        }
 
         CompiledRTPipeline compiled = new CompiledRTPipeline(
                 pipeline, pipelineLayout, clampedRecursion,
@@ -266,8 +362,9 @@ public class VulkaniumRayTracingPipeline {
         pipelineCache.put(name, compiled);
         activePipelineName = name;
 
-        LOGGER.info("Created RT pipeline '{}': {} groups ({}R/{}M/{}H/{}C), maxRecursion={}",
-                name, shaderGroups.size(), rayGenCount, missCount, hitCount, callableCount, clampedRecursion);
+        LOGGER.info("Created RT pipeline '{}': {} groups ({}R/{}M/{}H/{}C), maxRecursion={}, handle=0x{}",
+            name, shaderGroups.size(), rayGenCount, missCount, hitCount, callableCount,
+            clampedRecursion, Long.toHexString(pipeline));
 
         return compiled;
     }

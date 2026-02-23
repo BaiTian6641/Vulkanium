@@ -38,6 +38,12 @@ public class VulkaniumOptionsScreen {
     public VulkaniumOptionsScreen(VulkaniumGameOptions options) {
         this.options = options;
 
+        VulkaniumConfig config = Vulkanium.getConfig();
+        if (config != null) {
+            this.options.video.renderMode = VulkaniumGameOptions.VideoSettings.RenderModeSetting
+                    .fromCoreMode(config.getRenderMode());
+        }
+
         VulkaniumOptionPages pageBuilder = new VulkaniumOptionPages(options);
         this.pages = pageBuilder.getAllPages();
 
@@ -189,6 +195,9 @@ public class VulkaniumOptionsScreen {
             // Sync GUI options back to the live VulkaniumConfig so runtime reads see the new values
             VulkaniumConfig config = Vulkanium.getConfig();
             if (config != null) {
+                net.vulkanium.render.RenderMode selectedMode = this.options.video.renderMode.toCoreMode();
+                config.setRenderMode(selectedMode);
+
                 config.framesInFlight = this.options.video.framesInFlight;
                 config.presentMode = this.options.video.presentMode.ordinal();
                 config.deviceIndex = this.options.video.deviceIndex;
@@ -209,7 +218,8 @@ public class VulkaniumOptionsScreen {
                 config.gpuTranslucentSort = this.options.performance.gpuTranslucentSort;
                 config.workerThreads = this.options.performance.chunkBuilderThreads;
 
-                config.rayTracingEnabled = this.options.rayTracing.enabled;
+                config.rayTracingEnabled = selectedMode == net.vulkanium.render.RenderMode.VANILLA_RT
+                    && this.options.rayTracing.enabled;
                 config.rayTracingQualityTier = this.options.rayTracing.qualityTier;
                 config.ssaoEnabled = this.options.rayTracing.ssaoEnabled;
                 config.ssaoSamples = this.options.rayTracing.ssaoSamples;
@@ -237,6 +247,8 @@ public class VulkaniumOptionsScreen {
 
                 config.save();
                 LOGGER.info("Synced options to live VulkaniumConfig");
+
+                Vulkanium.setRenderMode(selectedMode);
 
                 // Apply SSAO/RT changes to the live RT renderer immediately
                 net.vulkanium.rt.RayTracingRenderer rtRenderer = Vulkanium.getRTRenderer();

@@ -318,15 +318,25 @@ public class Vulkanium implements ClientModInitializer {
             shaderpackManager.scanForPacks(gameDir.resolve("shaderpacks"));
 
             VulkaniumGameOptions gameOptions = VulkaniumGameOptions.loadFromDisk();
+                net.vulkanium.render.RenderMode optionsRenderMode =
+                    gameOptions.video.renderMode.toCoreMode();
+                if (config.getRenderMode() != optionsRenderMode) {
+                LOGGER.info("Startup render mode mismatch (config={}, options={}) — using options setting",
+                    config.getRenderMode().getDisplayName(), optionsRenderMode.getDisplayName());
+                config.setRenderMode(optionsRenderMode);
+                }
             String configSelected = config.selectedShaderpack == null ? "" : config.selectedShaderpack.trim();
             String optionsSelected = gameOptions.shader.selectedShaderpack == null ? ""
                     : gameOptions.shader.selectedShaderpack.trim();
             boolean configEnabled = config.shaderpackEnabled && !configSelected.isBlank();
             boolean optionsEnabled = gameOptions.shader.enableShaderpack && !optionsSelected.isBlank();
+            boolean modeWantsShaderpack = config.getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK;
 
             String resolvedSelected = "";
             boolean wantsShaderpack = false;
-            if (configEnabled && optionsEnabled) {
+            if (!modeWantsShaderpack) {
+                wantsShaderpack = false;
+            } else if (configEnabled && optionsEnabled) {
                 if (!configSelected.equals(optionsSelected)) {
                     LOGGER.warn(
                             "Shaderpack selection mismatch at startup (config='{}', options='{}'); using options selection",
@@ -546,12 +556,15 @@ public class Vulkanium implements ClientModInitializer {
             rtRenderer.initialize(device, vulkanMemory, spirvCompiler, rtCapabilities,
                     vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
 
-            // Respect config: if RT is disabled, keep renderer initialized but disabled
-            if (!config.rayTracingEnabled) {
+            boolean modeWantsRT = config.getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT;
+
+            // Respect config+mode: if RT is disabled (or mode is not VANILLA_RT), keep renderer initialized but disabled
+            if (!config.rayTracingEnabled || !modeWantsRT) {
                 rtRenderer.setEnabled(false);
                 if (vulkanDevice.isRTExtensionsEnabled()) {
-                    LOGGER.info("RT renderer initialized with hardware RT AVAILABLE but DISABLED by config");
-                    LOGGER.info("  Set rayTracingEnabled=true in vulkanium-options.json to enable");
+                    LOGGER.info("RT renderer initialized with hardware RT AVAILABLE but DISABLED (configEnabled={}, mode={})",
+                            config.rayTracingEnabled,
+                            config.getRenderMode().getDisplayName());
                 } else {
                     LOGGER.info("RT renderer initialized (compute-only, no hardware RT extensions)");
                 }
@@ -712,7 +725,10 @@ public class Vulkanium implements ClientModInitializer {
 
         // ── RT pass: feed chunk meshes to RT pipeline, then dispatch ──
         // Run RT whenever it's enabled in config (SSAO works in any render mode)
-        if (config.rayTracingEnabled && rtRenderer != null && rtRenderer.isEnabled()) {
+        if (getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
+            && config.rayTracingEnabled
+            && rtRenderer != null
+            && rtRenderer.isEnabled()) {
             try {
                 // Feed any newly uploaded terrain meshes to the RT module manager
                 // so it can build BLASes for ray-traced shadow computation
@@ -2349,11 +2365,48 @@ public class Vulkanium implements ClientModInitializer {
 
     /** Set the current rendering mode and save config. */
     public static void setRenderMode(net.vulkanium.render.RenderMode mode) {
-        if (config != null) {
-            config.setRenderMode(mode);
-            config.save();
-            LOGGER.info("Render mode changed to: {}", mode.getDisplayName());
+        if (config == null) return;
+
+        net.vulkanium.render.RenderMode previous = config.getRenderMode();
+        config.setRenderMode(mode);
+
+        if (mode == net.vulkanium.render.RenderMode.VANILLA_RT) {
+            config.rayTracingEnabled = true;
+            if (rtRenderer != null) {
+                rtRenderer.setEnabled(true);
+                rtRenderer.setSSAOEnabled(config.ssaoEnabled);
+                rtRenderer.setAOSamples(config.ssaoSamples);
+            }
+        } else {
+            config.rayTracingEnabled = false;
+            if (rtRenderer != null) {
+                rtRenderer.setEnabled(false);
+            }
         }
+
+        if (mode != net.vulkanium.render.RenderMode.SHADERPACK) {
+            if (shaderpackManager != null && shaderpackManager.isPackLoaded()) {
+                shaderpackManager.unloadPack();
+            }
+            config.shaderpackEnabled = false;
+        }
+
+        try {
+            VulkaniumGameOptions gameOptions = VulkaniumGameOptions.loadFromDisk();
+            gameOptions.video.renderMode = VulkaniumGameOptions.VideoSettings.RenderModeSetting.fromCoreMode(mode);
+            if (mode != net.vulkanium.render.RenderMode.SHADERPACK) {
+                gameOptions.shader.enableShaderpack = false;
+            }
+            VulkaniumGameOptions.writeToDisk(gameOptions);
+        } catch (Exception e) {
+            LOGGER.warn("Failed to persist render mode to game options: {}", e.getMessage());
+        }
+
+        config.save();
+        LOGGER.info("Render mode changed: {} -> {} (RT enabled={})",
+                previous.getDisplayName(),
+                mode.getDisplayName(),
+                config.rayTracingEnabled);
     }
 
     public static VulkaniumInstance getVulkanInstance() {
