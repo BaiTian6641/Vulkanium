@@ -42,6 +42,7 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
     // ── Atmosphere ──
     private float rainStrength = 0;
     private float wetness = 0;
+    private float sunPathRotation = 0.0f;
     private final float[] fogColor = {1, 1, 1, 1};
     private final float[] skyColor = {0.5f, 0.7f, 1.0f};
 
@@ -61,6 +62,7 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
 
     // ── Frame timing ──
     private long lastUpdateNs = System.nanoTime();
+    private float lastLoggedSunPathRotation = Float.NaN;
 
     /**
      * Updates all uniform values from the current MC game state.
@@ -88,6 +90,18 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
         sunAngle = skyAngle < 0.75f ? skyAngle + 0.25f : skyAngle - 0.75f;
         shadowAngle = sunAngle < 0.5f ? sunAngle : sunAngle - 0.5f;
 
+        if (net.vulkanium.Vulkanium.getShaderpackManager() != null
+                && net.vulkanium.Vulkanium.getShaderpackManager().getActivePipeline() instanceof VulkanShaderpackPipeline pipeline) {
+            sunPathRotation = pipeline.getSunPathRotation();
+        } else {
+            sunPathRotation = 0.0f;
+        }
+        if (Float.isNaN(lastLoggedSunPathRotation)
+                || Math.abs(lastLoggedSunPathRotation - sunPathRotation) > 0.001f) {
+            LOGGER.debug("Shaderpack sunPathRotation updated to {} degrees", sunPathRotation);
+            lastLoggedSunPathRotation = sunPathRotation;
+        }
+
         // Camera position
         prevCameraPosition.set(cameraPosition);
         cameraPosition.set(
@@ -108,8 +122,7 @@ public class ShaderpackUniformsImpl implements ShaderpackUniforms {
         // rotateZ(sunPathRotation) * rotateX(skyAngle * 360°)
         Matrix4f celestial = new Matrix4f(modelViewMatrix);
         celestial.rotate((float) Math.toRadians(-90.0f), 0.0f, 1.0f, 0.0f);
-        // sunPathRotation: default 0.0f, TODO: parse from shaderpack properties
-        celestial.rotate((float) Math.toRadians(0.0f), 0.0f, 0.0f, 1.0f);
+        celestial.rotate((float) Math.toRadians(sunPathRotation), 0.0f, 0.0f, 1.0f);
         celestial.rotate((float) Math.toRadians(skyAngle * 360.0f), 1.0f, 0.0f, 0.0f);
 
         org.joml.Vector4f sunVec = new org.joml.Vector4f(0.0f, 100.0f, 0.0f, 0.0f);

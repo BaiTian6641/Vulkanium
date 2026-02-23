@@ -13,7 +13,8 @@
 1. [Vision & Goals](#vision--goals)
 2. [Why VulkanMod Needs Reconstruction](#why-vulkanmod-needs-reconstruction)
 3. [Reference Architecture Analysis](#reference-architecture-analysis)
-4. [Vulkanium Architecture](#vulkanium-architecture)
+4. [Iris ↔ Vulkanium Comparison](#iris-↔-vulkanium-comparison)
+5. [Vulkanium Architecture](#vulkanium-architecture)
 5. [Module Structure](#module-structure)
 6. [Phase Plan](#phase-plan)
    - [Phase 0 — Foundation: Core Vulkan Abstraction](#phase-0--foundation-core-vulkan-abstraction)
@@ -193,6 +194,16 @@ After thorough analysis of VulkanMod's codebase (`/VulkanMod/src/`), these are t
 | Iris Component | Purpose | Vulkanium Integration |
 |---------------|---------|----------------------|
 | `TransformPatcher` (ANTLR4) | AST-based GLSL transformation | Core of the GLSL compatibility layer |
+
+---
+
+## Iris ↔ Vulkanium Comparison
+
+For a more extensive, narrative comparison of functional differences between the original Iris renderer and the Vulkanium project, see [iris-vulkanium-differences.md](iris-vulkanium-differences.md).  
+This companion document covers rendering backend changes, shader compatibility, new Vulkan‑native features, and the high‑level roadmap.
+
+---
+
 | `VulkanRenderingPipeline` | Extracts pack GLSL without GL calls | Direct reuse — pack loading is API-agnostic |
 | `VulkanTerrainPipeline` | Stores transformed terrain GLSL | Feeds into Vulkanium's shader compiler |
 | `IrisPackShaderAdapter` | Maps pack uniforms to UBO members | Data tables reused; regex logic replaced by AST |

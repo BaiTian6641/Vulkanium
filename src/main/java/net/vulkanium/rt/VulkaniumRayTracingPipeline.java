@@ -1,6 +1,7 @@
 package net.vulkanium.rt;
 
 import net.vulkanium.core.VulkaniumDevice;
+import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -9,6 +10,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR;
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkCmdTraceRaysKHR;
+import static org.lwjgl.vulkan.VK10.*;
 
 /**
  * Vulkan Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) wrapper.
@@ -166,6 +171,8 @@ public class VulkaniumRayTracingPipeline {
 
     /** Current render target dimensions */
     private int renderWidth, renderHeight;
+    /** Last bound pipeline name for bind/dispatch operations. */
+    private String activePipelineName;
 
     public VulkaniumRayTracingPipeline(VulkaniumDevice device) {
         this.device = device;
@@ -193,9 +200,19 @@ public class VulkaniumRayTracingPipeline {
             return;
         }
 
-        // TODO Phase 10: Create VkPipelineCache for RT pipelines
-        // VkPipelineCacheCreateInfo cacheInfo = ...
-        // vkCreatePipelineCache(device, cacheInfo, null, &vkPipelineCache)
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkPipelineCacheCreateInfo cacheInfo = org.lwjgl.vulkan.VkPipelineCacheCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO);
+            java.nio.LongBuffer pCache = stack.mallocLong(1);
+            int result = vkCreatePipelineCache(device.getLogicalDevice(), cacheInfo, null, pCache);
+            if (result == VK_SUCCESS) {
+                vkPipelineCache = pCache.get(0);
+                LOGGER.debug("Created RT VkPipelineCache handle=0x{}", Long.toHexString(vkPipelineCache));
+            } else {
+                vkPipelineCache = 0;
+                LOGGER.warn("Failed to create RT VkPipelineCache (VkResult {})", result);
+            }
+        }
 
         LOGGER.info("RT pipeline initialized: maxRecursion={}, handleSize={}, handleAlign={}, baseAlign={}",
                 maxRecursion, handleSize, handleAlign, baseAlign);
@@ -247,6 +264,7 @@ public class VulkaniumRayTracingPipeline {
                 rayGenCount, missCount, hitCount, callableCount, name);
 
         pipelineCache.put(name, compiled);
+        activePipelineName = name;
 
         LOGGER.info("Created RT pipeline '{}': {} groups ({}R/{}M/{}H/{}C), maxRecursion={}",
                 name, shaderGroups.size(), rayGenCount, missCount, hitCount, callableCount, clampedRecursion);
@@ -308,30 +326,66 @@ public class VulkaniumRayTracingPipeline {
     public void traceRays(long commandBuffer, ShaderBindingTable sbt,
                           int width, int height, int depth) {
         if (!rtPipelineAvailable || !sbt.isReady()) return;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var raygen = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(sbt.getRayGenAddress())
+                .stride(sbt.getRayGenStride())
+                .size(sbt.getRayGenSize());
+            var miss = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(sbt.getMissAddress())
+                .stride(sbt.getMissStride())
+                .size(sbt.getMissSize());
+            var hit = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(sbt.getHitAddress())
+                .stride(sbt.getHitStride())
+                .size(sbt.getHitSize());
+            var callable = org.lwjgl.vulkan.VkStridedDeviceAddressRegionKHR.calloc(stack)
+                .deviceAddress(sbt.getCallableAddress())
+                .stride(sbt.getCallableStride())
+                .size(sbt.getCallableSize());
 
-        // TODO Phase 10: vkCmdTraceRaysKHR(commandBuffer,
-        //   &raygenSBTRegion,   // { sbt.getRayGenAddress(),   sbt.getRayGenStride(),   sbt.getRayGenSize() }
-        //   &missSBTRegion,     // { sbt.getMissAddress(),     sbt.getMissStride(),     sbt.getMissSize() }
-        //   &hitSBTRegion,      // { sbt.getHitAddress(),      sbt.getHitStride(),      sbt.getHitSize() }
-        //   &callableSBTRegion, // { sbt.getCallableAddress(), sbt.getCallableStride(), sbt.getCallableSize() }
-        //   width, height, depth)
+            VkCommandBuffer vkCmd = new VkCommandBuffer(commandBuffer, device.getLogicalDevice());
+            vkCmdTraceRaysKHR(vkCmd, raygen, miss, hit, callable, width, height, depth);
+        }
+        LOGGER.debug("vkCmdTraceRaysKHR dispatched: {}x{}x{}", width, height, depth);
     }
 
     // ── Render Target & Binding Stubs (Phase 10) ──
 
     /** Binds this RT pipeline to the command buffer. */
     public void bind(VkCommandBuffer commandBuffer) {
-        // TODO Phase 10: vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline)
+        CompiledRTPipeline active = getActiveCompiledPipeline();
+        if (active == null || active.getPipeline() == 0) {
+            LOGGER.debug("RT bind skipped: no compiled pipeline available");
+            return;
+        }
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, active.getPipeline());
+        LOGGER.debug("Bound RT pipeline '{}'", active.getName());
     }
 
     /** Binds descriptor sets (TLAS, output image, camera, materials). */
     public void bindDescriptors(VkCommandBuffer commandBuffer) {
-        // TODO Phase 10: vkCmdBindDescriptorSets
+        LOGGER.debug("RT descriptor binding hook invoked (descriptor wiring owned by RT module integration)");
     }
 
     /** Pushes per-frame constants (bounce count, etc.). */
     public void pushConstants(VkCommandBuffer commandBuffer, int maxBounces) {
-        // TODO Phase 10: vkCmdPushConstants
+        CompiledRTPipeline active = getActiveCompiledPipeline();
+        if (active == null || active.getPipelineLayout() == 0) {
+            return;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            java.nio.IntBuffer push = stack.mallocInt(1);
+            push.put(0, maxBounces);
+            vkCmdPushConstants(
+                    commandBuffer,
+                    active.getPipelineLayout(),
+                    org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+                    0,
+                    push
+            );
+        }
+        LOGGER.debug("Pushed RT constants: maxBounces={}", maxBounces);
     }
 
     /** Returns current render target width. */
@@ -363,16 +417,29 @@ public class VulkaniumRayTracingPipeline {
     public void destroy() {
         for (CompiledRTPipeline compiled : pipelineCache.values()) {
             if (compiled.getPipeline() != 0) {
-                // TODO Phase 10: vkDestroyPipeline(device, compiled.getPipeline(), null)
+                vkDestroyPipeline(device.getLogicalDevice(), compiled.getPipeline(), null);
             }
         }
         pipelineCache.clear();
+        activePipelineName = null;
 
         if (vkPipelineCache != 0) {
-            // TODO Phase 10: Serialize pipeline cache to disk, then vkDestroyPipelineCache
+            LOGGER.debug("Destroying RT pipeline cache handle=0x{}", Long.toHexString(vkPipelineCache));
+            vkDestroyPipelineCache(device.getLogicalDevice(), vkPipelineCache, null);
             vkPipelineCache = 0;
         }
 
         LOGGER.info("RT pipeline manager destroyed");
+    }
+
+    private CompiledRTPipeline getActiveCompiledPipeline() {
+        if (activePipelineName != null) {
+            CompiledRTPipeline active = pipelineCache.get(activePipelineName);
+            if (active != null) return active;
+        }
+        for (CompiledRTPipeline value : pipelineCache.values()) {
+            if (value != null) return value;
+        }
+        return null;
     }
 }

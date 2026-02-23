@@ -1464,8 +1464,8 @@ public class VulkaniumASTTransformer {
         // that require compareEnable=true, causing a Vulkan validation error.
         // By converting to sampler2D, the shader reads raw depth values and the
         // shadow2D wrapper performs software comparison.
-        // TODO: When per-shader sampler type detection is added, remove this
-        //       blanket conversion and only apply it for non-comparison bindings.
+        // This blanket conversion is intentionally conservative until per-shader
+        // sampler type detection is integrated in the binding pipeline.
         source = source.replace("sampler2DShadow", "sampler2D");
 
         if (!source.contains("shadow2D(") && !source.contains("shadow2DProj(")) {

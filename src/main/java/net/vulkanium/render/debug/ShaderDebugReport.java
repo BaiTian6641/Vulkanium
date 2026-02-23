@@ -1,5 +1,6 @@
 package net.vulkanium.render.debug;
 
+import net.fabricmc.loader.api.FabricLoader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -205,7 +206,12 @@ public class ShaderDebugReport {
     }
 
     private String getVulkaniumVersion() {
-        // TODO: Read from fabric.mod.json or build properties
-        return "0.1.0-alpha";
+        return FabricLoader.getInstance()
+                .getModContainer("vulkanium")
+                .map(c -> c.getMetadata().getVersion().getFriendlyString())
+                .orElseGet(() -> {
+                    String impl = ShaderDebugReport.class.getPackage().getImplementationVersion();
+                    return impl != null ? impl : "unknown";
+                });
     }
 }

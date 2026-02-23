@@ -239,6 +239,8 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
 
     /** Parsed sunPathRotation from shaderpack directives (degrees). */
     private float sunPathRotation = 0.0f;
+    /** True when shader sources indicate sampler2DShadow usage for shadow textures. */
+    private boolean useHardwareShadowCompareSamplers = false;
 
     /** Runtime compatibility pipelines (ProgramId + vertex format key -> BasicPipeline). */
     private final Map<String, BasicPipeline> compatibilityPipelines = new HashMap<>();
@@ -836,6 +838,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         int failed = 0;
         int skipped = 0;
         int total = 0;
+
+        useHardwareShadowCompareSamplers = detectShadowCompareSamplerUsage();
+        LOGGER.info("[COMPILE] Shadow sampler mode: {}",
+            useHardwareShadowCompareSamplers ? "hardware-compare" : "regular depth sampling");
 
         // Count total programs to compile
         for (ProgramId id : programSet.getAllPrograms().keySet()) {
@@ -3251,16 +3257,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                                                        long placeholderSampler) {
         // Bind shadow textures so gbuffers shaders can access them
         if (shadowMap != null && shadowImagesInitialized) {
-            // shadowtex0 — Use regular (non-comparison) sampler by default.
-            // Modern shaderpacks (Complementary, BSL, etc.) declare shadowtex0 as sampler2D
-            // and do manual depth comparison for PCF/soft shadows. Using compareEnable=true
-            // with sampler2D would produce incorrect results (returns 0/1 instead of depth).
-            // Legacy packs using sampler2DShadow + shadow2D() are handled by the injected
-            // shadow2D(sampler2D, vec3) wrapper, which degrades to software comparison.
-            // TODO: Add per-shader sampler type detection to use HW comparison for packs
-            //       that actually declare sampler2DShadow.
             long stView0 = shadowMap.getMainDepthView();
-            long stSamp0 = shadowMap.getMainDepthSampler();
+            long stSamp0 = useHardwareShadowCompareSamplers
+                    ? shadowMap.getMainDepthHwSampler()
+                    : shadowMap.getMainDepthSampler();
             if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex0", stView0, stSamp0);
                 bindSamplerAlias(views, samplers, "shadow", stView0, stSamp0);
@@ -3269,9 +3269,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     imageLayouts[st0Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
                 }
             }
-            // shadowtex1 — also use non-comparison sampler (same reasoning as shadowtex0)
             long stView1 = shadowMap.getNoTranslucentsDepthView();
-            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
+                long stSamp1 = useHardwareShadowCompareSamplers
+                    ? shadowMap.getNoTranslucentsHwSampler()
+                    : shadowMap.getNoTranslucentsDepthSampler();
             if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
                 Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
@@ -3285,5 +3286,29 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         if (noiseImageView != VK_NULL_HANDLE && noiseSampler != VK_NULL_HANDLE) {
             bindSamplerAlias(views, samplers, "noisetex", noiseImageView, noiseSampler);
         }
+    }
+
+    private boolean detectShadowCompareSamplerUsage() {
+        if (programSet == null) {
+            return false;
+        }
+        for (Map.Entry<ProgramId, ProgramSource> entry : programSet.getAllPrograms().entrySet()) {
+            ProgramSource programSource = entry.getValue();
+            if (programSource == null) continue;
+            if (sourceUsesShadowCompareSampler(programSource.vertexSource())
+                    || sourceUsesShadowCompareSampler(programSource.fragmentSource())
+                    || sourceUsesShadowCompareSampler(programSource.geometrySource())) {
+                LOGGER.debug("Detected sampler2DShadow usage in program '{}'", entry.getKey().getSourceName());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean sourceUsesShadowCompareSampler(String source) {
+        if (source == null || source.isBlank()) return false;
+        if (!source.contains("sampler2DShadow")) return false;
+        String lower = source.toLowerCase(Locale.ROOT);
+        return lower.contains("shadowtex") || lower.contains("watershadow") || lower.contains("shadow");
     }
 }

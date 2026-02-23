@@ -16,6 +16,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  */
 @Mixin(value = GL11.class, remap = false)
 public abstract class MixinGL11 {
+    private static boolean loggedReadPixelsUnsupported = false;
 
     @Inject(method = "glEnable", at = @At("HEAD"), cancellable = true, remap = false)
     private static void onGlEnable(int cap, CallbackInfo ci) {
@@ -117,7 +118,13 @@ public abstract class MixinGL11 {
     @Inject(method = "glReadPixels(IIIIIIJ)V", at = @At("HEAD"), cancellable = true, remap = false)
     private static void onGlReadPixels(int x, int y, int width, int height,
                                         int format, int type, long pixels, CallbackInfo ci) {
-        if (Vulkanium.isVulkanReady()) { ci.cancel(); /* TODO: vkCmdCopyImageToBuffer */ }
+        if (Vulkanium.isVulkanReady()) {
+            if (!loggedReadPixelsUnsupported) {
+                Vulkanium.LOGGER.warn("glReadPixels(GL11) intercepted under Vulkan; direct GL readback is unsupported in this path (use screenshot/native image paths)");
+                loggedReadPixelsUnsupported = true;
+            }
+            ci.cancel();
+        }
     }
 
     @Inject(method = "glPolygonOffset", at = @At("HEAD"), cancellable = true, remap = false)

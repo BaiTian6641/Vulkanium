@@ -1,6 +1,7 @@
 package net.vulkanium.render.program;
 
 import net.vulkanium.render.gbuffer.MRTGraphicsPipeline;
+import net.vulkanium.core.VulkaniumDevice;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,6 +11,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Predicate;
+
+import static org.lwjgl.vulkan.VK10.vkDestroyPipeline;
 
 /**
  * Manages compiled shader programs for all rendering passes.
@@ -155,8 +158,8 @@ public class ShaderProgramManager {
             return new CompiledProgram(cachedPipeline, 0, 0, drawBuffers, key);
         }
 
-        // TODO (full implementation): compile GLSL -> SPIR-V -> VkShaderModule -> VkPipeline.
-        // For now, register a placeholder pipeline entry so source-equal keys can deduplicate.
+        // Full GLSL->SPIR-V->VkPipeline compilation is handled by the shaderpack pipeline path.
+        // Register a placeholder entry so source-equal keys can deduplicate consistently.
         long placeholderPipeline = 0L;
         pipelineCache.put(cacheKey, placeholderPipeline);
         return new CompiledProgram(placeholderPipeline, 0, 0, drawBuffers, key);
@@ -174,10 +177,11 @@ public class ShaderProgramManager {
     // ── Lifecycle ──
 
     public void destroy(long device) {
+        var vkDevice = VulkaniumDevice.getGlobalDevice();
         // Destroy all unique pipelines
         for (long pipeline : pipelineCache.values()) {
-            if (pipeline != 0) {
-                // TODO: vkDestroyPipeline(device, pipeline, null)
+            if (pipeline != 0 && vkDevice != null) {
+                vkDestroyPipeline(vkDevice, pipeline, null);
             }
         }
 

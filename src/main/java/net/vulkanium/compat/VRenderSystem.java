@@ -1,6 +1,7 @@
 package net.vulkanium.compat;
 
 import com.mojang.blaze3d.vertex.VertexSorting;
+import net.vulkanium.core.VulkaniumDevice;
 import net.vulkanium.Vulkanium;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryUtil;
@@ -35,8 +36,12 @@ public class VRenderSystem {
     public static long getWindowHandle() { return windowHandle; }
 
     public static int maxSupportedTextureSize() {
-        // TODO: Query VkPhysicalDeviceLimits.maxImageDimension2D
-        return 16384;
+        VulkaniumDevice device = Vulkanium.getVulkanDevice();
+        if (device == null || device.getDeviceProperties() == null) {
+            return 16384;
+        }
+        int max2D = device.getDeviceProperties().limits().maxImageDimension2D();
+        return max2D > 0 ? max2D : 16384;
     }
 
     // ─── Blend State ───────────────────────────────────────────────────

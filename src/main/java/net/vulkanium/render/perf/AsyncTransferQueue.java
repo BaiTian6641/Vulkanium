@@ -219,7 +219,81 @@ public class AsyncTransferQueue {
      */
     public void copyBufferToImage(long srcBuffer, long dstImage,
                                    int width, int height, int format) {
-        // TODO: vkCmdCopyBufferToImage with appropriate image layout transition
+        if (!hasDedicatedTransfer) {
+            return;
+        }
+
+        VkDevice vkDevice = net.vulkanium.core.VulkaniumDevice.getGlobalDevice();
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffers[currentBuffer], vkDevice);
+
+        try (MemoryStack stack = stackPush()) {
+            VkImageMemoryBarrier.Buffer toTransferDst = VkImageMemoryBarrier.calloc(1, stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .srcAccessMask(0)
+                .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(dstImage);
+            toTransferDst.subresourceRange()
+                .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0)
+                .levelCount(1)
+                .baseArrayLayer(0)
+                .layerCount(1);
+
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                null,
+                null,
+                toTransferDst);
+
+            VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack)
+                .bufferOffset(0)
+                .bufferRowLength(0)
+                .bufferImageHeight(0);
+            region.imageSubresource()
+                .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                .mipLevel(0)
+                .baseArrayLayer(0)
+                .layerCount(1);
+            region.imageOffset().set(0, 0, 0);
+            region.imageExtent().set(width, height, 1);
+
+            vkCmdCopyBufferToImage(cmd, srcBuffer, dstImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+
+            VkImageMemoryBarrier.Buffer toShaderRead = VkImageMemoryBarrier.calloc(1, stack)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                .dstAccessMask(VK_ACCESS_SHADER_READ_BIT)
+                .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                .newLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(dstImage);
+            toShaderRead.subresourceRange()
+                .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                .baseMipLevel(0)
+                .levelCount(1)
+                .baseArrayLayer(0)
+                .layerCount(1);
+
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                null,
+                null,
+                toShaderRead);
+        }
+
+        long estimatedBytes = Math.max(1L, (long) width * height * 4L);
+        totalBytesTransferred += estimatedBytes;
+        transfersThisFrame++;
     }
 
     /**

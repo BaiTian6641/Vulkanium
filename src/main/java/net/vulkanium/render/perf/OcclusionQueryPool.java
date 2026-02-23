@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory;
 import java.nio.LongBuffer;
 
 import static org.lwjgl.system.MemoryStack.stackPush;
+import static org.lwjgl.util.vma.Vma.*;
+import static org.lwjgl.vulkan.EXTConditionalRendering.*;
 import static org.lwjgl.vulkan.VK10.*;
 
 /**
@@ -66,6 +68,7 @@ public class OcclusionQueryPool {
     /** Predicate buffer for conditional rendering */
     private long predicateBuffer = VK_NULL_HANDLE;
     private long predicateAllocation = VK_NULL_HANDLE;
+    private long allocatorHandle = VK_NULL_HANDLE;
 
     // ── Stats ──
     private int regionsOccluded = 0;
@@ -82,6 +85,7 @@ public class OcclusionQueryPool {
      * @param conditionalRendering   Whether VK_EXT_conditional_rendering is supported
      */
     public void create(long allocator, boolean conditionalRendering) {
+        this.allocatorHandle = allocator;
         this.hasConditionalRendering = conditionalRendering;
         VkDevice vkDevice = net.vulkanium.core.VulkaniumDevice.getGlobalDevice();
 
@@ -103,10 +107,29 @@ public class OcclusionQueryPool {
         }
 
         if (hasConditionalRendering) {
-            // Predicate buffer: MAX_QUERIES × 8 bytes
-            // Allocated via standard VulkanBuffer mechanism
-            // usage = VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
-            LOGGER.debug("Conditional rendering enabled — predicate buffer allocated");
+            try (MemoryStack stack = stackPush()) {
+                VkBufferCreateInfo bufferCI = VkBufferCreateInfo.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
+                        .size((long) MAX_QUERIES * Long.BYTES)
+                        .usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT)
+                        .sharingMode(VK_SHARING_MODE_EXCLUSIVE);
+
+                org.lwjgl.util.vma.VmaAllocationCreateInfo allocCI =
+                        org.lwjgl.util.vma.VmaAllocationCreateInfo.calloc(stack)
+                                .usage(VMA_MEMORY_USAGE_GPU_ONLY);
+
+                LongBuffer pBuffer = stack.mallocLong(1);
+                var pAllocation = stack.mallocPointer(1);
+                int result = vmaCreateBuffer(allocator, bufferCI, allocCI, pBuffer, pAllocation, null);
+                if (result == VK_SUCCESS) {
+                    predicateBuffer = pBuffer.get(0);
+                    predicateAllocation = pAllocation.get(0);
+                    LOGGER.debug("Conditional rendering enabled — predicate buffer allocated");
+                } else {
+                    hasConditionalRendering = false;
+                    LOGGER.warn("Conditional rendering buffer allocation failed (VkResult {})", result);
+                }
+            }
         }
 
         LOGGER.info("Occlusion query pool created ({} max queries, conditional rendering: {})",
@@ -209,12 +232,16 @@ public class OcclusionQueryPool {
      */
     public void beginConditionalRendering(long commandBuffer, int regionIndex) {
         if (!hasConditionalRendering || predicateBuffer == VK_NULL_HANDLE) return;
-
-        // TODO: VkConditionalRenderingBeginInfoEXT
-        //   .buffer(predicateBuffer)
-        //   .offset(regionIndex * 8L)
-        //   .flags(VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT)
-        // vkCmdBeginConditionalRenderingEXT(commandBuffer, ...)
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+                net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+        try (MemoryStack stack = stackPush()) {
+            VkConditionalRenderingBeginInfoEXT beginInfo = VkConditionalRenderingBeginInfoEXT.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT)
+                    .buffer(predicateBuffer)
+                    .offset((long) regionIndex * Long.BYTES)
+                    .flags(0);
+            vkCmdBeginConditionalRenderingEXT(cmd, beginInfo);
+        }
     }
 
     /**
@@ -222,7 +249,9 @@ public class OcclusionQueryPool {
      */
     public void endConditionalRendering(long commandBuffer) {
         if (!hasConditionalRendering) return;
-        // TODO: vkCmdEndConditionalRenderingEXT(commandBuffer)
+        VkCommandBuffer cmd = new VkCommandBuffer(commandBuffer,
+            net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+        vkCmdEndConditionalRenderingEXT(cmd);
     }
 
     /**
@@ -265,7 +294,11 @@ public class OcclusionQueryPool {
                 queryPools[i] = VK_NULL_HANDLE;
             }
         }
-        // TODO: Destroy predicate buffer via VMA
+        if (predicateBuffer != VK_NULL_HANDLE && predicateAllocation != VK_NULL_HANDLE && allocatorHandle != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(allocatorHandle, predicateBuffer, predicateAllocation);
+            predicateBuffer = VK_NULL_HANDLE;
+            predicateAllocation = VK_NULL_HANDLE;
+        }
         LOGGER.debug("Occlusion query pool destroyed");
     }
 }

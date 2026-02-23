@@ -85,6 +85,7 @@ public class GPUTranslucentSorter {
 
     // ── State ──
     private int sectionCount = 0;
+    private boolean loggedCompositeFallback = false;
 
     public GPUTranslucentSorter(long device) {
         this.device = device;
@@ -290,12 +291,10 @@ public class GPUTranslucentSorter {
      */
     public void compositeWBOIT(long commandBuffer) {
         if (mode != Mode.WBOIT) return;
-
-        // TODO: Fullscreen triangle pass that reads accumulation + revealage
-        // and blends with the opaque scene using the WBOIT formula:
-        //   color = accum.rgb / max(accum.a, 1e-5)
-        //   alpha = 1.0 - revealage
-        //   finalColor = color * alpha + opaqueColor * (1 - alpha)
+        if (!loggedCompositeFallback) {
+            LOGGER.warn("WBOIT composite pass is not yet wired to a fullscreen pipeline; keeping accumulated targets ready");
+            loggedCompositeFallback = true;
+        }
     }
 
     // ── Getters ──
@@ -310,7 +309,7 @@ public class GPUTranslucentSorter {
 
     public void resize(long allocator, int width, int height) {
         if (mode == Mode.WBOIT) {
-            // TODO: Destroy old targets, recreate at new size
+            destroyWBOITTargets(allocator);
             createWBOITTargets(allocator, width, height);
         }
     }
@@ -322,9 +321,44 @@ public class GPUTranslucentSorter {
         if (sortComputePipeline != VK_NULL_HANDLE) vkDestroyPipeline(vkDevice, sortComputePipeline, null);
         if (sortPipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(vkDevice, sortPipelineLayout, null);
 
-        // TODO: Destroy WBOIT images/views via VMA
-        // TODO: Destroy distance/index buffers via VMA
+        destroyWBOITTargets(allocator);
+        destroySortBuffers(allocator);
 
         LOGGER.debug("Translucent sorter destroyed");
+    }
+
+    private void destroyWBOITTargets(long allocator) {
+        VkDevice vkDevice = net.vulkanium.core.VulkaniumDevice.getGlobalDevice();
+        if (accumulationView != VK_NULL_HANDLE) {
+            vkDestroyImageView(vkDevice, accumulationView, null);
+            accumulationView = VK_NULL_HANDLE;
+        }
+        if (revealageView != VK_NULL_HANDLE) {
+            vkDestroyImageView(vkDevice, revealageView, null);
+            revealageView = VK_NULL_HANDLE;
+        }
+        if (accumulationImage != VK_NULL_HANDLE && accumulationAllocation != VK_NULL_HANDLE) {
+            vmaDestroyImage(allocator, accumulationImage, accumulationAllocation);
+            accumulationImage = VK_NULL_HANDLE;
+            accumulationAllocation = VK_NULL_HANDLE;
+        }
+        if (revealageImage != VK_NULL_HANDLE && revealageAllocation != VK_NULL_HANDLE) {
+            vmaDestroyImage(allocator, revealageImage, revealageAllocation);
+            revealageImage = VK_NULL_HANDLE;
+            revealageAllocation = VK_NULL_HANDLE;
+        }
+    }
+
+    private void destroySortBuffers(long allocator) {
+        if (distanceBuffer != VK_NULL_HANDLE && distanceAllocation != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(allocator, distanceBuffer, distanceAllocation);
+            distanceBuffer = VK_NULL_HANDLE;
+            distanceAllocation = VK_NULL_HANDLE;
+        }
+        if (indexBuffer != VK_NULL_HANDLE && indexAllocation != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(allocator, indexBuffer, indexAllocation);
+            indexBuffer = VK_NULL_HANDLE;
+            indexAllocation = VK_NULL_HANDLE;
+        }
     }
 }

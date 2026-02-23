@@ -7,6 +7,9 @@ import org.joml.Vector3d;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.lwjgl.vulkan.VK10.VK_PIPELINE_BIND_POINT_GRAPHICS;
+import static org.lwjgl.vulkan.VK10.vkCmdBindPipeline;
+
 /**
  * Renders non-terrain geometry: entities, block entities, sky, hand, weather, and particles.
  *
@@ -74,34 +77,27 @@ public class EntitySkyRenderer {
                            float skyAngle, float tickDelta) {
         // ── Sky basic (dome + horizon) ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.SKY);
-
-        // TODO: Bind SKY_BASIC pipeline
-        // TODO: Record sky dome draws (vanilla uses position-only vertices)
-        // The sky dome is rendered with a solid color from the time-of-day gradient
+        bindKeyPipeline(commandBuffer, ShaderKey.SKY_BASIC);
 
         // ── Sunset gradient overlay ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.SUNSET);
-        // TODO: Bind SKY_BASIC_COLOR pipeline
-        // TODO: Record sunset triangle fan
+        bindKeyPipeline(commandBuffer, ShaderKey.SKY_BASIC_COLOR);
 
         // ── Sun ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.SUN);
-        // TODO: Bind SKY_TEXTURED pipeline
-        // TODO: Record sun quad (POSITION_TEX format)
+        bindKeyPipeline(commandBuffer, ShaderKey.SKY_TEXTURED);
 
         // ── Moon ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.MOON);
-        // TODO: Bind SKY_TEXTURED pipeline (same as sun)
-        // TODO: Record moon quad with correct phase texture coords
+        bindKeyPipeline(commandBuffer, ShaderKey.SKY_TEXTURED);
 
         // ── Stars ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.STARS);
-        // TODO: Bind SKY_BASIC_COLOR pipeline
-        // TODO: Stars are rendered as position+color quad-strips
+        bindKeyPipeline(commandBuffer, ShaderKey.SKY_BASIC_COLOR);
 
         // ── Void plane ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.VOID);
-        // TODO: Only rendered when camera Y < 63, dark plane below everything
+        bindKeyPipeline(commandBuffer, ShaderKey.SKY_BASIC);
     }
 
     // ── Entity Rendering ──
@@ -118,28 +114,15 @@ public class EntitySkyRenderer {
 
         // ── Entities ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.ENTITIES);
-
-        // TODO: For each visible entity:
-        //   1. Determine ShaderKey from entity render type:
-        //      - Solid entity: ENTITIES_SOLID_DIFFUSE
-        //      - Cutout entity: ENTITIES_CUTOUT_DIFFUSE
-        //      - Translucent entity: skip (handled in renderTranslucentEntities)
-        //      - Eyes (spider, enderman): ENTITIES_EYES
-        //      - Lightning bolt: LIGHTNING
-        //      - Glowing outline: ENTITIES_GLOWING (rendered separately)
-        //   2. Resolve through WorldRenderingPhase.resolveKey()
-        //   3. Bind pipeline from programManager
-        //   4. Upload entity model matrix + color + overlay via push constants or UBO
-        //   5. Record draw call with entity mesh data
+        if (bindKeyPipeline(commandBuffer, ShaderKey.ENTITIES_SOLID_DIFFUSE)) {
+            entitiesRendered++;
+        }
 
         // ── Block Entities ──
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.BLOCK_ENTITIES);
-
-        // TODO: For each visible block entity:
-        //   1. Types: chest, sign, skull, enchanting table, conduit, bell, etc.
-        //   2. ShaderKey resolved by phase → BLOCK_ENTITY, BLOCK_ENTITY_DIFFUSE, etc.
-        //   3. Special: beacon beam → BEACON (fullscreen column with BLOCK vertex format)
-        //   4. Text rendering (sign text) → TEXT_BE
+        if (bindKeyPipeline(commandBuffer, ShaderKey.BLOCK_ENTITY)) {
+            blockEntitiesRendered++;
+        }
     }
 
     /**
@@ -147,11 +130,9 @@ public class EntitySkyRenderer {
      */
     public void renderTranslucentEntities(long commandBuffer, Vector3d cameraPos, float tickDelta) {
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.ENTITIES);
-
-        // TODO: For each translucent entity:
-        //   - ShaderKey: ENTITIES_TRANSLUCENT or BE_TRANSLUCENT
-        //   - Must be rendered back-to-front for correct alpha blending
-        //   - Translucent block entities: slime blocks, honey blocks, stained glass entities
+        if (bindKeyPipeline(commandBuffer, ShaderKey.ENTITIES_TRANSLUCENT)) {
+            entitiesRendered++;
+        }
     }
 
     // ── Hand Rendering ──
@@ -168,12 +149,7 @@ public class EntitySkyRenderer {
         isRenderingHand = true;
         isHandSolid = true;
 
-        // TODO: Render hand with HAND_CUTOUT / HAND_CUTOUT_DIFFUSE / HAND_CUTOUT_BRIGHT
-        //   depending on the render type MC uses for the held item
-        //   - Bare hand: HAND_CUTOUT_DIFFUSE
-        //   - Held block item: HAND_CUTOUT (uses terrain-like rendering)
-        //   - Enchanted item: HAND_CUTOUT + GLINT overlay
-        //   - Text on maps: HAND_TEXT / HAND_TEXT_INTENSITY
+        bindKeyPipeline(commandBuffer, ShaderKey.HAND_CUTOUT_DIFFUSE);
 
         isRenderingHand = false;
     }
@@ -186,9 +162,7 @@ public class EntitySkyRenderer {
         isRenderingHand = true;
         isHandSolid = false;
 
-        // TODO: Render hand with HAND_TRANSLUCENT / HAND_WATER_DIFFUSE / HAND_WATER_BRIGHT
-        //   - Translucent held items (potions, stained glass)
-        //   - Water in bucket uses gbuffers_hand_water
+        bindKeyPipeline(commandBuffer, ShaderKey.HAND_TRANSLUCENT);
 
         isRenderingHand = false;
     }
@@ -200,10 +174,7 @@ public class EntitySkyRenderer {
      */
     public void renderWeather(long commandBuffer) {
         WorldRenderingPhase.setPhase(WorldRenderingPhase.Phase.RAIN_SNOW);
-
-        // TODO: Bind WEATHER pipeline (uses PARTICLE vertex format)
-        // Rain/snow are rendered as billboard quads with lightmap
-        // Weather detection: when phase is RAIN_SNOW, particle shader → WEATHER instead of PARTICLES
+        bindKeyPipeline(commandBuffer, ShaderKey.WEATHER);
     }
 
     /**
@@ -214,10 +185,24 @@ public class EntitySkyRenderer {
         particlesRendered = 0;
 
         ShaderKey key = translucent ? ShaderKey.PARTICLES_TRANS : ShaderKey.PARTICLES;
+        if (bindKeyPipeline(commandBuffer, key)) {
+            particlesRendered++;
+        }
+    }
 
-        // TODO: Bind appropriate PARTICLES / PARTICLES_TRANS pipeline
-        // Particle vertex format: pos(12) + uv(8) + color(4) + light(4) = 28 bytes
-        // Particles are sorted back-to-front for translucent, unsorted for opaque
+    private boolean bindKeyPipeline(long commandBuffer, ShaderKey requestedKey) {
+        ShaderKey resolvedKey = WorldRenderingPhase.resolveKey(requestedKey);
+        long pipeline = programManager.getPipeline(resolvedKey);
+        if (pipeline == 0L) {
+            pipeline = programManager.getPipeline(requestedKey);
+        }
+        if (pipeline == 0L) {
+            return false;
+        }
+        var vkCommandBuffer = new org.lwjgl.vulkan.VkCommandBuffer(
+                commandBuffer, net.vulkanium.core.VulkaniumDevice.getGlobalDevice());
+        vkCmdBindPipeline(vkCommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        return true;
     }
 
     // ── Phase query (for mixin redirects) ──

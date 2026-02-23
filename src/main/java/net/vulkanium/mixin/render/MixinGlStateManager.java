@@ -18,6 +18,8 @@ import com.mojang.blaze3d.platform.GlStateManager;
  */
 @Mixin(GlStateManager.class)
 public abstract class MixinGlStateManager {
+    private static boolean loggedReadPixelsUnsupported = false;
+    private static boolean loggedTexImageUnsupported = false;
 
     // ─── Blend ─────────────────────────────────────────────────────────
 
@@ -380,7 +382,21 @@ public abstract class MixinGlStateManager {
 
     @Inject(method = "_readPixels(IIIIIILjava/nio/ByteBuffer;)V", at = @At("HEAD"), cancellable = true)
     private static void onReadPixelsBuf(int x, int y, int width, int height, int format, int type, java.nio.ByteBuffer pixels, CallbackInfo ci) {
-        if (Vulkanium.isVulkanReady()) { ci.cancel(); /* TODO: vkCmdCopyImageToBuffer */ }
+        if (Vulkanium.isVulkanReady()) {
+            if (pixels != null) {
+                pixels.clear();
+                int fill = Math.min(pixels.remaining(), Math.max(0, width * height * 4));
+                for (int i = 0; i < fill; i++) {
+                    pixels.put((byte) 0);
+                }
+                pixels.flip();
+            }
+            if (!loggedReadPixelsUnsupported) {
+                Vulkanium.LOGGER.warn("GlStateManager._readPixels(ByteBuffer) intercepted in Vulkan mode; returning zeroed fallback buffer");
+                loggedReadPixelsUnsupported = true;
+            }
+            ci.cancel();
+        }
     }
 
     @Inject(method = "_readPixels(IIIIIIJ)V", at = @At("HEAD"), cancellable = true)
@@ -682,7 +698,13 @@ public abstract class MixinGlStateManager {
 
     @Inject(method = "_getTexImage", at = @At("HEAD"), cancellable = true)
     private static void onGetTexImage(int target, int level, int format, int type, long pixels, CallbackInfo ci) {
-        if (Vulkanium.isVulkanReady()) { ci.cancel(); /* TODO: vkCmdCopyImageToBuffer */ }
+        if (Vulkanium.isVulkanReady()) {
+            if (!loggedTexImageUnsupported) {
+                Vulkanium.LOGGER.warn("GlStateManager._getTexImage intercepted in Vulkan mode; direct GL texture readback is unsupported in this path");
+                loggedTexImageUnsupported = true;
+            }
+            ci.cancel();
+        }
     }
 
     @Inject(method = "upload", at = @At("HEAD"), cancellable = true)

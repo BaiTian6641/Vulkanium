@@ -168,7 +168,23 @@ public class RTModuleManager {
         // dstStage: VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
         // srcAccess: VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
         // dstAccess: VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
-        // TODO: vkCmdPipelineBarrier2 with KHR sync2
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            VkMemoryBarrier.Buffer barrier = VkMemoryBarrier.calloc(1, stack)
+                    .sType(org.lwjgl.vulkan.VK10.VK_STRUCTURE_TYPE_MEMORY_BARRIER)
+                    .srcAccessMask(org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                    .dstAccessMask(org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+
+            org.lwjgl.vulkan.VK10.vkCmdPipelineBarrier(
+                    commandBuffer,
+                    org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                    org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0,
+                    barrier,
+                    null,
+                    null
+            );
+        }
+        LOGGER.debug("Inserted AS->RT pipeline barrier for frame dispatch");
     }
 
     // ── Configuration ──

@@ -164,9 +164,6 @@ public class ChunkUploadManager {
      * truly asynchronous uploads.</p>
      */
     private void uploadBuffer(ByteBuffer srcData, long dstBuffer, long dstOffset) {
-        // TODO: Phase 7 — Use dedicated transfer queue for truly async upload
-        // Current path: staging ring copy (still fast, but stalls graphics queue briefly)
-
         long size = srcData.remaining();
         StagingRing.StagingRegion region = stagingRing.claim(size, 16);
         if (region == null) {
@@ -175,11 +172,22 @@ public class ChunkUploadManager {
         org.lwjgl.system.MemoryUtil.memCopy(
                 org.lwjgl.system.MemoryUtil.memAddress(srcData), region.hostPtr(), size);
 
-        // Record copy command (will be part of the current frame's command buffer)
-        // The actual vkCmdCopyBuffer is recorded during the frame's command recording phase
-        // For now, track the pending copy
-        pendingCopies.add(new CopyRecord(stagingRing.getBuffer(), region.offset(),
-                dstBuffer, dstOffset, size));
+        if (queues.getIndices().hasDedicatedTransfer()) {
+            org.lwjgl.vulkan.VkCommandBuffer transferCmd =
+                queues.beginSingleTimeCommand(queues.getTransferCommandPool());
+            try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            org.lwjgl.vulkan.VkBufferCopy.Buffer copyRegion = org.lwjgl.vulkan.VkBufferCopy.calloc(1, stack)
+                .srcOffset(region.offset())
+                .dstOffset(dstOffset)
+                .size(size);
+            org.lwjgl.vulkan.VK10.vkCmdCopyBuffer(transferCmd, stagingRing.getBuffer(), dstBuffer, copyRegion);
+            }
+            queues.endSingleTimeCommand(transferCmd, queues.getTransferQueue(), queues.getTransferCommandPool());
+            return;
+        }
+
+        pendingCopies.add(new CopyRecord(
+            stagingRing.getBuffer(), region.offset(), dstBuffer, dstOffset, size));
     }
 
     /** Pending buffer copy operations to be recorded in the command buffer. */
