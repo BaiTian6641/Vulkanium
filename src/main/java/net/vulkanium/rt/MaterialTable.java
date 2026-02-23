@@ -3,8 +3,17 @@ package net.vulkanium.rt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.server.packs.resources.ResourceManager;
+
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Block material property table for ray tracing.
@@ -285,6 +294,148 @@ public class MaterialTable {
 
         return buffer.array();
     }
+
+        /**
+         * Applies native LabPBR overrides by sampling resource-pack `_s` and `_n` textures.
+         *
+         * <p>For each known block material entry, attempts to load:
+         * {@code textures/block/<block_name>_s.png} and {@code textures/block/<block_name>_n.png}.
+         * If present, channels are decoded according to LabPBR and override roughness,
+         * metallic, emission, ior, and subsurface behavior.</p>
+         */
+        public void applyLabPbrOverrides(ResourceManager resourceManager) {
+                if (resourceManager == null) {
+                        return;
+                }
+
+                int updated = 0;
+                int specularHits = 0;
+                int normalHits = 0;
+
+                for (Map.Entry<String, Integer> entry : nameToId.entrySet()) {
+                        String blockName = entry.getKey();
+                        int id = entry.getValue();
+                        if (id < 0 || id >= MAX_MATERIALS) continue;
+
+                        TextureAverages specAvg = loadTextureAverages(resourceManager, blockName, "_s");
+                        TextureAverages normalAvg = loadTextureAverages(resourceManager, blockName, "_n");
+
+                        if (specAvg == null && normalAvg == null) continue;
+
+                        Material base = materials[id];
+                        float roughness = base.roughness();
+                        float metallic = base.metallic();
+                        float emission = base.emission();
+                        float ior = base.ior();
+                        float opacity = base.opacity();
+                        float subsurface = base.subsurface();
+                        int flags = base.flags();
+
+                        if (specAvg != null) {
+                                specularHits++;
+                                LabPBRMaterialStandard.DecodedSpecular spec = LabPBRMaterialStandard.decodeSpecular(
+                                                specAvg.r(), specAvg.g(), specAvg.b(), specAvg.a());
+
+                                roughness = spec.roughness();
+                                metallic = Math.max(metallic, spec.metallic());
+                                ior = Math.max(1.0f, spec.ior());
+                                emission = Math.max(emission, spec.emissive() * 15.0f);
+                                subsurface = Math.max(subsurface, spec.subsurface());
+
+                                if (spec.emissive() > 0.02f) flags |= FLAG_EMISSIVE;
+                                if (spec.metallic() > 0.5f) flags |= FLAG_METAL;
+                                if (spec.subsurface() > 0.02f) flags |= FLAG_SUBSURFACE;
+                                if (spec.hardcodedMetal()) flags |= FLAG_METAL;
+                                if (spec.porosity() > 0.4f) {
+                                        opacity = Math.max(0.2f, opacity - 0.15f);
+                                }
+                        }
+
+                        if (normalAvg != null) {
+                                normalHits++;
+                                LabPBRMaterialStandard.DecodedNormal normal = LabPBRMaterialStandard.decodeNormal(
+                                                normalAvg.r(), normalAvg.g(), normalAvg.b(), normalAvg.a());
+
+                                subsurface = Math.max(subsurface, (1.0f - normal.ambientOcclusion()) * 0.35f);
+                                roughness = Math.max(0.02f, roughness * (0.85f + normal.height() * 0.3f));
+                        }
+
+                        materials[id] = new Material(roughness, metallic, emission, ior, opacity, subsurface, flags);
+                        updated++;
+                }
+
+                LOGGER.info("Applied LabPBR overrides: {} materials updated (specular={}, normal={})",
+                                updated, specularHits, normalHits);
+        }
+
+        private TextureAverages loadTextureAverages(ResourceManager resourceManager, String blockName, String suffix) {
+                ResourceLocation textureLocation = toLabPbrTextureLocation(blockName, suffix);
+                if (textureLocation == null) return null;
+
+                Optional<Resource> resource = resourceManager.getResource(textureLocation);
+                if (resource.isEmpty()) return null;
+
+                try (var input = resource.get().open()) {
+                        BufferedImage image = ImageIO.read(input);
+                        if (image == null) return null;
+                        return averageRgba(image);
+                } catch (IOException e) {
+                        LOGGER.debug("Failed to read LabPBR texture {}: {}", textureLocation, e.getMessage());
+                        return null;
+                }
+        }
+
+        private ResourceLocation toLabPbrTextureLocation(String blockName, String suffix) {
+                if (blockName == null || blockName.isBlank()) return null;
+                String namespace = "minecraft";
+                String path = blockName;
+                int split = blockName.indexOf(':');
+                if (split >= 0 && split + 1 < blockName.length()) {
+                        namespace = blockName.substring(0, split);
+                        path = blockName.substring(split + 1);
+                }
+                String safeNamespace = Objects.requireNonNull(namespace, "namespace");
+                String safePath = Objects.requireNonNull(path, "path");
+                return new ResourceLocation(safeNamespace, "textures/block/" + safePath + suffix + ".png");
+        }
+
+        private TextureAverages averageRgba(BufferedImage image) {
+                long sr = 0;
+                long sg = 0;
+                long sb = 0;
+                long sa = 0;
+                long count = 0;
+
+                int w = image.getWidth();
+                int h = image.getHeight();
+                for (int y = 0; y < h; y++) {
+                        for (int x = 0; x < w; x++) {
+                                int argb = image.getRGB(x, y);
+                                int a = (argb >>> 24) & 0xFF;
+                                int r = (argb >>> 16) & 0xFF;
+                                int g = (argb >>> 8) & 0xFF;
+                                int b = argb & 0xFF;
+
+                                if (a == 0) continue;
+
+                                sr += r;
+                                sg += g;
+                                sb += b;
+                                sa += a;
+                                count++;
+                        }
+                }
+
+                if (count == 0) return null;
+                return new TextureAverages(
+                                (int) (sr / count),
+                                (int) (sg / count),
+                                (int) (sb / count),
+                                (int) (sa / count)
+                );
+        }
+
+        private record TextureAverages(int r, int g, int b, int a) {}
 
     public int getMaterialCount() { return nextId; }
 }

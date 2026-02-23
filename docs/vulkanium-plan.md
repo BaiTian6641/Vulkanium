@@ -63,6 +63,7 @@
 - [x] Video Settings render-mode selector is implemented (`Vanilla`, `Vanilla+RT`, `Shaderpack`)
 - [x] Phase 10 inline TODO/FIXME cleanup in active source tree is complete
 - [x] Initial RT shadow realism groundwork is implemented (material flags for foliage/translucency/emissive + transmittance-based shadow payload + shadow any-hit shader)
+- [x] Native LabPBR decode and RT material override pass are implemented (`_s`/`_n` channel decoding into roughness/metallic/ior/subsurface/emissive)
 - [ ] Vulkan command recording path is fully implemented end-to-end
 - [ ] Descriptor set lifecycle is fully implemented across all passes
 - [ ] Shaderpack runtime compatibility validated against real pack matrix
@@ -82,7 +83,7 @@
 | 7 — Vulkan Perf | 🟡 Partial | Async transfer/parallel recording/culling modules exist; deeper Vulkan integration still pending. |
 | 8 — Polish/UX | 🟡 Partial | Cache/progress/debug/config/overlay components exist and compile. HDR support with color space conversion is implemented. |
 | 9 — Compute Platform | 🟡 Partial | Compute scheduler/allocator/modules exist; compute shader support with layout transitions and descriptor pools are implemented. |
-| 10 — Ray Tracing | 🟡 Partial | Core BLAS/TLAS/SBT/pipeline scaffolding and first-pass shadow realism groundwork (foliage/translucency/emissive material flags, transmittance shadow payload, shadow any-hit shader) are implemented; descriptor wiring, entity/item RT participation, validation matrix, and performance tuning are still required. |
+| 10 — Ray Tracing | 🟡 Partial | Core BLAS/TLAS/SBT/pipeline scaffolding, first-pass shadow realism groundwork (foliage/translucency/emissive material flags, transmittance shadow payload, shadow any-hit shader), and native LabPBR decode + material override pass are implemented; descriptor wiring, entity/item RT participation, validation matrix, and performance tuning are still required. |
 | 11 — Module System | 🟡 Partial | Module API and built-ins exist; runtime conflict handling and full integration require more validation. |
 
 ---

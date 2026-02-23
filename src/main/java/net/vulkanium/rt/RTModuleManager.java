@@ -40,7 +40,6 @@ public class RTModuleManager {
 
     private final VulkaniumDevice vulkaniumDevice;
     private final VulkaniumMemory memory;
-    private final VulkaniumQueues queues;
 
     // Sub-managers
     private final BLASManager blasManager;
@@ -67,7 +66,6 @@ public class RTModuleManager {
                             VulkaniumQueues queues, RTCapabilities capabilities) {
         this.vulkaniumDevice = device;
         this.memory = memory;
-        this.queues = queues;
         this.capabilities = capabilities;
 
         this.blasManager = new BLASManager(memory, queues);
@@ -90,6 +88,14 @@ public class RTModuleManager {
 
         materialTable = new MaterialTable();
         materialTable.buildDefaultTable();
+        try {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            if (mc != null && mc.getResourceManager() != null) {
+                materialTable.applyLabPbrOverrides(mc.getResourceManager());
+            }
+        } catch (Throwable t) {
+            LOGGER.debug("LabPBR material override pass skipped: {}", t.getMessage());
+        }
 
         // Create RT pipeline and SBT
         rtPipeline.initialize(capabilities.hasRayTracingPipeline(),

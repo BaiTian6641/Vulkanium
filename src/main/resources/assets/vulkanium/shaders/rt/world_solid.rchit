@@ -69,6 +69,32 @@ float hash13(vec3 p) {
     return fract((p.x + p.y) * p.z);
 }
 
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+float distributionGGX(vec3 N, vec3 H, float roughness) {
+    float a = max(0.03, roughness * roughness);
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float NdotH2 = NdotH * NdotH;
+
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    return a2 / max(3.14159265359 * denom * denom, 1e-4);
+}
+
+float geometrySchlickGGX(float NdotV, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return NdotV / max(NdotV * (1.0 - k) + k, 1e-4);
+}
+
+float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+    float ggx1 = geometrySchlickGGX(max(dot(N, V), 0.0), roughness);
+    float ggx2 = geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
+    return ggx1 * ggx2;
+}
+
 float traceShadowVisibility(vec3 hitPos, vec3 normal, vec3 sunDir, float penumbraRadius) {
     const int SHADOW_SAMPLES = 4;
     vec3 up = abs(normal.y) < 0.95 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
@@ -140,7 +166,32 @@ void main() {
         shadowFactor = mix(shadowFactor, 1.0, 0.2 * mat.subsurface);
     }
 
-    vec3 directLight = albedo * NdotL * shadowFactor;
+    vec3 V = normalize(camera.cameraPosition - hitPos);
+    vec3 L = sunDir;
+    vec3 H = normalize(V + L);
+
+    float NdotV = max(dot(normal, V), 0.0);
+    float NdotH = max(dot(normal, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    float roughness = clamp(mat.roughness, 0.03, 1.0);
+    float metallic = clamp(mat.metallic, 0.0, 1.0);
+    float iorF0 = pow((max(mat.ior, 1.0) - 1.0) / max(max(mat.ior, 1.0) + 1.0, 1e-4), 2.0);
+    vec3 F0 = mix(vec3(clamp(iorF0, 0.02, 0.9)), albedo, metallic);
+
+    float D = distributionGGX(normal, H, roughness);
+    float G = geometrySmith(normal, V, L, roughness);
+    vec3 F = fresnelSchlick(VdotH, F0);
+
+    vec3 numerator = D * G * F;
+    float denominator = max(4.0 * NdotV * NdotL, 1e-4);
+    vec3 specular = numerator / denominator;
+
+    vec3 kS = F;
+    vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
+
+    vec3 sunRadiance = vec3(1.0, 0.98, 0.92) * 3.0;
+    vec3 directLight = (kD * albedo / 3.14159265359 + specular) * sunRadiance * NdotL * shadowFactor;
 
     // Ambient approximation + sky contribution
     float skyFactor = max(dot(normal, vec3(0.0, 1.0, 0.0)), 0.0);
