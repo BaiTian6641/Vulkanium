@@ -1,7 +1,5 @@
 package net.vulkanium.rt;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Vulkan acceleration structure wrapper — the fundamental data structure for ray tracing.
@@ -48,8 +46,6 @@ import org.slf4j.LoggerFactory;
  * </ul>
  */
 public class AccelerationStructure {
-    private static final Logger LOGGER = LoggerFactory.getLogger("Vulkanium/AccelStruct");
-
     /** Acceleration structure types */
     public enum Type {
         BOTTOM_LEVEL, // BLAS — per-chunk geometry
@@ -86,6 +82,12 @@ public class AccelerationStructure {
     /** Geometry/instance count (for diagnostics) */
     private int primitiveCount = 0;
 
+    /** Instance custom index used by hit shaders (material/entity class id). */
+    private int instanceCustomIndex = 0;
+
+    /** Instance SBT hit-group offset. */
+    private int instanceSbtOffset = 0;
+
     public AccelerationStructure(Type type, BuildQuality quality) {
         this.type = type;
         this.quality = quality;
@@ -102,6 +104,8 @@ public class AccelerationStructure {
     public long getSize() { return size; }
     public boolean isDirty() { return dirty; }
     public int getPrimitiveCount() { return primitiveCount; }
+    public int getInstanceCustomIndex() { return instanceCustomIndex; }
+    public int getInstanceSbtOffset() { return instanceSbtOffset; }
 
     // ── State management ──
 
@@ -115,6 +119,8 @@ public class AccelerationStructure {
     public void markDirty() { this.dirty = true; }
     public void markClean() { this.dirty = false; }
     public void setPrimitiveCount(int count) { this.primitiveCount = count; }
+    public void setInstanceCustomIndex(int index) { this.instanceCustomIndex = index & 0x00FFFFFF; }
+    public void setInstanceSbtOffset(int offset) { this.instanceSbtOffset = offset & 0x00FFFFFF; }
 
     /**
      * Returns whether this acceleration structure has been built.
@@ -135,6 +141,8 @@ public class AccelerationStructure {
         size = 0;
         dirty = true;
         primitiveCount = 0;
+        instanceCustomIndex = 0;
+        instanceSbtOffset = 0;
     }
 
     @Override

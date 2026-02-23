@@ -1,16 +1,13 @@
 package net.vulkanium.render.pipeline;
 
-import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexFormatElement;
-import net.vulkanium.Vulkanium;
 import net.vulkanium.resource.SPIRVCompiler;
 import org.lwjgl.vulkan.VkDevice;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -37,10 +34,21 @@ public class PipelineRegistry {
      */
     public BasicPipeline getPipeline(VertexFormat format) {
         String key = formatKey(format);
-        return pipelines.computeIfAbsent(key, k -> createPipeline(format, k));
+        return pipelines.computeIfAbsent(key, k -> createPipeline(format, k, false));
     }
 
-    private BasicPipeline createPipeline(VertexFormat format, String key) {
+    /**
+     * Gets or creates a dedicated UI pipeline for the given vertex format.
+     *
+     * <p>UI draws are isolated from world pipeline selection so GUI/HUD passes
+     * do not inherit world-specific compatibility behavior.</p>
+     */
+    public BasicPipeline getUiPipeline(VertexFormat format) {
+        String key = "ui::" + formatKey(format);
+        return pipelines.computeIfAbsent(key, k -> createPipeline(format, k, true));
+    }
+
+    private BasicPipeline createPipeline(VertexFormat format, String key, boolean uiPipeline) {
         // Determine which shader combo to use based on format elements.
         // CRITICAL: Distinguish UV0 (texture coords) from UV2 (lightmap).
         // Clouds have POSITION_TEX_COLOR_NORMAL (UV0 but NO UV2), while terrain blocks
@@ -57,6 +65,9 @@ public class PipelineRegistry {
                 }
                 case COLOR -> hasColor = true;
                 case NORMAL -> hasNormal = true;
+                case PADDING, GENERIC -> {
+                    // Not used for pipeline selection.
+                }
             }
         }
 
@@ -66,30 +77,31 @@ public class PipelineRegistry {
         if (hasUV0 && hasColor && hasNormal && hasUV2) {
             // Full block format: position + tex + color + lightmap + normal
             // Used for terrain chunks and block models with lightmap data
-            name = "block";
+            name = uiPipeline ? "block_ui" : "block";
             vertSrc = BLOCK_VERT;
             fragSrc = BLOCK_FRAG;
         } else if (hasUV0 && hasColor) {
             // Clouds (POSITION_TEX_COLOR_NORMAL), GUI elements, etc.
             // NO lightmap (UV2), so don't use block shader which reads UV2
-            name = "position_tex_color";
+            name = uiPipeline ? "position_tex_color_ui" : "position_tex_color";
             vertSrc = POSITION_TEX_COLOR_VERT;
             fragSrc = POSITION_TEX_COLOR_FRAG;
         } else if (hasUV0) {
-            name = "position_tex";
+            name = uiPipeline ? "position_tex_ui" : "position_tex";
             vertSrc = POSITION_TEX_VERT;
             fragSrc = POSITION_TEX_FRAG;
         } else if (hasColor) {
-            name = "position_color";
+            name = uiPipeline ? "position_color_ui" : "position_color";
             vertSrc = POSITION_COLOR_VERT;
             fragSrc = POSITION_COLOR_FRAG;
         } else {
-            name = "position_only";
+            name = uiPipeline ? "position_only_ui" : "position_only";
             vertSrc = POSITION_ONLY_VERT;
             fragSrc = POSITION_ONLY_FRAG;
         }
 
-        LOGGER.info("Creating pipeline '{}' for format key '{}' (pos={} uv0={} uv2={} col={} norm={})",
+        LOGGER.info("Creating {}pipeline '{}' for format key '{}' (pos={} uv0={} uv2={} col={} norm={})",
+                uiPipeline ? "UI " : "",
                 name, key, hasPosition, hasUV0, hasUV2, hasColor, hasNormal);
 
         ByteBuffer vertSpirv = compiler.compileVertex(vertSrc, name + ".vert");

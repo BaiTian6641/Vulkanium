@@ -3,7 +3,6 @@ package net.vulkanium.rt;
 import net.vulkanium.Vulkanium;
 import net.vulkanium.core.VulkaniumMemory;
 import net.vulkanium.core.VulkaniumQueues;
-import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,7 +63,6 @@ public class TLASBuilder {
 
     // ── State ──
     private final VulkaniumMemory memory;
-    private final VulkaniumQueues queues;
 
     /** The TLAS acceleration structure */
     private AccelerationStructure tlas;
@@ -88,16 +86,12 @@ public class TLASBuilder {
     /** Camera position (instances are relative to camera for precision) */
     private final Vector3f cameraPos = new Vector3f();
 
-    /** Temp matrix for per-instance transform computation */
-    private final Matrix4f tempTransform = new Matrix4f();
-
     /** Statistics */
     private long lastBuildTimeNs = 0;
     private int maxInstancesEverUsed = 0;
 
     public TLASBuilder(VulkaniumMemory memory, VulkaniumQueues queues) {
         this.memory = memory;
-        this.queues = queues;
     }
 
     /**
@@ -198,8 +192,10 @@ public class TLASBuilder {
             instanceBufferMapped.putFloat(base + 40, 1.0f);
             instanceBufferMapped.putFloat(base + 44, tz);
 
-            int customIndexAndMask = (instanceCount & 0x00FFFFFF) | (0xFF << 24);
-            int sbtOffsetAndFlags = (0 & 0x00FFFFFF)
+                int customIndex = blas.getInstanceCustomIndex() & 0x00FFFFFF;
+                int sbtOffset = blas.getInstanceSbtOffset() & 0x00FFFFFF;
+                int customIndexAndMask = customIndex | (0xFF << 24);
+                int sbtOffsetAndFlags = sbtOffset
                     | ((VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR & 0xFF) << 24);
             instanceBufferMapped.putInt(base + 48, customIndexAndMask);
             instanceBufferMapped.putInt(base + 52, sbtOffsetAndFlags);

@@ -27,6 +27,10 @@ struct Material {
     float ior;
     float opacity;
     float subsurface;
+    float reflectanceF0;
+    float porosity;
+    float ambientOcclusion;
+    float height;
     uint flags;
     uint padding;
 };
@@ -177,7 +181,8 @@ void main() {
     float roughness = clamp(mat.roughness, 0.03, 1.0);
     float metallic = clamp(mat.metallic, 0.0, 1.0);
     float iorF0 = pow((max(mat.ior, 1.0) - 1.0) / max(max(mat.ior, 1.0) + 1.0, 1e-4), 2.0);
-    vec3 F0 = mix(vec3(clamp(iorF0, 0.02, 0.9)), albedo, metallic);
+    float materialF0 = max(mat.reflectanceF0, iorF0);
+    vec3 F0 = mix(vec3(clamp(materialF0, 0.02, 0.95)), albedo, metallic);
 
     float D = distributionGGX(normal, H, roughness);
     float G = geometrySmith(normal, V, L, roughness);
@@ -191,11 +196,12 @@ void main() {
     vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
 
     vec3 sunRadiance = vec3(1.0, 0.98, 0.92) * 3.0;
-    vec3 directLight = (kD * albedo / 3.14159265359 + specular) * sunRadiance * NdotL * shadowFactor;
+    float wetDarkening = 1.0 - (mat.porosity * 0.25);
+    vec3 directLight = (kD * (albedo * wetDarkening) / 3.14159265359 + specular) * sunRadiance * NdotL * shadowFactor;
 
     // Ambient approximation + sky contribution
     float skyFactor = max(dot(normal, vec3(0.0, 1.0, 0.0)), 0.0);
-    vec3 ambient = albedo * (0.15 + 0.1 * skyFactor);
+    vec3 ambient = albedo * (0.15 + 0.1 * skyFactor) * clamp(mat.ambientOcclusion, 0.15, 1.0);
 
     // Indirect bounce (if within bounce budget)
     vec3 indirect = vec3(0.0);

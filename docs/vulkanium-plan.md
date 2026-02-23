@@ -64,6 +64,11 @@
 - [x] Phase 10 inline TODO/FIXME cleanup in active source tree is complete
 - [x] Initial RT shadow realism groundwork is implemented (material flags for foliage/translucency/emissive + transmittance-based shadow payload + shadow any-hit shader)
 - [x] Native LabPBR decode and RT material override pass are implemented (`_s`/`_n` channel decoding into roughness/metallic/ior/subsurface/emissive)
+- [x] RT instance metadata routing is fixed (TLAS custom index now uses per-BLAS material/entity ID instead of instance ordinal)
+- [x] RT dynamic mesh hooks are implemented for entity/item instances (material-aware BLAS updates + translucent hit-group routing)
+- [x] RT dispatch is now explicitly linked to world-rendered frames (skips non-world frame tails)
+- [x] SSAO black-screen root causes are mitigated (fixed fullscreen UV mapping + invalid-depth SSAO guard + compositor safety clamp)
+- [x] Dedicated UI pipeline path is implemented for non-world draws (GUI/HUD isolation from world pipeline routing)
 - [ ] Vulkan command recording path is fully implemented end-to-end
 - [ ] Descriptor set lifecycle is fully implemented across all passes
 - [ ] Shaderpack runtime compatibility validated against real pack matrix
@@ -83,7 +88,7 @@
 | 7 — Vulkan Perf | 🟡 Partial | Async transfer/parallel recording/culling modules exist; deeper Vulkan integration still pending. |
 | 8 — Polish/UX | 🟡 Partial | Cache/progress/debug/config/overlay components exist and compile. HDR support with color space conversion is implemented. |
 | 9 — Compute Platform | 🟡 Partial | Compute scheduler/allocator/modules exist; compute shader support with layout transitions and descriptor pools are implemented. |
-| 10 — Ray Tracing | 🟡 Partial | Core BLAS/TLAS/SBT/pipeline scaffolding, first-pass shadow realism groundwork (foliage/translucency/emissive material flags, transmittance shadow payload, shadow any-hit shader), and native LabPBR decode + material override pass are implemented; descriptor wiring, entity/item RT participation, validation matrix, and performance tuning are still required. |
+| 10 — Ray Tracing | 🟡 Partial | Core BLAS/TLAS/SBT/pipeline scaffolding, first-pass shadow realism groundwork (foliage/translucency/emissive material flags, transmittance shadow payload, shadow any-hit shader), native LabPBR decode + material override pass, corrected TLAS instance material routing with dynamic entity/item mesh hooks, world-frame-linked RT dispatch, and SSAO blackout safeguards are implemented; full descriptor wiring for per-texel RT sampling, runtime integration breadth, validation matrix, and performance tuning are still required. |
 | 11 — Module System | 🟡 Partial | Module API and built-ins exist; runtime conflict handling and full integration require more validation. |
 
 ---

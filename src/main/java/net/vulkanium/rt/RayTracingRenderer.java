@@ -195,8 +195,10 @@ public class RayTracingRenderer {
      * @param swapchainImageIndex Current swapchain image index (for compositing)
      */
     public void executeFrame(VkCommandBuffer commandBuffer, long depthImage,
-                             long depthImageView, int frameIdx, int swapchainImageIndex) {
+                             long depthImageView, int frameIdx, int swapchainImageIndex,
+                             boolean worldRenderedThisFrame) {
         if (!initialized || !enabled) return;
+        if (!worldRenderedThisFrame) return;
 
         // Don't run RT/SSAO when we're not in a world (title/menu screens).
         // Running SSAO over empty/cleared depth on the main menu can darken the
@@ -880,8 +882,10 @@ public class RayTracingRenderer {
                 // Sample center depth
                 float depth = texture(depthBuffer, uv).r;
 
-                // Skip sky pixels (depth >= 0.9999 = far plane)
-                if (depth >= 0.9999) {
+                // Skip sky/invalid pixels.
+                // Some transient depth states can produce 0.0 samples; treat these as non-occluding
+                // to avoid full-screen black AO artifacts.
+                if (depth >= 0.9999 || depth <= 0.000001) {
                     imageStore(aoOutput, pos, vec4(1.0));
                     return;
                 }

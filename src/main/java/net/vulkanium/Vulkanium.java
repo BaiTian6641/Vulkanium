@@ -725,7 +725,8 @@ public class Vulkanium implements ClientModInitializer {
 
         // ── RT pass: feed chunk meshes to RT pipeline, then dispatch ──
         // Run RT whenever it's enabled in config (SSAO works in any render mode)
-        if (getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
+        if (frameHadWorldRender
+            && getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
             && config.rayTracingEnabled
             && rtRenderer != null
             && rtRenderer.isEnabled()) {
@@ -756,7 +757,7 @@ public class Vulkanium implements ClientModInitializer {
                 long depthView = vulkanSwapchain.getDepthImageView();
                 int frameIdx = frameOrchestrator.getCurrentFrame();
                 int swapImageIdx = frameOrchestrator.getCurrentImageIndex();
-                rtRenderer.executeFrame(cmd, depthImage, depthView, frameIdx, swapImageIdx);
+                rtRenderer.executeFrame(cmd, depthImage, depthView, frameIdx, swapImageIdx, frameHadWorldRender);
             } catch (Exception e) {
                 if (isDebugLogging() && (frameCounter < 5 || frameCounter % 300 == 0)) {
                     LOGGER.warn("[RT] Frame dispatch error: {}", e.getMessage());
@@ -1009,7 +1010,8 @@ public class Vulkanium implements ClientModInitializer {
         // with the main render pass is a Vulkan spec violation. Fall back to vanilla
         // pipelines for all non-world draws.
         if (!worldRenderActive) {
-            return fallback;
+            BasicPipeline uiPipeline = pipelineRegistry.getUiPipeline(format);
+            return uiPipeline != null ? uiPipeline : fallback;
         }
 
         if (shaderpackManager == null || !(shaderpackManager

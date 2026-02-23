@@ -561,7 +561,7 @@ public class SSAOCompositor {
                 // Standard fullscreen triangle trick:
                 // 3 vertices cover [-1,1] × [-1,1] with a single oversized triangle
                 vec2 pos = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-                fragUV = pos;
+                                fragUV = pos * 0.5;
                 gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
             }
             """;
@@ -582,10 +582,14 @@ public class SSAOCompositor {
                 // Sample SSAO value (R8 texture, bilinear upscale from half-res)
                 float ao = texture(ssaoTexture, fragUV).r;
 
+                                // Safety floor to avoid full-screen blackouts from invalid AO reads.
+                                // Valid SSAO should remain near [0.3, 1.0], so this clamps only catastrophic cases.
+                                float safeAo = clamp(ao, 0.2, 1.0);
+
                 // Output AO as RGB — multiplicative blending applies: scene * ao
                 // AO = 1.0 means no occlusion (no darkening)
                 // AO = 0.0 means fully occluded (black)
-                outColor = vec4(ao, ao, ao, 1.0);
+                                outColor = vec4(safeAo, safeAo, safeAo, 1.0);
             }
             """;
 }

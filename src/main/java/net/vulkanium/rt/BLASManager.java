@@ -63,7 +63,6 @@ public class BLASManager {
 
     // ── State ──
     private final VulkaniumMemory memory;
-    private final VulkaniumQueues queues;
 
     /** Section key → BLAS mapping */
     private final Map<Long, AccelerationStructure> blasMap = new ConcurrentHashMap<>();
@@ -84,7 +83,6 @@ public class BLASManager {
 
     public BLASManager(VulkaniumMemory memory, VulkaniumQueues queues) {
         this.memory = memory;
-        this.queues = queues;
     }
 
     /**
@@ -153,7 +151,11 @@ public class BLASManager {
         if (!rtAvailable) return;
 
         AccelerationStructure blas = blasMap.get(sectionKey);
-        if (blas == null) return;
+        if (blas == null) {
+            createBLAS(sectionKey);
+            blas = blasMap.get(sectionKey);
+            if (blas == null) return;
+        }
 
         blas.setPrimitiveCount(indexCount / 3);
         if (!blas.isDirty()) {
@@ -163,6 +165,26 @@ public class BLASManager {
 
         LOGGER.debug("BLAS geometry updated: sectionKey={} vertices={} indices={} stride={} indexType={}",
                 sectionKey, vertexCount, indexCount, vertexStride, useUint32 ? "u32" : "u16");
+    }
+
+    /**
+     * Sets the per-instance material/custom index consumed by RT hit shaders.
+     */
+    public void setInstanceMaterialId(long sectionKey, int materialId) {
+        AccelerationStructure blas = blasMap.get(sectionKey);
+        if (blas != null) {
+            blas.setInstanceCustomIndex(materialId);
+        }
+    }
+
+    /**
+     * Sets the per-instance SBT hit-group offset.
+     */
+    public void setInstanceSbtOffset(long sectionKey, int sbtOffset) {
+        AccelerationStructure blas = blasMap.get(sectionKey);
+        if (blas != null) {
+            blas.setInstanceSbtOffset(sbtOffset);
+        }
     }
 
     /**

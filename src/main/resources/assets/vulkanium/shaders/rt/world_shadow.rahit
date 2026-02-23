@@ -12,6 +12,10 @@ struct Material {
     float ior;
     float opacity;
     float subsurface;
+    float reflectanceF0;
+    float porosity;
+    float ambientOcclusion;
+    float height;
     uint flags;
     uint padding;
 };

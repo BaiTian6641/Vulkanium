@@ -223,6 +223,13 @@ public class RTModuleManager {
                                      int vertexCount, int indexCount) {
         if (!enabled) return;
         long sectionKey = packSectionKey(sectionX, sectionY, sectionZ);
+        blasManager.setGeometry(sectionKey,
+            vertexBuffer, 0,
+            vertexCount, 32,
+            indexBuffer, 0, indexCount,
+            indexCount > 65535);
+        blasManager.setInstanceMaterialId(sectionKey, 0); // default terrain material
+        blasManager.setInstanceSbtOffset(sectionKey, 0);  // opaque hit group
         blasManager.markDirty(sectionKey);
     }
 
@@ -233,6 +240,38 @@ public class RTModuleManager {
         if (!enabled) return;
         long sectionKey = packSectionKey(sectionX, sectionY, sectionZ);
         blasManager.removeBLAS(sectionKey);
+    }
+
+    /**
+     * Registers or updates RT geometry for entities/items, including material routing.
+     *
+     * @param instanceId unique runtime key for entity or item instance
+     * @param materialName material key used for LabPBR-capable material lookup
+     */
+    public void onDynamicMeshChanged(long instanceId,
+                                     long vertexBuffer, long indexBuffer,
+                                     int vertexCount, int indexCount,
+                                     String materialName,
+                                     boolean translucent) {
+        if (!enabled) return;
+
+        long dynamicKey = packDynamicKey(instanceId);
+        int materialId = materialTable != null ? materialTable.getMaterialId(materialName) : 0;
+
+        blasManager.setGeometry(dynamicKey,
+                vertexBuffer, 0,
+                vertexCount, 32,
+                indexBuffer, 0, indexCount,
+                indexCount > 65535);
+        blasManager.setInstanceMaterialId(dynamicKey, materialId);
+        blasManager.setInstanceSbtOffset(dynamicKey, translucent ? 1 : 0);
+        blasManager.markDirty(dynamicKey);
+    }
+
+    /** Removes entity/item RT geometry instance. */
+    public void onDynamicMeshRemoved(long instanceId) {
+        if (!enabled) return;
+        blasManager.removeBLAS(packDynamicKey(instanceId));
     }
 
     public void resize(int width, int height) {
@@ -254,6 +293,10 @@ public class RTModuleManager {
 
     private static long packSectionKey(int x, int y, int z) {
         return ((long)(x & 0x3FFFFF)) | (((long)(y & 0xFFFFF)) << 22) | (((long)(z & 0x3FFFFF)) << 42);
+    }
+
+    private static long packDynamicKey(long instanceId) {
+        return (1L << 63) | (instanceId & 0x7FFFFFFFFFFFFFFFL);
     }
 
     // ── Accessors ──

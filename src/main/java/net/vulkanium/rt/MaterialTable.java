@@ -42,9 +42,13 @@ import java.util.Optional;
  *       float ior;
  *       float opacity;
  *       float subsurface;
- *       uint flags;      // bitfield: isWater, isGlass, isLeaf, isEmissive
+ *       float reflectanceF0;
+ *       float porosity;
+ *       float ambientOcclusion;
+ *       float height;
+ *       uint flags;
  *       uint padding;
- *   }; // 32 bytes per material
+ *   }; // 48 bytes per material
  * </pre>
  *
  * <h3>Integration with Shader Packs</h3>
@@ -56,7 +60,7 @@ public class MaterialTable {
     private static final Logger LOGGER = LoggerFactory.getLogger("Vulkanium/Materials");
 
     /** Material struct size in bytes */
-    public static final int MATERIAL_BYTES = 32;
+        public static final int MATERIAL_BYTES = 48;
 
     /** Maximum distinct materials (Minecraft block state count) */
     public static final int MAX_MATERIALS = 4096;
@@ -83,42 +87,64 @@ public class MaterialTable {
             float ior,
             float opacity,
             float subsurface,
+            float reflectanceF0,
+            float porosity,
+            float ambientOcclusion,
+            float height,
             int flags
     ) {
         public static final Material DEFAULT = new Material(
-                0.8f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0
+                0.8f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                0
         );
 
         public static final Material WATER = new Material(
-                0.02f, 0.0f, 0.0f, 1.333f, 0.3f, 0.0f, FLAG_WATER
+                0.02f, 0.0f, 0.0f, 1.333f, 0.3f, 0.0f,
+                0.02f, 0.0f, 1.0f, 1.0f,
+                FLAG_WATER | FLAG_TRANSLUCENT
         );
 
         public static final Material GLASS = new Material(
-                0.01f, 0.0f, 0.0f, 1.5f, 0.1f, 0.0f, FLAG_GLASS
+                0.01f, 0.0f, 0.0f, 1.5f, 0.1f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_GLASS | FLAG_TRANSLUCENT
         );
 
         public static final Material GLOWSTONE = new Material(
-                0.9f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE
+                0.9f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE
         );
 
         public static final Material IRON_BLOCK = new Material(
-                0.3f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, FLAG_METAL
+                0.3f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f,
+                0.91f, 0.0f, 1.0f, 1.0f,
+                FLAG_METAL
         );
 
         public static final Material GOLD_BLOCK = new Material(
-                0.2f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, FLAG_METAL
+                0.2f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f,
+                0.90f, 0.0f, 1.0f, 1.0f,
+                FLAG_METAL
         );
 
         public static final Material LEAVES = new Material(
-                0.9f, 0.0f, 0.0f, 1.0f, 0.7f, 0.5f, FLAG_LEAF | FLAG_SUBSURFACE | FLAG_CUTOUT | FLAG_FOLIAGE
+                0.9f, 0.0f, 0.0f, 1.0f, 0.7f, 0.5f,
+                0.03f, 0.35f, 0.75f, 0.85f,
+                FLAG_LEAF | FLAG_SUBSURFACE | FLAG_CUTOUT | FLAG_FOLIAGE
         );
 
         public static final Material FOLIAGE_CUTOUT = new Material(
-                0.92f, 0.0f, 0.0f, 1.0f, 0.45f, 0.55f, FLAG_CUTOUT | FLAG_FOLIAGE | FLAG_SUBSURFACE
+                0.92f, 0.0f, 0.0f, 1.0f, 0.45f, 0.55f,
+                0.03f, 0.4f, 0.7f, 0.8f,
+                FLAG_CUTOUT | FLAG_FOLIAGE | FLAG_SUBSURFACE
         );
 
         public static final Material ICE = new Material(
-                0.05f, 0.0f, 0.0f, 1.31f, 0.5f, 0.3f, FLAG_ICE
+                0.05f, 0.0f, 0.0f, 1.31f, 0.5f, 0.3f,
+                0.03f, 0.0f, 1.0f, 1.0f,
+                FLAG_ICE | FLAG_TRANSLUCENT
         );
     }
 
@@ -142,18 +168,26 @@ public class MaterialTable {
         registerMaterial("minecraft:glass_pane", Material.GLASS);
         registerMaterial("minecraft:white_stained_glass", Material.GLASS);
         registerMaterial("minecraft:tinted_glass", new Material(
-                0.02f, 0.0f, 0.0f, 1.5f, 0.2f, 0.0f, FLAG_GLASS | FLAG_TRANSLUCENT));
+                0.02f, 0.0f, 0.0f, 1.5f, 0.2f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_GLASS | FLAG_TRANSLUCENT));
         registerMaterial("minecraft:glowstone", Material.GLOWSTONE);
         registerMaterial("minecraft:sea_lantern", Material.GLOWSTONE);
         registerMaterial("minecraft:shroomlight", Material.GLOWSTONE);
         registerMaterial("minecraft:iron_block", Material.IRON_BLOCK);
         registerMaterial("minecraft:gold_block", Material.GOLD_BLOCK);
         registerMaterial("minecraft:copper_block", new Material(
-                0.35f, 0.9f, 0.0f, 1.0f, 1.0f, 0.0f, FLAG_METAL));
+                0.35f, 0.9f, 0.0f, 1.0f, 1.0f, 0.0f,
+                0.88f, 0.0f, 1.0f, 1.0f,
+                FLAG_METAL));
         registerMaterial("minecraft:diamond_block", new Material(
-                0.1f, 0.0f, 0.0f, 2.42f, 0.9f, 0.0f, FLAG_GLASS));
+                0.1f, 0.0f, 0.0f, 2.42f, 0.9f, 0.0f,
+                0.17f, 0.0f, 1.0f, 1.0f,
+                FLAG_GLASS | FLAG_TRANSLUCENT));
         registerMaterial("minecraft:emerald_block", new Material(
-                0.1f, 0.0f, 0.0f, 1.57f, 0.8f, 0.0f, FLAG_GLASS));
+                0.1f, 0.0f, 0.0f, 1.57f, 0.8f, 0.0f,
+                0.05f, 0.0f, 1.0f, 1.0f,
+                FLAG_GLASS | FLAG_TRANSLUCENT));
         registerMaterial("minecraft:ice", Material.ICE);
         registerMaterial("minecraft:packed_ice", Material.ICE);
         registerMaterial("minecraft:blue_ice", Material.ICE);
@@ -193,21 +227,37 @@ public class MaterialTable {
 
         // Emissive blocks
         registerMaterial("minecraft:torch", new Material(
-                0.9f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.9f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:lantern", new Material(
-                0.85f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.85f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:soul_lantern", new Material(
-                0.85f, 0.0f, 12.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.85f, 0.0f, 12.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:end_rod", new Material(
-                0.7f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.7f, 0.0f, 14.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:sea_pickle", new Material(
-                0.7f, 0.0f, 11.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.7f, 0.0f, 11.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:lava", new Material(
-                0.95f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.95f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:redstone_lamp", new Material(
-                0.7f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.7f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
         registerMaterial("minecraft:jack_o_lantern", new Material(
-                0.8f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE));
+                0.8f, 0.0f, 15.0f, 1.0f, 1.0f, 0.0f,
+                0.04f, 0.0f, 1.0f, 1.0f,
+                FLAG_EMISSIVE));
 
         LOGGER.info("Material table built with {} entries", nextId);
     }
@@ -255,11 +305,15 @@ public class MaterialTable {
                         return Material.FOLIAGE_CUTOUT;
                 }
                 if (blockName.contains("glass") || blockName.contains("ice") || blockName.contains("water")) {
-                        return new Material(0.03f, 0.0f, 0.0f, 1.4f, 0.35f, 0.0f, FLAG_TRANSLUCENT);
+                        return new Material(0.03f, 0.0f, 0.0f, 1.4f, 0.35f, 0.0f,
+                                0.04f, 0.0f, 1.0f, 1.0f,
+                                FLAG_TRANSLUCENT | FLAG_GLASS);
                 }
                 if (blockName.contains("lantern") || blockName.contains("torch") || blockName.contains("shroomlight")
                                 || blockName.contains("glow") || blockName.contains("magma") || blockName.contains("lava")) {
-                        return new Material(0.85f, 0.0f, 12.0f, 1.0f, 1.0f, 0.0f, FLAG_EMISSIVE);
+                        return new Material(0.85f, 0.0f, 12.0f, 1.0f, 1.0f, 0.0f,
+                                0.04f, 0.0f, 1.0f, 1.0f,
+                                FLAG_EMISSIVE);
                 }
                 return null;
         }
@@ -288,6 +342,10 @@ public class MaterialTable {
             buffer.putFloat(m.ior());
             buffer.putFloat(m.opacity());
             buffer.putFloat(m.subsurface());
+                        buffer.putFloat(m.reflectanceF0());
+                        buffer.putFloat(m.porosity());
+                        buffer.putFloat(m.ambientOcclusion());
+                        buffer.putFloat(m.height());
             buffer.putInt(m.flags());
             buffer.putInt(0); // padding
         }
@@ -329,6 +387,10 @@ public class MaterialTable {
                         float ior = base.ior();
                         float opacity = base.opacity();
                         float subsurface = base.subsurface();
+                        float reflectanceF0 = base.reflectanceF0();
+                        float porosity = base.porosity();
+                        float ambientOcclusion = base.ambientOcclusion();
+                        float height = base.height();
                         int flags = base.flags();
 
                         if (specAvg != null) {
@@ -341,6 +403,8 @@ public class MaterialTable {
                                 ior = Math.max(1.0f, spec.ior());
                                 emission = Math.max(emission, spec.emissive() * 15.0f);
                                 subsurface = Math.max(subsurface, spec.subsurface());
+                                reflectanceF0 = Math.max(reflectanceF0, spec.reflectanceF0());
+                                porosity = Math.max(porosity, spec.porosity());
 
                                 if (spec.emissive() > 0.02f) flags |= FLAG_EMISSIVE;
                                 if (spec.metallic() > 0.5f) flags |= FLAG_METAL;
@@ -358,9 +422,23 @@ public class MaterialTable {
 
                                 subsurface = Math.max(subsurface, (1.0f - normal.ambientOcclusion()) * 0.35f);
                                 roughness = Math.max(0.02f, roughness * (0.85f + normal.height() * 0.3f));
+                                ambientOcclusion = Math.min(ambientOcclusion, normal.ambientOcclusion());
+                                height = normal.height();
                         }
 
-                        materials[id] = new Material(roughness, metallic, emission, ior, opacity, subsurface, flags);
+                        materials[id] = new Material(
+                                roughness,
+                                metallic,
+                                emission,
+                                ior,
+                                opacity,
+                                subsurface,
+                                reflectanceF0,
+                                porosity,
+                                ambientOcclusion,
+                                height,
+                                flags
+                        );
                         updated++;
                 }
 
