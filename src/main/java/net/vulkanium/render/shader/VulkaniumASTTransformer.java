@@ -138,7 +138,7 @@ public class VulkaniumASTTransformer {
         UNIFORM_REMAP.put("fogEnd", "iris_FogParams.y");
         UNIFORM_REMAP.put("fogDensity", "iris_FogParams.z");
         UNIFORM_REMAP.put("fogShape", "int(iris_FogParams.w)");
-        UNIFORM_REMAP.put("fogMode", "int(iris_FogParams.w)");
+        UNIFORM_REMAP.put("fogMode", "int(iris_Weather.w)");
         UNIFORM_REMAP.put("rainStrength", "iris_Weather.x");
         UNIFORM_REMAP.put("wetness", "iris_Weather.y");
         UNIFORM_REMAP.put("thunderStrength", "iris_Weather.z");
@@ -236,9 +236,21 @@ public class VulkaniumASTTransformer {
         TERRAIN_VERTEX_REMAP.put("gl_MultiTexCoord0", "vec4(iris_vk_TexCoord0, 0.0, 1.0)");
         TERRAIN_VERTEX_REMAP.put("gl_MultiTexCoord1", "vec4(iris_vk_LightCoord, 0.0, 1.0)");
         TERRAIN_VERTEX_REMAP.put("gl_MultiTexCoord2", "vec4(iris_vk_LightCoord, 0.0, 1.0)");
+        // Sodium-style vertex attributes — some shaderpacks reference these in terrain
+        // shaders for Sodium compatibility. Map to the same decoded variables.
+        TERRAIN_VERTEX_REMAP.put("vaPosition", "iris_vk_Vertex.xyz");
+        TERRAIN_VERTEX_REMAP.put("vaNormal", "iris_compat_Normal");
         TERRAIN_VERTEX_REMAP.put("at_tangent", "iris_compat_Tangent");
-        TERRAIN_VERTEX_REMAP.put("mc_Entity", "vec4(float(iris_vk_EntityId), 0.0, 0.0, 0.0)");
+        // mc_Entity: x = block state ID, y = render type (-1 = solid default).
+        // Iris convention: y=-1 for solid, 1 for fluid/translucent.
+        // We default to -1.0 (solid) since most terrain is solid blocks.
+        TERRAIN_VERTEX_REMAP.put("mc_Entity", "vec4(float(iris_vk_EntityId), -1.0, 0.0, 0.0)");
+        // TODO: at_midBlock requires per-vertex block-center offset computed during
+        // chunk building (offset from block center in 1/64ths). Currently always zero.
         TERRAIN_VERTEX_REMAP.put("at_midBlock", "vec4(0.0)");
+        // TODO: mc_midTexCoord should be the sprite center (mean of quad corner UVs),
+        // identical for all 4 quad vertices. Currently uses per-vertex corner UV as
+        // a fallback. Proper fix requires BufferBuilder mixin to compute per-quad.
         TERRAIN_VERTEX_REMAP.put("mc_midTexCoord", "vec4(iris_vk_MidTexCoord, 0.0, 1.0)");
         for (int i = 3; i <= 7; i++) {
             TERRAIN_VERTEX_REMAP.put("gl_MultiTexCoord" + i, "vec4(0.0)");
@@ -327,7 +339,6 @@ public class VulkaniumASTTransformer {
     //  Vertex decode preambles (injected as external declarations)
     // ═══════════════════════════════════════════════════════════════
 
-    // UV.y is flipped (0.5 - y*0.5) because the negative-height viewport makes
     // ── Composite fullscreen triangle: Iris-compatible [0,1] convention ──
     // With positive viewport, the G-buffer stores V=0 = NDC y=-1 (ground) and
     // V=1 = NDC y=+1 (sky), matching the OpenGL texture convention.
@@ -349,7 +360,7 @@ public class VulkaniumASTTransformer {
             """;
 
     // Terrain vertex inputs — MUST match BasicPipeline.createAttributeDescriptions
-    // location scheme for Vulkanium extended terrain format (36 bytes):
+    // for DefaultVertexFormat.BLOCK (32 bytes):
     //   0=Position(vec3,R32G32B32_SFLOAT), 1=UV0(vec2,R32G32_SFLOAT),
     //   2=Color(vec4,R8G8B8A8_UNORM), 3=UV2/lightmap(ivec2,R16G16_SINT),
     //   4=Normal(vec4,R8G8B8A8_SNORM), 5=mc_Entity(ivec2,R16G16_SINT)
@@ -382,9 +393,30 @@ public class VulkaniumASTTransformer {
                 vec3 rawNormal = vkm_NormalPacked.xyz;
                 float normalLen = length(rawNormal);
                 iris_compat_Normal = normalLen > 0.0001 ? normalize(rawNormal) : vec3(0.0, 1.0, 0.0);
-                // MC BLOCK format has no tangent — synthesize from normal
-                vec3 tangentDir = abs(iris_compat_Normal.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
-                iris_compat_Tangent = vec4(normalize(cross(iris_compat_Normal, tangentDir)), 1.0);
+                // Synthesize tangent from normal to match MC's standard block UV mapping.
+                // Each cardinal face has a well-defined texture → tangent direction:
+                //   UP/DOWN  (Y-dominant): tangent = +X       (U increases along +X)
+                //   NORTH/SOUTH (Z-dominant): tangent = sign(Z)*X  (SOUTH: +X, NORTH: -X)
+                //   EAST/WEST   (X-dominant): tangent = -sign(X)*Z (WEST: +Z, EAST: -Z)
+                // Tangent w = 1.0: standard right-handed TBN for all MC cube faces
+                // (bitangent = cross(tangent, normal) * w matches MC's V-axis direction).
+                // Note: non-axis-aligned faces (stairs, rotated models) use the
+                // Y-dominant fallback (tangent = +X) which is approximate.
+                float ax = abs(iris_compat_Normal.x);
+                float ay = abs(iris_compat_Normal.y);
+                float az = abs(iris_compat_Normal.z);
+                vec3 synthTangent;
+                if (az > ax && az > ay) {
+                    // NORTH/SOUTH face: tangent follows sign of Z
+                    synthTangent = vec3(sign(iris_compat_Normal.z), 0.0, 0.0);
+                } else if (ax > ay) {
+                    // EAST/WEST face: tangent follows -sign of X
+                    synthTangent = vec3(0.0, 0.0, -sign(iris_compat_Normal.x));
+                } else {
+                    // UP/DOWN face (and fallback): tangent = +X
+                    synthTangent = vec3(1.0, 0.0, 0.0);
+                }
+                iris_compat_Tangent = vec4(synthTangent, 1.0);
                 iris_vk_MidTexCoord = vkm_TexCoord;
                 iris_vk_EntityId = vkm_Entity.x; // block material ID from block.properties
             }
@@ -1147,8 +1179,10 @@ public class VulkaniumASTTransformer {
         COMPAT_REPLACEMENTS.put("cameraPositionToPrevious",
                 "(iris_PreviousCameraPosition.xyz - iris_CameraPosition.xyz)");
 
-        // ── Relative eye position (Iris-specific, approx standing player) ──
-        COMPAT_REPLACEMENTS.put("relativeEyePosition", "vec3(0.0, 1.62, 0.0)");
+        // ── Relative eye position: cameraPosition - entityEyePosition ──
+        // Packed into iris_RenderState.yzw (offset 1184 + 4/8/12), computed per-frame in DrawBatcher.
+        // In first person: ~(0,0,0). In third person: real camera offset from player eyes.
+        COMPAT_REPLACEMENTS.put("relativeEyePosition", "iris_RenderState.yzw");
 
         // ── Partial matrix column/row extractions ──
         // Used by some shaderpacks for optimized matrix access instead of the full mat4
@@ -1424,16 +1458,31 @@ public class VulkaniumASTTransformer {
     // ── Legacy shadow2D compatibility wrappers ──
 
     private static String injectLegacyShadowFunctions(String source) {
+        // First, convert sampler2DShadow → sampler2D everywhere in the source.
+        // Since we always bind non-comparison samplers (compareEnable=false),
+        // any sampler2DShadow declaration would produce Dref SPIR-V instructions
+        // that require compareEnable=true, causing a Vulkan validation error.
+        // By converting to sampler2D, the shader reads raw depth values and the
+        // shadow2D wrapper performs software comparison.
+        // TODO: When per-shader sampler type detection is added, remove this
+        //       blanket conversion and only apply it for non-comparison bindings.
+        source = source.replace("sampler2DShadow", "sampler2D");
+
         if (!source.contains("shadow2D(") && !source.contains("shadow2DProj(")) {
             return source;
         }
 
+        // Only sampler2D overloads — sampler2DShadow declarations have been
+        // converted above, so all shadow samplers are now sampler2D.
+        // shadow2D(sampler2D, vec3):  .xy = UV, .z = depth ref → manual compare
+        // shadow2D(sampler2D, vec2):  direct texcoord (no compare)
         String wrappers = """
                 // ── Vulkanium legacy shadow* compatibility ──
-                vec4 shadow2D(sampler2DShadow s, vec3 coord) { float v = texture(s, coord); return vec4(v); }
-                vec4 shadow2D(sampler2D s, vec3 coord) { return texture(s, coord.xy); }
+                vec4 shadow2D(sampler2D s, vec3 coord) {
+                    float d = texture(s, coord.xy).r;
+                    return vec4(step(coord.z, d));
+                }
                 vec4 shadow2D(sampler2D s, vec2 coord) { return texture(s, coord); }
-                vec4 shadow2DProj(sampler2DShadow s, vec4 coord) { float v = textureProj(s, coord); return vec4(v); }
                 vec4 shadow2DProj(sampler2D s, vec4 coord) { return textureProj(s, coord); }
                 """;
 

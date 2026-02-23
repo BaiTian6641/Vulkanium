@@ -56,8 +56,11 @@ public class GBufferManager {
     private RenderTarget depthTarget;
 
     // ── MRT render pass ──
-    /** The VkRenderPass for gbuffers MRT rendering. All color targets are attached. */
+    /** The VkRenderPass for gbuffers MRT rendering (CLEAR variant — clears depth). */
     private long gbufferRenderPass = VK_NULL_HANDLE;
+
+    /** VkRenderPass LOAD variant — loads all attachments (used to resume after depth snapshot). */
+    private long gbufferRenderPassLoad = VK_NULL_HANDLE;
 
     /** The VkFramebuffer for the gbuffers pass. */
     private long gbufferFramebuffer = VK_NULL_HANDLE;
@@ -311,6 +314,19 @@ public class GBufferManager {
 
             LOGGER.debug("Created MRT render pass: {} color attachments, {} subpass color refs + depth, handle=0x{}",
                     colorAttachmentCount, subpassColorRefCount, Long.toHexString(gbufferRenderPass));
+
+            // Create LOAD variant: identical but all attachments use LOAD_OP_LOAD
+            // so existing content is preserved when resuming after a depth snapshot.
+            for (int i = 0; i < colorAttachmentCount; i++) {
+                attachments.get(i).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD);
+            }
+            attachments.get(colorAttachmentCount).loadOp(VK_ATTACHMENT_LOAD_OP_LOAD);
+
+            checkResult(vkCreateRenderPass(device, rpInfo, null, pRenderPass));
+            gbufferRenderPassLoad = pRenderPass.get(0);
+
+            LOGGER.debug("Created MRT render pass (LOAD variant), handle=0x{}",
+                    Long.toHexString(gbufferRenderPassLoad));
         }
     }
 
@@ -466,6 +482,75 @@ public class GBufferManager {
         }
     }
 
+    /**
+     * Temporarily ends the MRT render pass so that the depth buffer can be
+     * copied (e.g. for depthtex1/2 pre-translucent snapshots).
+     *
+     * <p>After this call, all attachments remain in their attachment-optimal layouts
+     * (depth=DEPTH_STENCIL_ATTACHMENT, color=COLOR_ATTACHMENT). The caller performs
+     * the depth copy, then calls {@link #resumeWorldPass} to restart the MRT pass
+     * with LOAD_OP_LOAD (preserving existing contents).</p>
+     *
+     * @param cmd Active command buffer
+     */
+    public void pauseWorldPass(VkCommandBuffer cmd) {
+        if (!initialized || !worldPassActive) return;
+        vkCmdEndRenderPass(cmd);
+        // Note: images stay in their render pass final layouts
+        // (COLOR_ATTACHMENT_OPTIMAL and DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        // The caller is responsible for proper transitions if it copies depth.
+        worldPassActive = false;
+    }
+
+    /**
+     * Resumes the MRT render pass after a pause (e.g. depth snapshot).
+     *
+     * <p>Uses the LOAD variant render pass so all existing attachment contents
+     * are preserved. All attachments must be in their attachment-optimal layouts
+     * (restored by the caller after any copy operations).</p>
+     *
+     * @param cmd Active command buffer
+     */
+    public void resumeWorldPass(VkCommandBuffer cmd) {
+        if (!initialized || worldPassActive) return;
+        if (gbufferRenderPassLoad == VK_NULL_HANDLE) return;
+
+        try (MemoryStack stack = stackPush()) {
+            // No clear values needed with LOAD_OP_LOAD, but Vulkan still requires
+            // the pClearValues array to match the attachment count.
+            int totalAttachments = colorAttachmentCount + 1;
+            VkClearValue.Buffer clearValues = VkClearValue.calloc(totalAttachments, stack);
+            // Values are unused with LOAD_OP_LOAD but must be present
+
+            VkRenderPassBeginInfo rpBegin = VkRenderPassBeginInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO)
+                    .renderPass(gbufferRenderPassLoad)
+                    .framebuffer(gbufferFramebuffer);
+            rpBegin.renderArea().offset().set(0, 0);
+            rpBegin.renderArea().extent().set(width, height);
+            rpBegin.pClearValues(clearValues);
+
+            vkCmdBeginRenderPass(cmd, rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+            // Restore viewport and scissor
+            VkViewport.Buffer viewport = VkViewport.calloc(1, stack)
+                    .x(0.0f)
+                    .y(0.0f)
+                    .width((float) width)
+                    .height((float) height)
+                    .minDepth(0.0f)
+                    .maxDepth(1.0f);
+            vkCmdSetViewport(cmd, 0, viewport);
+
+            VkRect2D.Buffer scissor = VkRect2D.calloc(1, stack);
+            scissor.offset().set(0, 0);
+            scissor.extent().set(width, height);
+            vkCmdSetScissor(cmd, 0, scissor);
+        }
+
+        worldPassActive = true;
+    }
+
     // ═══════════════════════════════════════════════════════════════
     //  Accessors for Composite/Deferred Pass Integration
     // ═══════════════════════════════════════════════════════════════
@@ -524,6 +609,10 @@ public class GBufferManager {
         if (gbufferRenderPass != VK_NULL_HANDLE) {
             vkDestroyRenderPass(device, gbufferRenderPass, null);
             gbufferRenderPass = VK_NULL_HANDLE;
+        }
+        if (gbufferRenderPassLoad != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(device, gbufferRenderPassLoad, null);
+            gbufferRenderPassLoad = VK_NULL_HANDLE;
         }
         for (int i = 0; i < colorTargets.length; i++) {
             if (colorTargets[i] != null) {

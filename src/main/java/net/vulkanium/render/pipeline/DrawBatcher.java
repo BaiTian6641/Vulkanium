@@ -87,6 +87,9 @@ public class DrawBatcher {
     private float shadowDistanceRenderMul = -1.0f;
     private int shadowMapResolution = 1024;
 
+    // ── Fog mode (computed during fog param upload, written to iris_Weather.w) ──
+    private float computedFogMode = 9729.0f; // GL_LINEAR by default
+
     // ── Eye brightness smoothing state ──
     private float eyeBrightSmoothBlock = 0.0f;
     private float eyeBrightSmoothSky = 240.0f;  // start at full daylight
@@ -103,6 +106,10 @@ public class DrawBatcher {
     // ── Previous camera position for TAA/motion vectors ──
     private double prevCamX = 0.0, prevCamY = 64.0, prevCamZ = 0.0;
 
+    // ── Center depth smoothing (for centerDepthSmooth uniform) ──
+    private float centerDepthRaw = 1.0f;      // raw depth from GPU readback (previous frame)
+    private float centerDepthSmoothed = 1.0f;  // exponentially smoothed value
+
     /**
      * Updates shadow parameters from parsed directives.
      * Call after shadow infrastructure initialization.
@@ -117,6 +124,15 @@ public class DrawBatcher {
         this.shadowFarPlane = farPlane;
         this.shadowDistanceRenderMul = distRenderMul;
         this.shadowMapResolution = resolution;
+    }
+
+    /**
+     * Sets the raw center depth value read back from the GPU depth buffer.
+     * Called each frame with the depth at the screen center pixel.
+     * The value is smoothed in uploadUniformsShaderpack before uploading.
+     */
+    public void setCenterDepthRaw(float depth) {
+        this.centerDepthRaw = depth;
     }
 
     /**
@@ -581,10 +597,19 @@ public class DrawBatcher {
 
         // Write fog params (offset 1072): start, end, density, shape
         long fogRangePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_FOG_PARAMS;
-        MemoryUtil.memPutFloat(fogRangePtr, fogParams.length > 4 ? fogParams[4] : 0.0f);       // FogStart
-        MemoryUtil.memPutFloat(fogRangePtr + 4, fogParams.length > 5 ? fogParams[5] : 1000.0f); // FogEnd
-        MemoryUtil.memPutFloat(fogRangePtr + 8, 0.0f); // FogDensity
-        MemoryUtil.memPutFloat(fogRangePtr + 12, 0.0f); // FogShape
+        float fogStartVal = fogParams.length > 4 ? fogParams[4] : 0.0f;
+        float fogEndVal   = fogParams.length > 5 ? fogParams[5] : 1000.0f;
+        // MC 1.20.x uses linear fog exclusively; signal this with negative density (Iris convention)
+        float fogDensity  = -1.0f;
+        float shapeVal    = (float) VRenderSystem.getFogShape();
+        // fogMode: derived from fogDensity sign (Iris convention)
+        // negative → GL_LINEAR (9729), positive → GL_EXP2 (2049), disabled when start >= end
+        float fogMode     = (fogStartVal >= fogEndVal) ? 0.0f : (fogDensity < 0.0f ? 9729.0f : 2049.0f);
+        this.computedFogMode = fogMode;
+        MemoryUtil.memPutFloat(fogRangePtr,      fogStartVal);   // iris_FogParams.x
+        MemoryUtil.memPutFloat(fogRangePtr + 4,  fogEndVal);     // iris_FogParams.y
+        MemoryUtil.memPutFloat(fogRangePtr + 8,  Math.max(0.0f, fogDensity)); // iris_FogParams.z (clamped ≥0 like Iris)
+        MemoryUtil.memPutFloat(fogRangePtr + 12, shapeVal);      // iris_FogParams.w (fogShape)
 
         // Write texture matrix (offset 704)
         long texMatPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_TEXTURE_MATRIX;
@@ -923,7 +948,7 @@ public class DrawBatcher {
                 MemoryUtil.memPutFloat(weatherPtr, rain);
                 MemoryUtil.memPutFloat(weatherPtr + 4, rain);       // wetness ≈ rain (simplified)
                 MemoryUtil.memPutFloat(weatherPtr + 8, thunder);
-                MemoryUtil.memPutFloat(weatherPtr + 12, 0.0f);
+                MemoryUtil.memPutFloat(weatherPtr + 12, computedFogMode); // fogMode: GL_LINEAR=9729, GL_EXP2=2049, OFF=0
             }
         } catch (Exception ignored) {}
 
@@ -1032,14 +1057,43 @@ public class DrawBatcher {
         } catch (Exception ignored) {}
 
         // ── Depth Params (offset 1152): vec4(centerDepthSmooth, near, far, 0) ──
-        // centerDepthSmooth should be read from the depth buffer center texel;
-        // for now use 1.0 (far plane) as a safe default so auto-exposure doesn't break.
+        // centerDepthSmooth: exponentially smoothed center-pixel depth readback.
+        // Matches Iris: centerDepthSmooth += (centerDepth - centerDepthSmooth) * 0.1
         {
+            centerDepthSmoothed += (centerDepthRaw - centerDepthSmoothed) * 0.1f;
             long depthPtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_DEPTH_PARAMS;
-            MemoryUtil.memPutFloat(depthPtr, 1.0f);       // centerDepthSmooth (far plane default)
+            MemoryUtil.memPutFloat(depthPtr, centerDepthSmoothed);
             MemoryUtil.memPutFloat(depthPtr + 4, 0.05f);   // near
             MemoryUtil.memPutFloat(depthPtr + 8, farPlane); // far
             MemoryUtil.memPutFloat(depthPtr + 12, 0.0f);
+        }
+
+        // ── Render State (offset 1184): vec4(renderStage, relEyeX, relEyeY, relEyeZ) ──
+        // relativeEyePosition = cameraPosition - entityEyePosition
+        // In first person: typically (0,0,0). In third person: real camera offset from eyes.
+        // Packed into iris_RenderState.yzw; shaderpacks access via relativeEyePosition.
+        {
+            long renderStatePtr = ptr + net.vulkanium.render.shader.UniformBridge.OFF_RENDER_STATE;
+            float relEyeX = 0.0f, relEyeY = 0.0f, relEyeZ = 0.0f;
+            try {
+                net.minecraft.client.Minecraft mcRel = net.minecraft.client.Minecraft.getInstance();
+                if (mcRel != null && mcRel.gameRenderer != null
+                        && mcRel.gameRenderer.getMainCamera() != null
+                        && mcRel.getCameraEntity() != null) {
+                    net.minecraft.world.phys.Vec3 camPos =
+                            mcRel.gameRenderer.getMainCamera().getPosition();
+                    float partialTick = net.vulkanium.Vulkanium.getCurrentPartialTick();
+                    net.minecraft.world.phys.Vec3 eyePos =
+                            mcRel.getCameraEntity().getEyePosition(partialTick);
+                    relEyeX = (float) (camPos.x - eyePos.x);
+                    relEyeY = (float) (camPos.y - eyePos.y);
+                    relEyeZ = (float) (camPos.z - eyePos.z);
+                }
+            } catch (Exception ignored) {}
+            MemoryUtil.memPutFloat(renderStatePtr, 0.0f);       // renderStage (placeholder)
+            MemoryUtil.memPutFloat(renderStatePtr + 4, relEyeX);
+            MemoryUtil.memPutFloat(renderStatePtr + 8, relEyeY);
+            MemoryUtil.memPutFloat(renderStatePtr + 12, relEyeZ);
         }
 
         // ── Blocklight Color (offset 1200): vec4(r, g, b, 1) ──

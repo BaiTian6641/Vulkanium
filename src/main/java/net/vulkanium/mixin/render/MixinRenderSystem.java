@@ -1,6 +1,7 @@
 package net.vulkanium.mixin.render;
 
 import com.mojang.blaze3d.platform.GlStateManager;
+import com.mojang.blaze3d.shaders.FogShape;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexSorting;
@@ -192,5 +193,12 @@ public abstract class MixinRenderSystem {
     /** @author Vulkanium @reason VK */ @Overwrite public static void setShaderColor(float r, float g, float b, float a) {
         shaderColor[0] = r; shaderColor[1] = g; shaderColor[2] = b; shaderColor[3] = a;
         VRenderSystem.setShaderColor(r, g, b, a);
+    }
+
+    @Shadow private static FogShape shaderFogShape;
+    /** @author Vulkanium @reason VK — capture fogShape for shaderpack uniform */
+    @Overwrite private static void _setShaderFogShape(FogShape shape) {
+        shaderFogShape = shape;
+        VRenderSystem.setShaderFogShape(shape == FogShape.CYLINDER ? 1 : 0);
     }
 }

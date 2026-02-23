@@ -146,6 +146,29 @@ public abstract class MixinLevelRenderer {
     }
 
     /**
+     * Hook just before the translucent terrain layer is rendered in renderLevel().
+     *
+     * <p>This is the boundary between opaque and translucent rendering.
+     * We snapshot the current depth buffer here for depthtex1/depthtex2 so
+     * composite shaders can distinguish opaque-only vs post-translucent depth.</p>
+     *
+     * <p>Injection point: the string constant "translucent" in MC's renderLevel,
+     * which is used as a profiler section marker just before renderChunkLayer(TRANSLUCENT).</p>
+     *
+     * <p>Reference: Iris Shaders (LGPL-3.0) — MixinLevelRenderer.iris$beginTranslucents</p>
+     */
+    @Inject(method = "renderLevel",
+            at = @At(value = "CONSTANT", args = "stringValue=translucent"))
+    private void vulkanium$beforeTranslucents(PoseStack poseStack, float partialTick,
+                                               long finishNanoTime, boolean renderBlockOutline,
+                                               Camera camera, GameRenderer gameRenderer,
+                                               LightTexture lightTexture, Matrix4f projectionMatrix,
+                                               CallbackInfo ci) {
+        if (!Vulkanium.isVulkanReady()) return;
+        Vulkanium.onBeforeTranslucents();
+    }
+
+    /**
      * Set CLOUDS phase before vanilla renderClouds() is called inside renderLevel().
      *
      * <p>This allows {@code mapShaderNameToProgramId()} to know we're in the

@@ -318,6 +318,23 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
     private long noiseSampler = VK_NULL_HANDLE;
     private static final int NOISE_TEXTURE_SIZE = 256;
 
+    // ── Center depth readback (for centerDepthSmooth uniform) ──
+    /** HOST_VISIBLE buffer receiving the center pixel of the depth buffer each frame. */
+    private long centerDepthBuffer = VK_NULL_HANDLE;
+    private long centerDepthAllocation = 0L;
+    private long centerDepthMapped = 0L;
+    /** Whether the center depth staging buffer has been initialized. */
+    private boolean centerDepthReady = false;
+
+    // ── Pre-translucent depth snapshot (for depthtex1/depthtex2) ──
+    /** Device-local image holding the depth buffer snapshot taken before translucent rendering. */
+    private long preTranslucentDepthImage = VK_NULL_HANDLE;
+    private long preTranslucentDepthAllocation = 0L;
+    private int preTranslucentDepthWidth = 0;
+    private int preTranslucentDepthHeight = 0;
+    /** Whether a pre-translucent depth snapshot was captured this frame. */
+    private boolean hasPreTranslucentSnapshot = false;
+
     /** Cached MRT pipelines: keyed by ProgramId + attachment count to match MRT render pass. */
     private final Map<String, BasicPipeline> mrtPipelines = new HashMap<>();
 
@@ -1234,6 +1251,34 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         noiseImageAllocation = 0L;
         noiseImageView = VK_NULL_HANDLE;
         noiseSampler = VK_NULL_HANDLE;
+
+        // Destroy center depth readback buffer
+        if (centerDepthBuffer != VK_NULL_HANDLE && centerDepthAllocation != 0L
+                && Vulkanium.getVulkanMemory() != null) {
+            if (centerDepthMapped != 0L) {
+                Vulkanium.getVulkanMemory().unmap(centerDepthAllocation);
+                centerDepthMapped = 0L;
+            }
+            Vulkanium.getVulkanMemory().freeBuffer(centerDepthBuffer, centerDepthAllocation);
+        }
+        centerDepthBuffer = VK_NULL_HANDLE;
+        centerDepthAllocation = 0L;
+        centerDepthReady = false;
+
+        // Destroy pre-translucent depth snapshot
+        if (preTranslucentDepthImage != VK_NULL_HANDLE && preTranslucentDepthAllocation != 0L
+                && Vulkanium.getVulkanMemory() != null) {
+            Vulkanium.getVulkanMemory().freeImageImmediate(
+                    new VulkaniumMemory.ImageAllocation(preTranslucentDepthImage,
+                            preTranslucentDepthAllocation,
+                            preTranslucentDepthWidth, preTranslucentDepthHeight,
+                            VK_FORMAT_D32_SFLOAT, 1));
+        }
+        preTranslucentDepthImage = VK_NULL_HANDLE;
+        preTranslucentDepthAllocation = 0L;
+        preTranslucentDepthWidth = 0;
+        preTranslucentDepthHeight = 0;
+        hasPreTranslucentSnapshot = false;
 
         for (BasicPipeline mrtP : mrtPipelines.values()) {
             if (mrtP != null) mrtP.destroy();
@@ -2199,10 +2244,29 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 }
             }
 
-            // Copy G-buffer depth into depthtex0/1/2
+            // Copy G-buffer depth into depthtex slots:
+            // depthtex0 = final depth (after all rendering including translucents)
+            // depthtex1 = pre-translucent depth snapshot (before translucent layer)
+            // depthtex2 = pre-hand depth snapshot (same as depthtex1 for now)
             RenderTarget gbufDepth = gbufferManager.getDepthTarget();
             if (gbufDepth != null && gbufDepth.getImage() != VK_NULL_HANDLE) {
-                fsTargets.captureGBufferDepthTarget(cmd, gbufDepth.getImage());
+                // depthtex0 always gets the final (post-translucent) depth
+                fsTargets.captureGBufferDepthTargetSingle(cmd, gbufDepth.getImage(), 0);
+
+                if (hasPreTranslucentSnapshot && preTranslucentDepthImage != VK_NULL_HANDLE) {
+                    // depthtex1/2 get the pre-translucent snapshot
+                    // The snapshot image is in SHADER_READ_ONLY_OPTIMAL from snapshotPreTranslucentDepth
+                    fsTargets.captureGBufferDepthTargetSingle(cmd, preTranslucentDepthImage, 1);
+                    fsTargets.captureGBufferDepthTargetSingle(cmd, preTranslucentDepthImage, 2);
+                } else {
+                    // No snapshot taken: fall back to final depth for all slots
+                    fsTargets.captureGBufferDepthTargetSingle(cmd, gbufDepth.getImage(), 1);
+                    fsTargets.captureGBufferDepthTargetSingle(cmd, gbufDepth.getImage(), 2);
+                }
+                hasPreTranslucentSnapshot = false;
+
+                // ── Center depth readback: copy center pixel to staging buffer ──
+                readbackCenterDepth(cmd, gbufDepth.getImage(), width, height);
             }
         } else {
             // ── Fallback: capture from swapchain (no G-buffer) ──
@@ -2219,6 +2283,203 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                 fsTargets.captureDepthToTarget0(cmd, srcDepthImage);
             }
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Center Depth Readback (for centerDepthSmooth uniform)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Copies the center pixel of the depth buffer into a small HOST_VISIBLE staging buffer.
+     * The result becomes available on the CPU after the command buffer completes (next frame).
+     * The source image must be in SHADER_READ_ONLY_OPTIMAL.
+     */
+    private void readbackCenterDepth(VkCommandBuffer cmd, long srcDepthImage, int w, int h) {
+        VulkaniumMemory memory = Vulkanium.getVulkanMemory();
+        if (memory == null) return;
+
+        // Lazily create the readback buffer (4 bytes for a single D32_SFLOAT pixel)
+        if (centerDepthBuffer == VK_NULL_HANDLE) {
+            VulkaniumMemory.BufferAllocation ba = memory.createBuffer(
+                    4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            centerDepthBuffer = ba.buffer();
+            centerDepthAllocation = ba.allocation();
+            centerDepthMapped = memory.map(centerDepthAllocation);
+            // Write initial value (far plane)
+            MemoryUtil.memPutFloat(centerDepthMapped, 1.0f);
+        }
+
+        // Transition depth: SHADER_READ_ONLY → TRANSFER_SRC
+        VulkaniumCommand.transitionImageLayout(cmd, srcDepthImage,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        // Copy center pixel to staging buffer
+        try (var stack = MemoryStack.stackPush()) {
+            VkBufferImageCopy.Buffer regions = VkBufferImageCopy.calloc(1, stack);
+            regions.bufferOffset(0)
+                    .bufferRowLength(0)
+                    .bufferImageHeight(0);
+            regions.imageSubresource()
+                    .aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0)
+                    .baseArrayLayer(0)
+                    .layerCount(1);
+            regions.imageOffset().set(w / 2, h / 2, 0);
+            regions.imageExtent().set(1, 1, 1);
+
+            vkCmdCopyImageToBuffer(cmd, srcDepthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    centerDepthBuffer, regions);
+        }
+
+        // Transition depth back: TRANSFER_SRC → SHADER_READ_ONLY
+        VulkaniumCommand.transitionImageLayout(cmd, srcDepthImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        centerDepthReady = true;
+    }
+
+    /**
+     * Reads the center depth value from the staging buffer (written by the previous frame's GPU)
+     * and feeds it into the DrawBatcher for exponential smoothing.
+     * Must be called after the GPU fence for the most recent submitted frame has been waited on.
+     */
+    public void consumeCenterDepth() {
+        if (!centerDepthReady || centerDepthMapped == 0L) return;
+        float rawDepth = MemoryUtil.memGetFloat(centerDepthMapped);
+        // Clamp to valid depth range [0, 1]
+        rawDepth = Math.max(0.0f, Math.min(rawDepth, 1.0f));
+        DrawBatcher batcher = Vulkanium.getDrawBatcher();
+        if (batcher != null) {
+            batcher.setCenterDepthRaw(rawDepth);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Pre-Translucent Depth Snapshot (for depthtex1/depthtex2)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Snapshots the current G-buffer depth buffer into a separate image before
+     * translucent rendering begins. This snapshot becomes depthtex1 and depthtex2
+     * in composite shaders, allowing them to distinguish opaque vs translucent depth.
+     *
+     * <p>Called from {@code Vulkanium.onBeforeTranslucents()} via the
+     * MixinLevelRenderer hook at the translucent rendering boundary.</p>
+     *
+     * <p>The MRT render pass must be paused first, and resumed after the copy.</p>
+     *
+     * @param cmd Active command buffer
+     */
+    public void snapshotPreTranslucentDepth(VkCommandBuffer cmd) {
+        if (gbufferManager == null || !gbufferManager.isInitialized()) return;
+        RenderTarget gbufDepth = gbufferManager.getDepthTarget();
+        if (gbufDepth == null || gbufDepth.getImage() == VK_NULL_HANDLE) return;
+
+        int w = gbufferManager.getWidth();
+        int h = gbufferManager.getHeight();
+
+        // Ensure the snapshot image exists and is the right size
+        ensurePreTranslucentDepthImage(w, h);
+        if (preTranslucentDepthImage == VK_NULL_HANDLE) return;
+
+        long srcImage = gbufDepth.getImage();
+
+        // Source depth is in DEPTH_STENCIL_ATTACHMENT_OPTIMAL (MRT pass just ended)
+        // Transition to TRANSFER_SRC
+        VulkaniumCommand.transitionImageLayout(cmd, srcImage,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        // Transition snapshot destination: UNDEFINED → TRANSFER_DST
+        VulkaniumCommand.transitionImageLayout(cmd, preTranslucentDepthImage,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        // Copy
+        try (var stack = MemoryStack.stackPush()) {
+            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+            region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.srcOffset().set(0, 0, 0);
+            region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.dstOffset().set(0, 0, 0);
+            region.extent().set(w, h, 1);
+
+            vkCmdCopyImage(cmd,
+                    srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    preTranslucentDepthImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    region);
+        }
+
+        // Transition snapshot → SHADER_READ_ONLY (will be sampled in prepareFullscreenInputs)
+        VulkaniumCommand.transitionImageLayout(cmd, preTranslucentDepthImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        // Transition source depth back: TRANSFER_SRC → DEPTH_STENCIL_ATTACHMENT
+        // (so it can be used when the MRT pass resumes)
+        VulkaniumCommand.transitionImageLayout(cmd, srcImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        hasPreTranslucentSnapshot = true;
+    }
+
+    /**
+     * Lazily creates or resizes the pre-translucent depth snapshot image.
+     */
+    private void ensurePreTranslucentDepthImage(int w, int h) {
+        if (preTranslucentDepthImage != VK_NULL_HANDLE
+                && preTranslucentDepthWidth == w && preTranslucentDepthHeight == h) {
+            return; // already correct size
+        }
+
+        VulkaniumMemory memory = Vulkanium.getVulkanMemory();
+        if (memory == null) return;
+
+        // Destroy old if exists
+        if (preTranslucentDepthImage != VK_NULL_HANDLE && preTranslucentDepthAllocation != 0L) {
+            memory.freeImageImmediate(
+                    new VulkaniumMemory.ImageAllocation(preTranslucentDepthImage,
+                            preTranslucentDepthAllocation, preTranslucentDepthWidth,
+                            preTranslucentDepthHeight, VK_FORMAT_D32_SFLOAT, 1));
+        }
+
+        // Use the same depth format as the G-buffer
+        int depthFormat = VK_FORMAT_D32_SFLOAT;
+        if (Vulkanium.getVulkanSwapchain() != null) {
+            depthFormat = Vulkanium.getVulkanSwapchain().getDepthFormat();
+        }
+
+        VulkaniumMemory.ImageAllocation img = memory.createImage(
+                w, h, 1, depthFormat,
+                VK_IMAGE_TILING_OPTIMAL,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        preTranslucentDepthImage = img.image();
+        preTranslucentDepthAllocation = img.allocation();
+        preTranslucentDepthWidth = w;
+        preTranslucentDepthHeight = h;
+
+        LOGGER.debug("[DEPTHTEX] Created pre-translucent depth snapshot image {}x{}", w, h);
     }
 
     private void runFullscreenPasses(VkCommandBuffer cmd, int frameIndex) {
@@ -2712,7 +2973,6 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         RenderTarget ct0 = fsTargets.getReadTarget(0);
         if (ct0 != null && ct0.getImageView() != VK_NULL_HANDLE) {
             bindSamplerAlias(views, samplers, "gcolor", ct0.getImageView(), ct0.getSampler());
-            bindSamplerAlias(views, samplers, "composite", ct0.getImageView(), ct0.getSampler());
         }
         RenderTarget ct1 = fsTargets.getReadTarget(1);
         if (ct1 != null && ct1.getImageView() != VK_NULL_HANDLE) {
@@ -2721,6 +2981,10 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
         RenderTarget ct2 = fsTargets.getReadTarget(2);
         if (ct2 != null && ct2.getImageView() != VK_NULL_HANDLE) {
             bindSamplerAlias(views, samplers, "gnormal", ct2.getImageView(), ct2.getSampler());
+        }
+        RenderTarget ct3 = fsTargets.getReadTarget(3);
+        if (ct3 != null && ct3.getImageView() != VK_NULL_HANDLE) {
+            bindSamplerAlias(views, samplers, "composite", ct3.getImageView(), ct3.getSampler());
         }
         RenderTarget ct4 = fsTargets.getReadTarget(4);
         if (ct4 != null && ct4.getImageView() != VK_NULL_HANDLE) {
@@ -2782,9 +3046,13 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
             }
 
             // shadowtex1 — pre-translucent depth (DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-            // Uses HW comparison sampler (sampler2DShadow in all shader packs)
+            // Composite/deferred shaders declare shadowtex1 as sampler2D (NOT sampler2DShadow),
+            // so use the regular (non-comparison) sampler — same as shadowtex0.
+            // Using compareEnable=true with sampler2D causes incorrect depth reads (returns
+            // comparison result 0/1 instead of actual depth value), breaking shadow processing.
+            // HW comparison samplers are only needed for gbuffers passes that use sampler2DShadow.
             long stView1 = shadowMap.getNoTranslucentsDepthView();
-            long stSamp1 = shadowMap.getNoTranslucentsHwSampler();
+            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
             if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
                 Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");
@@ -2983,10 +3251,16 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                                                        long placeholderSampler) {
         // Bind shadow textures so gbuffers shaders can access them
         if (shadowMap != null && shadowImagesInitialized) {
-            // shadowtex0 — gbuffers shaders declare it as sampler2DShadow and call
-            // shadow2D() which emits SPIR-V Dref instructions requiring compareEnable=true.
+            // shadowtex0 — Use regular (non-comparison) sampler by default.
+            // Modern shaderpacks (Complementary, BSL, etc.) declare shadowtex0 as sampler2D
+            // and do manual depth comparison for PCF/soft shadows. Using compareEnable=true
+            // with sampler2D would produce incorrect results (returns 0/1 instead of depth).
+            // Legacy packs using sampler2DShadow + shadow2D() are handled by the injected
+            // shadow2D(sampler2D, vec3) wrapper, which degrades to software comparison.
+            // TODO: Add per-shader sampler type detection to use HW comparison for packs
+            //       that actually declare sampler2DShadow.
             long stView0 = shadowMap.getMainDepthView();
-            long stSamp0 = shadowMap.getMainDepthHwSampler();
+            long stSamp0 = shadowMap.getMainDepthSampler();
             if (stView0 != VK_NULL_HANDLE && stSamp0 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex0", stView0, stSamp0);
                 bindSamplerAlias(views, samplers, "shadow", stView0, stSamp0);
@@ -2995,9 +3269,9 @@ public class VulkanShaderpackPipeline implements ShaderpackPipeline {
                     imageLayouts[st0Binding] = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
                 }
             }
-            // shadowtex1 — also sampler2DShadow in gbuffers
+            // shadowtex1 — also use non-comparison sampler (same reasoning as shadowtex0)
             long stView1 = shadowMap.getNoTranslucentsDepthView();
-            long stSamp1 = shadowMap.getNoTranslucentsHwSampler();
+            long stSamp1 = shadowMap.getNoTranslucentsDepthSampler();
             if (stView1 != VK_NULL_HANDLE && stSamp1 != VK_NULL_HANDLE) {
                 bindSamplerAlias(views, samplers, "shadowtex1", stView1, stSamp1);
                 Integer st1Binding = DEFAULT_SAMPLER_BINDINGS.get("shadowtex1");

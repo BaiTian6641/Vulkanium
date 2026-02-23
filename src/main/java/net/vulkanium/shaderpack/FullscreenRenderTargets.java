@@ -820,6 +820,64 @@ public class FullscreenRenderTargets {
     }
 
     /**
+     * Copies a single depth source image into one specific depthtex slot.
+     * The source image must already be in SHADER_READ_ONLY_OPTIMAL layout.
+     *
+     * @param cmd           Active command buffer
+     * @param srcDepthImage Source depth image handle (in SHADER_READ_ONLY_OPTIMAL)
+     * @param depthtexIndex Target depth slot (0, 1, or 2)
+     */
+    public void captureGBufferDepthTargetSingle(VkCommandBuffer cmd, long srcDepthImage, int depthtexIndex) {
+        if (depthtexIndex < 0 || depthtexIndex >= MAX_DEPTH_TARGETS) return;
+        RenderTarget dst = depthTargets[depthtexIndex];
+        if (dst == null) return;
+
+        // Transition source: SHADER_READ_ONLY → TRANSFER_SRC
+        VulkaniumCommand.transitionImageLayout(cmd, srcDepthImage,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        VulkaniumCommand.transitionImageLayout(cmd, dst.getImage(),
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        try (var stack = stackPush()) {
+            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+            region.srcSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.srcOffset().set(0, 0, 0);
+            region.dstSubresource().aspectMask(VK_IMAGE_ASPECT_DEPTH_BIT)
+                    .mipLevel(0).baseArrayLayer(0).layerCount(1);
+            region.dstOffset().set(0, 0, 0);
+            region.extent().set(width, height, 1);
+
+            vkCmdCopyImage(cmd,
+                    srcDepthImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    dst.getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    region);
+        }
+
+        VulkaniumCommand.transitionImageLayout(cmd, dst.getImage(),
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        // Transition source back: TRANSFER_SRC → SHADER_READ_ONLY
+        VulkaniumCommand.transitionImageLayout(cmd, srcDepthImage,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+    }
+
+    /**
      * Blits the current colortex0 READ side to the swapchain image.
      *
      * @param cmd             Active command buffer

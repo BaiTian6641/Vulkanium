@@ -886,7 +886,7 @@ public class VulkaniumGlslTransformer {
                     vec4 iris_ViewParams;                   // offset 1040 (aspectRatio, near, far, fov)
                     vec4 iris_Time;                         // offset 1056 (frameTimeCounter, worldTime, frameCounter, sunAngle)
                     vec4 iris_FogParams;                    // offset 1072 (fogStart, fogEnd, fogDensity, fogShape)
-                    vec4 iris_Weather;                      // offset 1088 (rainStrength, wetness, thunderStrength, 0)
+                    vec4 iris_Weather;                      // offset 1088 (rainStrength, wetness, thunderStrength, fogMode)
                     vec4 iris_PlayerState;                  // offset 1104 (nightVision, blindness, darknessFactor, playerMood)
                     vec4 iris_EyeBrightness;                // offset 1120 (eyeBrightness.xy, eyeBrightnessSmooth.xy)
                     vec4 iris_WorldState;                   // offset 1136 (moonPhase, isEyeInWater, biomeTemp, biomeRainfall)
@@ -973,7 +973,8 @@ public class VulkaniumGlslTransformer {
         UNIFORM_MAP.put("fogStart", "iris_FogParams.x");
         UNIFORM_MAP.put("fogEnd", "iris_FogParams.y");
         UNIFORM_MAP.put("fogDensity", "iris_FogParams.z");
-        UNIFORM_MAP.put("fogMode", "int(iris_FogParams.w)");
+        UNIFORM_MAP.put("fogShape", "int(iris_FogParams.w)");
+        UNIFORM_MAP.put("fogMode", "int(iris_Weather.w)");
         UNIFORM_MAP.put("gl_Fog.color", "iris_FogColor.rgb");
         UNIFORM_MAP.put("gl_Fog.start", "iris_FogParams.x");
         UNIFORM_MAP.put("gl_Fog.end", "iris_FogParams.y");
@@ -1045,7 +1046,7 @@ public class VulkaniumGlslTransformer {
         UNIFORM_MAP.put("previousCameraPositionFract", "fract(iris_PreviousCameraPosition.xyz)");
         UNIFORM_MAP.put("cameraPositionInt", "ivec3(iris_CameraPositionInt.xyz)");
         UNIFORM_MAP.put("previousCameraPositionInt", "ivec3(iris_PrevCameraPositionInt.xyz)");
-        UNIFORM_MAP.put("relativeEyePosition", "vec3(0.0, 1.62, 0.0)");
+        UNIFORM_MAP.put("relativeEyePosition", "iris_RenderState.yzw");
 
         // Built-ins that may be referenced without uniform declarations.
         LEGACY_BUILTIN_MAP.put("gl_ModelViewMatrix", "iris_ModelViewMatrix");

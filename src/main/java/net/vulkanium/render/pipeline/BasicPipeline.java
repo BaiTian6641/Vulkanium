@@ -151,16 +151,18 @@ public class BasicPipeline {
     /**
      * Front face winding order.
      *
-     * <p>Vulkanium uses a <b>negative-height viewport</b> ({@code height = -H,
-     * y = H}) to flip the Y axis from Vulkan's top-down convention to OpenGL's
-     * bottom-up convention.  This flip <em>reverses</em> the apparent triangle
-     * winding as seen by the rasteriser: triangles that are counter-clockwise
-     * (front-facing) in OpenGL's clip space become clockwise after the Y-flip.
+     * <p>Vulkanium uses two viewport conventions:</p>
+     * <ul>
+     *   <li><b>GUI rendering</b>: negative-height viewport ({@code height = -H, y = H}).
+     *       VK_KHR_maintenance1 (core in Vulkan 1.1) automatically inverts the winding
+     *       determination for negative viewport height, so CCW is correct.</li>
+     *   <li><b>World rendering</b> (G-buffer, shadow, composite): positive-height viewport.
+     *       The viewport transform preserves the sign of the triangle's signed area
+     *       (both X and Y scale factors are positive), so CCW content from OpenGL
+     *       remains CCW in framebuffer coordinates. CCW is correct here too.</li>
+     * </ul>
      *
-     * <p>Default is CCW for GUI rendering (negative viewport).  World-rendering
-     * pipelines (G-buffer, shadow, composite) override to CW via
-     * {@link #setFrontFace} because they use positive viewport, which removes
-     * the Y-flip that would otherwise reverse the winding.</p>
+     * <p>All pipelines use CCW, which is correct for both viewport conventions.</p>
      */
     private int frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 

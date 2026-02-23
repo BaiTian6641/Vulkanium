@@ -703,6 +703,7 @@ public class Vulkanium implements ClientModInitializer {
             if (shaderpackManager
                     .getActivePipeline() instanceof net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline) {
                 vkPipeline.prepareFullscreenInputs(cmd, frameOrchestrator.getCurrentFrame());
+                vkPipeline.consumeCenterDepth();
             }
 
             shaderpackManager.getActivePipeline().onFrameEnd(cmd, frameOrchestrator.getCurrentFrame());
@@ -914,6 +915,10 @@ public class Vulkanium implements ClientModInitializer {
                 // 2. Copy G-buffer data into fullscreen ping-pong targets
                 vkPipeline.prepareFullscreenInputs(cmd, frameOrchestrator.getCurrentFrame());
 
+                // 2b. Read back center depth from previous frame's staging buffer
+                //     and feed it into DrawBatcher for centerDepthSmooth smoothing.
+                vkPipeline.consumeCenterDepth();
+
                 // 3. Run composite/deferred/final passes (produces final image in colortex0)
                 vkPipeline.onFrameEnd(cmd, frameOrchestrator.getCurrentFrame());
                 fullscreenPassesExecuted = true;
@@ -925,6 +930,33 @@ public class Vulkanium implements ClientModInitializer {
                         vulkanSwapchain.getWidth(), vulkanSwapchain.getHeight());
             }
         }
+    }
+
+    /**
+     * Called from MixinLevelRenderer just before the translucent terrain layer renders.
+     * Pauses the MRT pass, snapshots depth for depthtex1/2, then resumes.
+     */
+    public static void onBeforeTranslucents() {
+        if (!vulkanReady || !frameStarted) return;
+        if (getRenderMode() != net.vulkanium.render.RenderMode.SHADERPACK) return;
+        if (shaderpackManager == null) return;
+        if (!(shaderpackManager.getActivePipeline() instanceof
+                net.vulkanium.shaderpack.VulkanShaderpackPipeline vkPipeline)) return;
+        if (!vkPipeline.isLoaded()) return;
+
+        var gbuf = vkPipeline.getGBufferManager();
+        if (gbuf == null || !gbuf.isWorldPassActive()) return;
+
+        VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
+
+        // 1. Pause the MRT render pass (ends it, attachments stay in attachment-optimal layouts)
+        gbuf.pauseWorldPass(cmd);
+
+        // 2. Snapshot the current depth buffer (opaque geometry only)
+        vkPipeline.snapshotPreTranslucentDepth(cmd);
+
+        // 3. Resume the MRT render pass (LOAD variant preserves all contents)
+        gbuf.resumeWorldPass(cmd);
     }
 
     public static void onTerrainLayerStart(String renderTypeName) {

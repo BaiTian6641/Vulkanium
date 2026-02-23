@@ -432,6 +432,7 @@ public class VRenderSystem {
     private static float shaderColorR = 1.0f, shaderColorG = 1.0f, shaderColorB = 1.0f, shaderColorA = 1.0f;
     private static float fogStart = 0.0f, fogEnd = 0.0f;
     private static float fogColorR = 0.0f, fogColorG = 0.0f, fogColorB = 0.0f, fogColorA = 1.0f;
+    private static int fogShape = 0; // 0 = sphere, 1 = cylinder
     private static int currentEntityId = 0;
     private static float lineWidth = 1.0f;
 
@@ -458,6 +459,8 @@ public class VRenderSystem {
     public static void setShaderFogColor(float r, float g, float b, float a) {
         fogColorR = r; fogColorG = g; fogColorB = b; fogColorA = a;
     }
+    public static void setShaderFogShape(int shape) { fogShape = shape; }
+    public static int getFogShape() { return fogShape; }
 
     public static void setCurrentEntityId(int id) { currentEntityId = id; }
     public static int getCurrentEntityId() { return currentEntityId; }
