@@ -48,10 +48,10 @@ void main() {
     float glowIntensity = pow(sunDot, 8.0) * 0.3;
     vec3 glowColor = vec3(1.0, 0.8, 0.5) * glowIntensity;
 
-    // Night sky (below horizon)
+    // Below horizon — show MC-like distant terrain fog color rather than void black
     if (dir.y < 0.0) {
-        vec3 groundColor = vec3(0.1, 0.08, 0.06);
-        skyColor = mix(horizon * 0.3, groundColor, min(-dir.y * 5.0, 1.0));
+        vec3 groundColor = vec3(0.55, 0.50, 0.45); // warm earth / distant fog
+        skyColor = mix(horizon * 0.7, groundColor, min(-dir.y * 4.0, 1.0));
         sunColor = vec3(0.0);
         glowColor = vec3(0.0);
     }

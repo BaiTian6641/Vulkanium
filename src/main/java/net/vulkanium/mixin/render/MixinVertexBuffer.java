@@ -380,6 +380,15 @@ public abstract class MixinVertexBuffer {
                 // Upload vertex data via persistently mapped pointer (zero-overhead)
                 MemoryUtil.memCopy(MemoryUtil.memAddress(vtxRaw), persistentMappedPtr, dataSize);
 
+                // One-shot terrain upload diagnostic
+                if (vulkanium$isTerrainFormat(this.format) && vulkanium$terrainUploadDiag > 0) {
+                    vulkanium$terrainUploadDiag--;
+                    VULKANIUM$LOGGER.debug("[TERRAIN-UPLOAD] vtxCount={} dataSize={} vkVB={} pool={}",
+                            this.persistentVertexCount, dataSize,
+                            this.vkVertexBuffer != VK_NULL_HANDLE ? "OK" : "NULL",
+                            Vulkanium.getChunkBufferPool() != null ? "exists" : "null");
+                }
+
                 // Notify RT pipeline about terrain mesh uploads for BLAS construction
                 if (vulkanium$isTerrainFormat(this.format)) {
                     Vulkanium.notifyChunkMeshUploaded(
@@ -516,6 +525,15 @@ public abstract class MixinVertexBuffer {
         if (!Vulkanium.isVulkanReady())
             return;
 
+        // One-shot terrain draw diagnostic
+        if (vulkanium$isTerrainFormat(this.format) && vulkanium$terrainDrawDiag > 0) {
+            vulkanium$terrainDrawDiag--;
+            VULKANIUM$LOGGER.warn("[TERRAIN-DRAW] entry: vkVB={} idxCount={} vtxCount={} worldActive={}",
+                    this.vkVertexBuffer == VK_NULL_HANDLE ? "NULL" : Long.toHexString(this.vkVertexBuffer),
+                    this.indexCount, this.persistentVertexCount,
+                    net.vulkanium.Vulkanium.isWorldRenderActive());
+        }
+
         if (this.vkVertexBuffer == VK_NULL_HANDLE || this.indexCount <= 0 || this.persistentVertexCount <= 0) {
             ci.cancel();
             return;
@@ -541,22 +559,6 @@ public abstract class MixinVertexBuffer {
             VRenderSystem.setShader(shader);
         }
 
-        float chunkOffsetX = VRenderSystem.getChunkOffsetX();
-        float chunkOffsetY = VRenderSystem.getChunkOffsetY();
-        float chunkOffsetZ = VRenderSystem.getChunkOffsetZ();
-        boolean appliedLocalChunkOffset = false;
-
-        if (vulkanium$isTerrainFormat(this.format)
-                && (chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f)) {
-            // The drawWithShader modelView parameter (PoseStack) already
-            // includes the section translation (sectionPos - cameraPos).
-            // Do NOT bake chunkOffset into the MV — that would apply the
-            // section offset twice.  Just zero chunkOffset so the shader's
-            // (gl_Vertex + chunkOffset) doesn't double-count it.
-            VRenderSystem.setChunkOffset(0.0f, 0.0f, 0.0f);
-            appliedLocalChunkOffset = true;
-        }
-
         if (VULKANIUM$DEBUG_TRANSLUCENT && shader != null && vulkanium$isTranslucentShaderName(shader.getName())) {
             VULKANIUM$LOGGER.info(
                     "[DRAW_WS] shader='{}' mode={} vtxCount={} idxCount={} persistentIdxCount={} idxType={} hasVB={} hasIB={} chunkOffset=({},{},{})",
@@ -573,41 +575,47 @@ public abstract class MixinVertexBuffer {
                     VRenderSystem.getChunkOffsetZ());
         }
 
-                if ((VULKANIUM$DEBUG_TRANSLUCENT || VULKANIUM$DEBUG_WATER)
-                    && shader != null
-                    && vulkanium$isWaterShaderName(shader.getName())
-                    && vulkanium$isTerrainFormat(this.format)) {
-                    VULKANIUM$LOGGER.info(
-                        "[WATER-WS] shader='{}' mode={} vtxCount={} drawStateIdxCount={} persistentIdxCount={} idxType={} hasIB={} chunkOffsetBeforeApply=({},{},{}) localOffsetApplied={} blend={} depthTest={} depthWrite={} cull={}",
-                        shader.getName(),
-                        this.mode,
-                        this.persistentVertexCount,
-                        this.indexCount,
-                        this.persistentIndexCount,
-                        (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
-                        this.vkIndexBuffer != VK_NULL_HANDLE,
-                        chunkOffsetX,
-                        chunkOffsetY,
-                        chunkOffsetZ,
-                        appliedLocalChunkOffset,
-                        VRenderSystem.isBlendEnabled(),
-                        VRenderSystem.isDepthTestEnabled(),
-                        VRenderSystem.isDepthWriteEnabled(),
-                        VRenderSystem.isCullEnabled());
-                }
+        if ((VULKANIUM$DEBUG_TRANSLUCENT || VULKANIUM$DEBUG_WATER)
+                && shader != null
+                && vulkanium$isWaterShaderName(shader.getName())
+                && vulkanium$isTerrainFormat(this.format)) {
+            VULKANIUM$LOGGER.info(
+                "[WATER-WS] shader='{}' mode={} vtxCount={} drawStateIdxCount={} persistentIdxCount={} idxType={} hasIB={} chunkOffset=({},{},{}) blend={} depthTest={} depthWrite={} cull={}",
+                shader.getName(),
+                this.mode,
+                this.persistentVertexCount,
+                this.indexCount,
+                this.persistentIndexCount,
+                (this.persistentIndexVkType == VK_INDEX_TYPE_UINT32 ? "u32" : "u16"),
+                this.vkIndexBuffer != VK_NULL_HANDLE,
+                VRenderSystem.getChunkOffsetX(),
+                VRenderSystem.getChunkOffsetY(),
+                VRenderSystem.getChunkOffsetZ(),
+                VRenderSystem.isBlendEnabled(),
+                VRenderSystem.isDepthTestEnabled(),
+                VRenderSystem.isDepthWriteEnabled(),
+                VRenderSystem.isCullEnabled());
+        }
 
-        // Issue a persistent-VBO draw (no data copy — binds the already-uploaded
-        // buffer)
+        // ─── Apply chunk offset in persistent draw ───
+        // MC 1.20.4's renderChunkLayer calls drawWithShader(cameraRotation, proj, shader)
+        // where the modelViewMatrix is camera-ROTATION ONLY (no section translation).
+        // Per-section translation is provided via the "ChunkOffset" uniform, which is
+        // intercepted by MixinUniform → VRenderSystem.setChunkOffset(dx, dy, dz) before
+        // each section draw.
+        //
+        // recordDrawPersistent (non-shaderpack path) detects hasChunkOffset() and applies:
+        //   MVP = Proj × (CamRot × T(chunkOffset))
+        // which is the correct camera-relative position for each terrain section.
+        //
+        // DO NOT zero the chunk offset here — doing so would leave MVP = Proj × CamRot
+        // (no translation), causing all sections to render at camera origin and making
+        // terrain appear fixed/locked to the camera viewpoint.
         Vulkanium.recordDrawPersistent(
                 this.vkVertexBuffer, this.persistentVertexCount,
                 this.mode, this.format.getVertexSize(), this.format,
             this.vkIndexBuffer, this.persistentIndexCount, this.persistentIndexVkType,
             this.persistentSequentialIndex);
-
-        if (appliedLocalChunkOffset) {
-            // Restore the terrain chunk offset for subsequent draws.
-            VRenderSystem.setChunkOffset(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
-        }
 
         // ─── Restore VRenderSystem to RenderSystem's canonical state ───
         // VulkanMod does this after every VBO draw to ensure any code that
@@ -629,28 +637,23 @@ public abstract class MixinVertexBuffer {
             return;
 
         if (this.vkVertexBuffer != VK_NULL_HANDLE && this.indexCount > 0 && this.persistentVertexCount > 0) {
-            float chunkOffsetX = VRenderSystem.getChunkOffsetX();
-            float chunkOffsetY = VRenderSystem.getChunkOffsetY();
-            float chunkOffsetZ = VRenderSystem.getChunkOffsetZ();
-            boolean appliedLocalChunkOffset = false;
-
-            if (vulkanium$isTerrainFormat(this.format)
-                    && (chunkOffsetX != 0.0f || chunkOffsetY != 0.0f || chunkOffsetZ != 0.0f)) {
-                // The draw() path uses VRenderSystem's MV which was set by
-                // drawWithShader (PoseStack including section translation).
-                // Do NOT bake chunkOffset — just zero it to prevent double-count.
-                VRenderSystem.setChunkOffset(0.0f, 0.0f, 0.0f);
-                appliedLocalChunkOffset = true;
-            }
-
+            // Note: chunk offset is NOT zeroed — recordDrawPersistent needs it to build
+            // the correct MVP = Proj × CamRot × T(sectionOffset) for terrain sections.
             Vulkanium.recordDrawPersistent(
                     this.vkVertexBuffer, this.persistentVertexCount,
                     this.mode, this.format.getVertexSize(), this.format,
                     this.vkIndexBuffer, this.persistentIndexCount, this.persistentIndexVkType,
                     this.persistentSequentialIndex);
-
-            if (appliedLocalChunkOffset) {
-                VRenderSystem.setChunkOffset(chunkOffsetX, chunkOffsetY, chunkOffsetZ);
+            // Bootstrap RT: register terrain meshes on first draw, so BLASes are populated
+            // even when RT was enabled after the initial chunk uploads.
+            if (vulkanium$isTerrainFormat(this.format)) {
+                Vulkanium.notifyChunkMeshDrawn(
+                        this.vkVertexBuffer,
+                        this.persistentVertexCount,
+                        this.format.getVertexSize(),
+                        this.vkIndexBuffer,
+                        this.persistentIndexCount,
+                        false);
             }
         }
         ci.cancel();
@@ -681,6 +684,8 @@ public abstract class MixinVertexBuffer {
         // Immediate free causes use-after-free → stretched geometry, wrong
         // textures, and water transparency glitches during player movement.
         if (vkVertexBuffer != VK_NULL_HANDLE) {
+            // Remove from RT registration set so the buffer can be re-registered if reused
+            Vulkanium.unregisterChunkBufferFromRT(vkVertexBuffer);
             Vulkanium.deferBufferFree(vkVertexBuffer, vkVertexAllocation,
                     persistentBufferSize, persistentMappedPtr);
             vkVertexBuffer = VK_NULL_HANDLE;
@@ -703,6 +708,13 @@ public abstract class MixinVertexBuffer {
         GlStateInterceptor.onDeleteBuffer(this.indexBufferId);
         ci.cancel();
     }
+
+    /** One-shot diagnostic budget for terrain uploads (not gated by VULKANIUM$DEBUG_TRANSLUCENT). */
+    @Unique
+    private static int vulkanium$terrainUploadDiag = 5;
+    /** One-shot diagnostic budget for terrain draw attempts (not gated by VULKANIUM$DEBUG_TRANSLUCENT). */
+    @Unique
+    private static int vulkanium$terrainDrawDiag = 10;
 
     /**
      * Checks if a vertex format is terrain (BLOCK format with UV2 lightmap).

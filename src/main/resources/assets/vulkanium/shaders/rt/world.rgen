@@ -29,6 +29,7 @@ void main() {
     vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
     vec2 uv = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
     vec2 ndc = uv * 2.0 - 1.0;
+    ndc.y = -ndc.y; // Vulkan pixel(0,0) is top-left; flip Y so NDC matches MC's Y-up projection
 
     // Compute ray origin and direction from inverse camera matrices
     vec4 origin = camera.viewInverse * vec4(0.0, 0.0, 0.0, 1.0);
@@ -55,5 +56,7 @@ void main() {
         0                  // payload location
     );
 
+    // payload.color is already gamma-corrected or perceptual (rchit applies sRGB,
+    // sky.rmiss uses perceptual sky colors). Store directly.
     imageStore(outImage, ivec2(gl_LaunchIDEXT.xy), vec4(payload.color, 1.0));
 }

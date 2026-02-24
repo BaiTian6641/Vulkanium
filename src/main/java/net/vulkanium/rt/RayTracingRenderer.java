@@ -19,6 +19,7 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.memFree;
 import static org.lwjgl.vulkan.VK10.*;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+import static org.lwjgl.vulkan.KHRSwapchain.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 /**
  * Ray Tracing Renderer — integrates RT capabilities into the Vulkanium frame lifecycle.
@@ -49,6 +50,8 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACI
  */
 public class RayTracingRenderer {
     private static final Logger LOGGER = LoggerFactory.getLogger("Vulkanium/RTRenderer");
+    private static final boolean ENABLE_EXPERIMENTAL_HW_RT_DISPATCH =
+            Boolean.getBoolean("vulkanium.rt.experimental.dispatch");
 
     /** Compute workgroup size (16×16 = 256 threads) */
     private static final int WORKGROUP_SIZE = 16;
@@ -216,11 +219,16 @@ public class RayTracingRenderer {
 
         // 1. Hardware RT pass (if available)
         boolean hwRTDispatched = false;
-        if (rtModuleManager != null && rtModuleManager.isEnabled() && rtModuleManager.isRTPipelineReady()) {
+        if (ENABLE_EXPERIMENTAL_HW_RT_DISPATCH
+            && rtModuleManager != null && rtModuleManager.isEnabled() && rtModuleManager.isRTPipelineReady()) {
             try {
                 rtModuleManager.executeFrame(commandBuffer, frameIdx);
-                // If RT pipeline is ready and has output, blit RT output to swapchain
-                if (rtModuleManager.getRTOutputImage() != 0 && rtModuleManager.getRTWidth() > 0) {
+                // Blit RT output (RGBA16F with PBR lighting + RT shadows) over the swapchain.
+                // RT shadows/lighting replace vanilla baked AO + static lightmap.
+                // SSAO still runs on top as a fast broad-scale ambient occlusion pass.
+                if (rtModuleManager.wasRTDispatchedThisFrame()
+                        && rtModuleManager.getRTOutputImage() != 0
+                        && rtModuleManager.getRTWidth() > 0) {
                     blitRTOutputToSwapchain(commandBuffer, swapchainImageIndex);
                     hwRTDispatched = true;
                 }
@@ -229,11 +237,20 @@ public class RayTracingRenderer {
                     LOGGER.warn("Hardware RT dispatch failed: {}", e.getMessage());
                 }
             }
+        } else if (!ENABLE_EXPERIMENTAL_HW_RT_DISPATCH && totalSSAODispatches < 3) {
+            LOGGER.info("[RT] Experimental HW RT dispatch disabled (set -Dvulkanium.rt.experimental.dispatch=true to enable); running SSAO-only path");
         }
 
         // 2. Compute SSAO pass (skip if hardware RT already did full path tracing)
         if (ssaoEnabled && !hwRTDispatched) {
             dispatchSSAO(commandBuffer, depthImage, depthImageView);
+
+            // Diagnostic: log first few SSAO dispatches
+            if (totalSSAODispatches <= 3) {
+                LOGGER.info("[SSAO-DIAG] SSAO dispatched (#{}) compositorReady={} enabled={} ssaoEnabled={}",
+                        totalSSAODispatches, ssaoCompositor != null && ssaoCompositor.isInitialized(),
+                        enabled, ssaoEnabled);
+            }
 
             // 3. Composite SSAO onto the swapchain image
             if (ssaoCompositor != null && ssaoCompositor.isInitialized()) {
@@ -266,9 +283,10 @@ public class RayTracingRenderer {
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_IMAGE_ASPECT_COLOR_BIT);
 
-        // Transition swapchain image: COLOR_ATTACHMENT → TRANSFER_DST
+        // Transition swapchain image: PRESENT_SRC → TRANSFER_DST
+        // After mainRenderPass.end() the swapchain finalLayout is PRESENT_SRC_KHR
         VulkaniumCommand.transitionImageLayout(commandBuffer, swapImage,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -306,10 +324,11 @@ public class RayTracingRenderer {
                 VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                 VK_IMAGE_ASPECT_COLOR_BIT);
 
-        // Transition swapchain image back: TRANSFER_DST → COLOR_ATTACHMENT
+        // Transition swapchain image back: TRANSFER_DST → PRESENT_SRC_KHR
+        // SSAO compositor's render pass expects PRESENT_SRC_KHR as initialLayout
         VulkaniumCommand.transitionImageLayout(commandBuffer, swapImage,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_ACCESS_TRANSFER_WRITE_BIT,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -415,7 +434,7 @@ public class RayTracingRenderer {
 
         totalSSAODispatches++;
         if (totalSSAODispatches == 1 || totalSSAODispatches == 10 || totalSSAODispatches % 300 == 0) {
-            LOGGER.info("[RT] SSAO dispatch #{}: {}×{} → {}×{} workgroups, {} samples, radius={:.2f}",
+            LOGGER.info("[RT] SSAO dispatch #{}: {}×{} → {}×{} workgroups, {} samples, radius={}",
                     totalSSAODispatches, aoWidth, aoHeight, groupsX, groupsY, aoSamples, aoRadius);
         }
     }
@@ -942,7 +961,7 @@ public class RayTracingRenderer {
 
                 // Perspective-correct radius (smaller for distant geometry)
                 float radius = pc.aoRadius / max(linDepth, 0.1);
-                float pixRadius = min(radius * 20.0, 30.0);
+                float pixRadius = min(radius * 40.0, 64.0);
 
                 for (int i = 0; i < samples; i++) {
                     float fi = float(i) + noise.x;
@@ -983,11 +1002,10 @@ public class RayTracingRenderer {
                 }
                 ao = clamp(ao, 0.0, 1.0);
 
-                // ── Conservative output ──
-                // Blend with white at low intensity so AO is a subtle enhancement,
-                // not an aggressive darkening filter.
-                float final_ao = mix(1.0, ao, 0.30);          // 30 % effect strength
-                final_ao = clamp(final_ao, 0.70, 1.0);        // never below 70 % brightness
+                // ── AO output ──
+                // Strong enough to be visible — darkening in occluded areas.
+                float final_ao = mix(1.0, ao, 0.85);          // 85 % effect strength
+                final_ao = clamp(final_ao, 0.25, 1.0);        // allow down to 25 % brightness
 
                 imageStore(aoOutput, pos, vec4(final_ao));
             }

@@ -44,6 +44,7 @@ public class SPIRVCompiler {
 
         options = shaderc_compile_options_initialize();
         shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_2);
+        shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_5);
         shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
         shaderc_compile_options_set_generate_debug_info(options);
 
@@ -59,6 +60,9 @@ public class SPIRVCompiler {
      * @return SPIR-V bytecode as a ByteBuffer, or null on failure
      */
     public ByteBuffer compile(String source, int stage, String filename) {
+        if (compiler == 0 || options == 0) {
+            throw new IllegalStateException("SPIRVCompiler not initialized — call initialize() first");
+        }
         long result = shaderc_compile_into_spv(compiler, source, stage, filename, "main", options);
 
         if (result == 0) {

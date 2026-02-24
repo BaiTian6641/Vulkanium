@@ -143,8 +143,18 @@ void main() {
     // World-space hit position
     vec3 hitPos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 
-    // Object-space normal (from hit attributes — simplified)
-    vec3 normal = normalize(gl_ObjectToWorldEXT * vec4(0.0, 1.0, 0.0, 0.0)).xyz;
+    // Derive face normal from the dominant axis of the ray direction in object space.
+    // This correctly identifies which face of the AABB was hit (top/bottom/side).
+    vec3 rayDirMS = (gl_WorldToObjectEXT * vec4(gl_WorldRayDirectionEXT, 0.0)).xyz;
+    vec3 absRayDir = abs(rayDirMS);
+    vec3 hitNormal;
+    if (absRayDir.x > absRayDir.y && absRayDir.x > absRayDir.z)
+        hitNormal = vec3(-sign(rayDirMS.x), 0.0, 0.0); // +X or -X face
+    else if (absRayDir.y > absRayDir.z)
+        hitNormal = vec3(0.0, -sign(rayDirMS.y), 0.0); // +Y or -Y face
+    else
+        hitNormal = vec3(0.0, 0.0, -sign(rayDirMS.z)); // +Z or -Z face
+    vec3 normal = normalize((gl_ObjectToWorldEXT * vec4(hitNormal, 0.0)).xyz);
 
     payload.distance = gl_HitTEXT;
     payload.normal = normal;
@@ -200,8 +210,10 @@ void main() {
     vec3 directLight = (kD * (albedo * wetDarkening) / 3.14159265359 + specular) * sunRadiance * NdotL * shadowFactor;
 
     // Ambient approximation + sky contribution
+    // Clamped AO: if materials SSBO isn't populated, AO defaults to 0 → clamp to 0.5
+    // for visible ambient lighting rather than clamping to 0.15 (too dark).
     float skyFactor = max(dot(normal, vec3(0.0, 1.0, 0.0)), 0.0);
-    vec3 ambient = albedo * (0.15 + 0.1 * skyFactor) * clamp(mat.ambientOcclusion, 0.15, 1.0);
+    vec3 ambient = albedo * (0.3 + 0.2 * skyFactor) * clamp(mat.ambientOcclusion, 0.5, 1.0);
 
     // Indirect bounce (if within bounce budget)
     vec3 indirect = vec3(0.0);
@@ -217,5 +229,8 @@ void main() {
         emissive = albedo * (emissionStrength * 0.08);
     }
 
-    payload.color = directLight + ambient + indirect + emissive;
+    vec3 linearColor = directLight + ambient + indirect + emissive;
+    // Convert linear PBR result to sRGB (gamma correction) so the blit to the
+    // swapchain (which does not apply sRGB OETF) produces correct-looking colors.
+    payload.color = pow(max(linearColor, vec3(0.0)), vec3(1.0 / 2.2));
 }

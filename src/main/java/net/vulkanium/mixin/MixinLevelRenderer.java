@@ -53,11 +53,11 @@ public abstract class MixinLevelRenderer {
 
     @Shadow @Nullable private ClientLevel level;
 
-    /**
-     * The model-view matrix that was active BEFORE the current renderChunkLayer started.
-     * Saved at HEAD, restored at RETURN so entities/particles don't get double-rotated,
-     * but without clobbering the camera matrix mid-layer (which broke translucent water).
-     */
+    @Shadow private it.unimi.dsi.fastutil.objects.ObjectArrayList<?> renderChunksInFrustum;
+    @Shadow private boolean needsFullRenderChunkUpdate;
+
+    @Unique private int vulkanium$terrainDiagCounter = 0;
+
     /**
      * Intercept setupRender to use Vulkan-optimized frustum culling and chunk scheduling.
      *
@@ -78,6 +78,15 @@ public abstract class MixinLevelRenderer {
             double z = camera.getPosition().z;
 
             Vulkanium.LOGGER.trace("setupRender: camera at ({}, {}, {})", x, y, z);
+
+            // Temporary terrain diagnostic
+            if (vulkanium$terrainDiagCounter < 30 || vulkanium$terrainDiagCounter % 300 == 0) {
+                int visibleCount = renderChunksInFrustum != null ? renderChunksInFrustum.size() : -1;
+                Vulkanium.LOGGER.info("[TERRAIN-DIAG] F#{} setupRender: needsFullUpdate={}, visibleSections={}, camera=({},{},{})",
+                        vulkanium$terrainDiagCounter, needsFullRenderChunkUpdate, visibleCount,
+                        String.format("%.1f", x), String.format("%.1f", y), String.format("%.1f", z));
+            }
+            vulkanium$terrainDiagCounter++;
 
             VulkaniumWorldRenderer.getInstance().setupTerrain(
                     x, y, z,
@@ -101,6 +110,13 @@ public abstract class MixinLevelRenderer {
                                        double camX, double camY, double camZ,
                                        Matrix4f projectionMatrix, CallbackInfo ci) {
         if (!Vulkanium.isVulkanReady()) return;
+
+        // Temporary terrain diagnostic
+        if (vulkanium$terrainDiagCounter < 35 || vulkanium$terrainDiagCounter % 300 < 5) {
+            int visibleCount = renderChunksInFrustum != null ? renderChunksInFrustum.size() : -1;
+            Vulkanium.LOGGER.info("[TERRAIN-DIAG] renderChunkLayer: type={}, visibleSections={}",
+                    renderType.toString(), visibleCount);
+        }
 
         Vulkanium.onTerrainLayerStart(renderType.toString());
 

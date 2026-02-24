@@ -101,6 +101,8 @@ public class RTModuleManager {
     private int rtHeight = 0;
     /** Whether the full RT pipeline has been successfully created */
     private boolean rtPipelineReady = false;
+    /** Whether RT was actually dispatched this frame (has geometry + pipeline ready) */
+    private boolean rtDispatchedThisFrame = false;
 
     public RTModuleManager(VulkaniumDevice device, VulkaniumMemory memory,
                             VulkaniumQueues queues, RTCapabilities capabilities) {
@@ -178,6 +180,7 @@ public class RTModuleManager {
 
         // 1. Compile RT shaders
         SPIRVCompiler compiler = new SPIRVCompiler();
+        compiler.initialize();
         try {
             rayGenModule = compileAndCreateModule(compiler, device,
                     "/assets/vulkanium/shaders/rt/world.rgen");
@@ -442,12 +445,21 @@ public class RTModuleManager {
             net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
             if (mc == null || mc.gameRenderer == null || mc.level == null) return;
 
-            // Get projection matrix from VRenderSystem
+            net.minecraft.world.phys.Vec3 cam = mc.gameRenderer.getMainCamera().getPosition();
+
+            // Build viewInverse (camera-to-world matrix):
+            // Rotation part = transpose of MC's camera rotation matrix (MC uses view = camRot, no translation)
+            // Translation column = camera world position
+            // This ensures: viewInverse * (0,0,0,1) == camera world position (rays start from camera)
+            org.joml.Matrix4f camRot = new org.joml.Matrix4f(
+                    net.vulkanium.compat.VRenderSystem.getModelViewMatrix());
+            // Transpose gives camera-to-world rotation
+            org.joml.Matrix4f viewInv = camRot.transpose(new org.joml.Matrix4f());
+            // Inject camera world position as the translation column
+            viewInv.m03((float) cam.x).m13((float) cam.y).m23((float) cam.z).m33(1.0f);
+
+            // Projection inverse from Vulkan/MC perspective matrix
             org.joml.Matrix4f proj = new org.joml.Matrix4f(net.vulkanium.compat.VRenderSystem.getProjectionMatrix());
-            // Get view matrix from modelview stack
-            org.joml.Matrix4f view = new org.joml.Matrix4f(
-                    com.mojang.blaze3d.systems.RenderSystem.getModelViewMatrix());
-            org.joml.Matrix4f viewInv = view.invert(new org.joml.Matrix4f());
             org.joml.Matrix4f projInv = proj.invert(new org.joml.Matrix4f());
 
             cameraUBOMapped.position(0);
@@ -457,21 +469,26 @@ public class RTModuleManager {
             // projInverse (64 bytes)
             projInv.get(cameraUBOMapped);
             cameraUBOMapped.position(128);
-            // cameraPosition (vec3 = 12 bytes)
-            net.minecraft.world.phys.Vec3 cam = mc.gameRenderer.getMainCamera().getPosition();
-            cameraUBOMapped.putFloat((float) cam.x);
-            cameraUBOMapped.putFloat((float) cam.y);
-            cameraUBOMapped.putFloat((float) cam.z);
-            // time (float)
+            // cameraPosition (vec3) at std140 offset 128:
+            //   vec3 base alignment = 16, data size = 12 bytes, followed by 4 bytes implicit padding.
+            //   Next element (float time) must start at offset 144 per std140, NOT 140.
+            cameraUBOMapped.putFloat((float) cam.x);   // offset 128
+            cameraUBOMapped.putFloat((float) cam.y);   // offset 132
+            cameraUBOMapped.putFloat((float) cam.z);   // offset 136
+            cameraUBOMapped.putFloat(0.0f);             // offset 140: std140 vec3 implicit padding
+            // time (float) at std140 offset 144
             cameraUBOMapped.putFloat((float) (mc.level.getGameTime() % 24000) / 24000.0f);
-            // frameIndex (uint)
+            // frameIndex (uint) at offset 148
             cameraUBOMapped.putInt(frameIndex);
-            // maxBounces (uint)
+            // maxBounces (uint) at offset 152
             cameraUBOMapped.putInt(maxBounces);
-            // sunAngle (float)
-            float sunAngle = mc.level.getSunAngle(1.0f);
+            // sunAngle (float) at offset 156
+            // mc.level.getSunAngle(1.0f) returns the celestial angle in RADIANS [0, 2π].
+            // The RT shaders multiply by 2π (treating sunAngle as a [0,1] fraction),
+            // so we normalize it to [0,1] before uploading to avoid double-rotation.
+            float sunAngle = mc.level.getSunAngle(1.0f) / ((float) Math.PI * 2.0f);
             cameraUBOMapped.putFloat(sunAngle);
-            // padding
+            // padding (float) at offset 160
             cameraUBOMapped.putFloat(0.0f);
         } catch (Throwable t) {
             LOGGER.debug("Camera UBO update failed: {}", t.getMessage());
@@ -500,19 +517,30 @@ public class RTModuleManager {
         int blasBuilds = blasManager.buildDirtyBLASes(commandBuffer);
         blasBuildsThisFrame = blasBuilds;
 
-        // 2. Rebuild TLAS
-        tlasBuilder.collectInstances(blasManager.getBuiltBLASes(), 0, 0, 0);
+        // 2. Rebuild TLAS — use actual camera position for camera-relative instance transforms
+        double camX = 0, camY = 0, camZ = 0;
+        try {
+            net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+            if (mc != null && mc.gameRenderer != null && mc.gameRenderer.getMainCamera() != null) {
+                net.minecraft.world.phys.Vec3 cp = mc.gameRenderer.getMainCamera().getPosition();
+                camX = cp.x; camY = cp.y; camZ = cp.z;
+            }
+        } catch (Throwable ignored) {}
+        tlasBuilder.collectInstances(blasManager.getBuiltBLASes(), camX, camY, camZ);
         tlasBuilder.buildTLAS(commandBuffer);
 
         // 3. Barrier: AS build → ray trace
         insertASBarrier(commandBuffer);
 
-        // 4. Update descriptors and dispatch rays
-        if (rtPipelineReady && sbt.isReady()) {
+        // 4. Update descriptors and dispatch rays (only when TLAS has geometry)
+        if (rtPipelineReady && sbt.isReady() && tlasBuilder.getInstanceCount() > 0) {
             VkDevice device = vulkaniumDevice.getLogicalDevice();
             updateTLASDescriptor(device);
             updateCameraUBO(frameIndex);
             dispatchRays(commandBuffer);
+            rtDispatchedThisFrame = true;
+        } else {
+            rtDispatchedThisFrame = false;
         }
 
         // 5. Denoise (if enabled)
@@ -706,6 +734,8 @@ public class RTModuleManager {
 
     public boolean isEnabled() { return enabled; }
     public boolean isRTPipelineReady() { return rtPipelineReady; }
+    /** Returns true if RT dispatch actually ran this frame (pipeline ready + TLAS non-empty). */
+    public boolean wasRTDispatchedThisFrame() { return rtDispatchedThisFrame; }
     public long getRTOutputImage() { return rtOutputImage; }
     public long getRTOutputImageView() { return rtOutputImageView; }
     public int getRTWidth() { return rtWidth; }

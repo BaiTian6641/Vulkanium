@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.Locale;
@@ -89,6 +90,14 @@ public class Vulkanium implements ClientModInitializer {
             .synchronizedList(new java.util.ArrayList<>());
 
     /**
+     * Set of VkBuffer handles already registered with the RT BLAS system.
+     * Used by notifyChunkMeshDrawn() to skip redundant re-registration on every draw.
+     * Cleared when RT is torn down; individual entries removed when buffers are freed.
+     */
+    private static final java.util.Set<Long> rtRegisteredBuffers =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    /**
      * Records a newly uploaded terrain section mesh for RT processing.
      */
     public static void notifyChunkMeshUploaded(int sectionX, int sectionY, int sectionZ,
@@ -98,12 +107,49 @@ public class Vulkanium implements ClientModInitializer {
         if (rtRenderer == null || !rtRenderer.isEnabled()) {
             return;
         }
+        // Mark this buffer as registered so notifyChunkMeshDrawn skips it
+        rtRegisteredBuffers.add(vertexBuffer);
         pendingChunkMeshes.add(new ChunkMeshUpload(
                 sectionX, sectionY, sectionZ,
                 vertexBuffer, vertexOffset, vertexCount,
                 indexBuffer, indexOffset, indexCount,
                 vertexStride, translucent,
                 frameCounter));
+    }
+
+    /**
+     * Registers a terrain chunk that is being DRAWN (not newly uploaded) with the RT system.
+     * Called from MixinVertexBuffer.onDraw() to bootstrap BLASes for terrain that was uploaded
+     * before RT was enabled. Uses the vkBuffer handle bits as a unique section key.
+     * No-op if this buffer is already registered or RT is not active.
+     */
+    public static void notifyChunkMeshDrawn(long vkBuffer, int vertexCount, int vertexStride,
+                                             long indexBuffer, int indexCount, boolean translucent) {
+        if (rtRenderer == null || !rtRenderer.isEnabled()) return;
+        if (vkBuffer == 0 || vertexCount <= 0) return;
+        // Only register once per buffer lifetime — skip redundant re-dirty
+        if (!rtRegisteredBuffers.add(vkBuffer)) return;
+        // Derive a unique section key from the buffer handle bits.
+        // Uses low 22 bits for X, bits 22-41 for Y, bits 42-63 for Z.
+        // Real section coords from ChunkUploadManager live in world-block range which
+        // yields very different packed values from small Vulkan handle integers.
+        int fakeX = (int)(vkBuffer & 0x1FFFFFL);
+        int fakeY = (int)((vkBuffer >> 22) & 0xFFFFFL);
+        int fakeZ = (int)((vkBuffer >> 42) & 0x1FFFFFL);
+        pendingChunkMeshes.add(new ChunkMeshUpload(
+                fakeX, fakeY, fakeZ,
+                vkBuffer, 0L, vertexCount,
+                indexBuffer, 0L, indexCount,
+                Math.max(16, vertexStride), translucent,
+                frameCounter));
+    }
+
+    /**
+     * Removes a terrain chunk's VkBuffer from the RT registration set.
+     * Must be called when a persistent vertex buffer is freed (VertexBuffer.close()).
+     */
+    public static void unregisterChunkBufferFromRT(long vkBuffer) {
+        rtRegisteredBuffers.remove(vkBuffer);
     }
 
     private record ChunkMeshUpload(int sectionX, int sectionY, int sectionZ,
@@ -198,6 +244,24 @@ public class Vulkanium implements ClientModInitializer {
 
         Path configDir = FabricLoader.getInstance().getConfigDir();
         config = VulkaniumConfig.load(configDir.resolve("vulkanium.json"));
+
+        try {
+            Path runMods = FabricLoader.getInstance().getGameDir().resolve("mods");
+            if (Files.isDirectory(runMods)) {
+                try (var stream = Files.list(runMods)) {
+                    long staleJarCount = stream
+                            .filter(Files::isRegularFile)
+                            .map(path -> path.getFileName().toString().toLowerCase(Locale.ROOT))
+                            .filter(name -> name.startsWith("vulkanium-") && name.endsWith(".jar"))
+                            .count();
+                    if (staleJarCount > 0) {
+                        LOGGER.warn("Detected {} packaged Vulkanium jar(s) in run/mods; these can override development classes and cause stale behavior. Remove vulkanium-*.jar from run/mods.",
+                                staleJarCount);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
 
         initialized = true;
         LOGGER.info("Vulkanium client initialization complete. Vulkan backend will activate on window creation.");
@@ -957,11 +1021,38 @@ public class Vulkanium implements ClientModInitializer {
                 long depthView = vulkanSwapchain.getDepthImageView();
                 int frameIdx = frameOrchestrator.getCurrentFrame();
 
+                // Pre-SSAO diagnostic: log first 3 frames + periodic\n                if (frameCounter < 3 || frameCounter % 600 == 0) {\n                    LOGGER.info(\"[RT-PRE] Frame #{}: draws={} before SSAO\",\n                            frameCounter, drawBatcher.getDrawCallsThisFrame());\n                }
+
+                // Update RT renderer with camera position and sun direction
+                // before dispatching compute SSAO / RT passes.
+                try {
+                    net.minecraft.client.Minecraft mc = net.minecraft.client.Minecraft.getInstance();
+                    if (mc.gameRenderer != null && mc.gameRenderer.getMainCamera() != null) {
+                        var cam = mc.gameRenderer.getMainCamera();
+                        rtRenderer.setCameraPosition(
+                                (float) cam.getPosition().x,
+                                (float) cam.getPosition().y,
+                                (float) cam.getPosition().z);
+                    }
+                    if (mc.level != null) {
+                        float skyAngle = mc.level.getTimeOfDay(currentPartialTick);
+                        float sunAngle = skyAngle < 0.75f ? skyAngle + 0.25f : skyAngle - 0.75f;
+                        // Sun direction: celestial circle in the XY plane
+                        float angle = sunAngle * (float)(2.0 * Math.PI);
+                        rtRenderer.setSunDirection(
+                                (float) Math.cos(angle),
+                                (float) Math.sin(angle),
+                                0.0f);
+                    }
+                } catch (Exception e) {
+                    // Defensive: don't let camera/sun failures block SSAO
+                }
+
                 mainRenderPass.end(cmd);
                 rtRenderer.executeFrame(cmd, depthImage, depthView, frameIdx, imageIndex, true);
                 rtPassExecutedThisFrame = true;
             } catch (Exception e) {
-                if (isDebugLogging() && (frameCounter < 5 || frameCounter % 300 == 0)) {
+                if (frameCounter < 10 || frameCounter % 300 == 0) {
                     LOGGER.warn("[RT] World-end dispatch error: {}", e.getMessage());
                 }
             } finally {
@@ -1022,18 +1113,16 @@ public class Vulkanium implements ClientModInitializer {
         if (fallback == null)
             return null;
 
-        if (getRenderMode() != net.vulkanium.render.RenderMode.SHADERPACK) {
-            return fallback;
-        }
-
-        // When MRT G-buffer is active, shaderpack pipelines are created against the
-        // MRT render pass (N color attachments). After world rendering ends, the main
-        // render pass (1 attachment) is active for GUI/HUD/menu. Using an MRT pipeline
-        // with the main render pass is a Vulkan spec violation. Fall back to vanilla
-        // pipelines for all non-world draws.
+        // Dedicated UI pipeline routing (all render modes): when world rendering
+        // is inactive, prefer UI-specialized pipelines so HUD/text/overlays do
+        // not inherit world-oriented state or shader compatibility behavior.
         if (!worldRenderActive) {
             BasicPipeline uiPipeline = pipelineRegistry.getUiPipeline(format);
             return uiPipeline != null ? uiPipeline : fallback;
+        }
+
+        if (getRenderMode() != net.vulkanium.render.RenderMode.SHADERPACK) {
+            return fallback;
         }
 
         if (shaderpackManager == null || !(shaderpackManager
@@ -1313,8 +1402,11 @@ public class Vulkanium implements ClientModInitializer {
     /** One-shot budget to verify draw entry paths are reached. */
     private static int drawEntryDiagBudget = 10;
     private static int persistEntryDiagBudget = 10;
+    private static long terrainDrawCounter = 0;
     /** One-shot budget for terrain draw diagnostics. */
     private static int terrainDrawDiagBudget = 10;
+    /** One-shot budget for legacy MVP path diagnostic. */
+    private static int terrainMVPDiagBudget = 3;
     /** One-shot budget for shadow post-pass diagnostic. */
     private static int shadowPostDiagBudget = 3;
 
@@ -1435,19 +1527,11 @@ public class Vulkanium implements ClientModInitializer {
         if (pipeline == null)
             return;
 
-        // One-shot entry diagnostic
+        // One-shot entry diagnostic (debug level only)
         if (drawEntryDiagBudget > 0 && frameCounter > 50) {
             drawEntryDiagBudget--;
-            System.err.println("[DRAW-ENTRY] pipe=" + pipeline.getName()
-                + " renderMode=" + getRenderMode()
-                + " verts=" + vertexCount);
-            LOGGER.info("[DRAW-ENTRY] pipe={} mode={} shaderpackCompat={} renderMode={} verts={}",
-                    pipeline.getName(),
-                    getRenderMode(),
-                    getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-                        && pipeline.getName().startsWith("shaderpack_"),
-                    getRenderMode(),
-                    vertexCount);
+            LOGGER.debug("[DRAW-ENTRY] pipe={} mode={} verts={}",
+                    pipeline.getName(), getRenderMode(), vertexCount);
         }
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
@@ -1730,19 +1814,20 @@ public class Vulkanium implements ClientModInitializer {
         if (pipeline == null)
             return;
 
-        // One-shot entry diagnostic
+        // One-shot entry diagnostic (debug level only)
         if (persistEntryDiagBudget > 0 && frameCounter > 50) {
             persistEntryDiagBudget--;
-            System.err.println("[PERSIST-ENTRY] pipe=" + pipeline.getName()
-                + " renderMode=" + getRenderMode()
-                + " verts=" + vertexCount);
-            LOGGER.info("[PERSIST-ENTRY] pipe={} mode={} shaderpackCompat={} renderMode={} verts={}",
-                    pipeline.getName(),
-                    getRenderMode(),
-                    getRenderMode() == net.vulkanium.render.RenderMode.SHADERPACK
-                        && pipeline.getName().startsWith("shaderpack_"),
-                    getRenderMode(),
-                    vertexCount);
+            LOGGER.debug("[PERSIST-ENTRY] pipe={} mode={} verts={}",
+                    pipeline.getName(), getRenderMode(), vertexCount);
+        }
+
+        // Terrain-specific: log first few draws at debug level
+        if (isTerrainLikeFormat(format)) {
+            terrainDrawCounter++;
+            if (terrainDrawCounter <= 3) {
+                LOGGER.debug("[TERRAIN-PERSIST] count={} pipe={} worldActive={} verts={}",
+                        terrainDrawCounter, pipeline.getName(), worldRenderActive, vertexCount);
+            }
         }
 
         VkCommandBuffer cmd = frameOrchestrator.getCommandBuffer();
@@ -1940,12 +2025,29 @@ public class Vulkanium implements ClientModInitializer {
             }
         } else {
             if (VRenderSystem.hasChunkOffset() && isTerrainLikeFormat(format)) {
-                org.joml.Matrix4f modelViewWithOffset = new org.joml.Matrix4f(VRenderSystem.getModelViewMatrix())
+                // MC 1.20.1 renderChunkLayer calls VertexBuffer.draw() (parameterless)
+                // for terrain. The MV uniform is set to camera rotation only (from PoseStack),
+                // and ChunkOffset is set per-section via Uniform. So MV does NOT include
+                // section offset — we MUST add it here via .translate(chunkOffset).
+                // This produces: MVP = Proj × (CamRot × T(sectionOffset)) — correct.
+                if (terrainMVPDiagBudget > 0) {
+                    terrainMVPDiagBudget--;
+                    LOGGER.debug("[MVP-DIAG] chunkOffset translate co=({},{},{}) applied",
+                            VRenderSystem.getChunkOffsetX(),
+                            VRenderSystem.getChunkOffsetY(),
+                            VRenderSystem.getChunkOffsetZ());
+                }
+                // Use the world-render snapshot (captured at renderLevel start) as the camera MV.
+                // The live modelViewMat (getModelViewMatrix()) lags behind camera rotation because
+                // RenderSystem.applyModelViewMatrix() is not reliably called for terrain sections —
+                // so we use getWorldRenderModelView() which is snapshotted from poseStack.last().pose()
+                // at the top of renderChunkLayer and always reflects the current camera rotation.
+                org.joml.Matrix4f modelViewWithOffset = new org.joml.Matrix4f(VRenderSystem.getWorldRenderModelView())
                         .translate(
                                 VRenderSystem.getChunkOffsetX(),
                                 VRenderSystem.getChunkOffsetY(),
                                 VRenderSystem.getChunkOffsetZ());
-                org.joml.Matrix4f projection = new org.joml.Matrix4f(VRenderSystem.getProjectionMatrix());
+                org.joml.Matrix4f projection = new org.joml.Matrix4f(VRenderSystem.getWorldRenderProjection());
                 projection.mul(modelViewWithOffset).get(mvp);
             }
             uboOffset = drawBatcher.uploadUniformsLegacy(frameIndex, mvp, colorMod, fogParams, texMat);
@@ -2348,6 +2450,10 @@ public class Vulkanium implements ClientModInitializer {
 
     public static boolean isVulkanReady() {
         return vulkanReady;
+    }
+
+    public static boolean isWorldRenderActive() {
+        return worldRenderActive;
     }
 
     public static boolean wasVulkanUsed() {

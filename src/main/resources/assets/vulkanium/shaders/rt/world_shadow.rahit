@@ -45,15 +45,15 @@ void main() {
         float coverage = clamp(mat.opacity, 0.2, 0.8);
         float noise = hash13(hitPos * 3.7 + vec3(gl_PrimitiveID, materialId, 0.0));
         if (noise > coverage) {
-            ignoreIntersectionEXT();
+            ignoreIntersectionEXT;
             return;
         }
 
         payload.visibility = max(payload.visibility * (1.0 - coverage), 0.0);
         if (payload.visibility <= 0.02) {
-            terminateRayEXT();
+            terminateRayEXT;
         } else {
-            ignoreIntersectionEXT();
+            ignoreIntersectionEXT;
         }
         return;
     }
@@ -62,13 +62,13 @@ void main() {
         float transmittance = clamp(1.0 - mat.opacity, 0.05, 0.95);
         payload.visibility *= transmittance;
         if (payload.visibility <= 0.02) {
-            terminateRayEXT();
+            terminateRayEXT;
         } else {
-            ignoreIntersectionEXT();
+            ignoreIntersectionEXT;
         }
         return;
     }
 
     payload.visibility = 0.0;
-    terminateRayEXT();
+    terminateRayEXT;
 }
