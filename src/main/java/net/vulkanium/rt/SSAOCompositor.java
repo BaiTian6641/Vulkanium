@@ -60,6 +60,7 @@ public class SSAOCompositor {
 
     // State
     private boolean initialized = false;
+    private boolean reflectionMode = false; // true = alpha-blend reflection compositor
     private int width, height;
 
     /**
@@ -74,13 +75,33 @@ public class SSAOCompositor {
      * @param ssaoImageView RT output image view (R8 SSAO)
      * @param ssaoSampler   Sampler for the SSAO image
      */
+    /**
+     * Initializes the compositor for the shadow/SSAO mask pass
+     * (multiplicative blend).
+     */
     public void initialize(VkDevice device, SPIRVCompiler compiler,
                            int colorFormat, long[] imageViews,
                            int width, int height,
                            long ssaoImageView, long ssaoSampler) {
+        initialize(device, compiler, colorFormat, imageViews,
+                width, height, ssaoImageView, ssaoSampler, false);
+    }
+
+    /**
+     * Initializes the compositor.
+     *
+     * @param reflectionMode if {@code true}, uses Fresnel-weighted alpha blending
+     *                       for the reflection pass instead of multiplicative shadow blend.
+     */
+    public void initialize(VkDevice device, SPIRVCompiler compiler,
+                           int colorFormat, long[] imageViews,
+                           int width, int height,
+                           long ssaoImageView, long ssaoSampler,
+                           boolean reflectionMode) {
         this.device = device;
         this.width = width;
         this.height = height;
+        this.reflectionMode = reflectionMode;
 
         try {
             createRenderPass(colorFormat);
@@ -299,16 +320,30 @@ public class SSAOCompositor {
     }
 
     /**
-     * Updates the descriptor set to point to the current SSAO output image.
-     * Called on init and after resize.
+     * Updates the descriptor set to point to the current SSAO output image,
+     * using {@link org.lwjgl.vulkan.VK10#VK_IMAGE_LAYOUT_GENERAL} (default for SSAO compute output).
      */
     public void updateSSAOBinding(long ssaoImageView, long ssaoSampler) {
+        updateSSAOBinding(ssaoImageView, ssaoSampler, VK_IMAGE_LAYOUT_GENERAL);
+    }
+
+    /**
+     * Updates the descriptor set to point to the given image view and sampler.
+     * Use this overload when the image has been explicitly transitioned to a layout
+     * other than GENERAL (e.g. {@link org.lwjgl.vulkan.VK10#VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}
+     * for the HW RT shadow mask after a GENERAL→SHADER_READ_ONLY barrier).
+     *
+     * @param ssaoImageView view of the shadow/SSAO image
+     * @param ssaoSampler   sampler to use
+     * @param imageLayout   actual current layout of the image (must match what the GPU sees)
+     */
+    public void updateSSAOBinding(long ssaoImageView, long ssaoSampler, int imageLayout) {
         if (compositeDescSet == VK_NULL_HANDLE) return;
 
         try (MemoryStack stack = stackPush()) {
             VkDescriptorImageInfo.Buffer imageInfo = VkDescriptorImageInfo.calloc(1, stack)
                     .imageView(ssaoImageView)
-                    .imageLayout(VK_IMAGE_LAYOUT_GENERAL) // SSAO image stays in GENERAL
+                    .imageLayout(imageLayout)
                     .sampler(ssaoSampler);
 
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
@@ -329,7 +364,9 @@ public class SSAOCompositor {
     private void createPipeline(SPIRVCompiler compiler) {
         // Compile shaders
         ByteBuffer vertSpirv = compiler.compileVertex(COMPOSITE_VERTEX_SHADER, "ssao_composite.vert");
-        ByteBuffer fragSpirv = compiler.compileFragment(COMPOSITE_FRAGMENT_SHADER, "ssao_composite.frag");
+        String fragSrc = reflectionMode ? REFLECTION_FRAGMENT_SHADER : COMPOSITE_FRAGMENT_SHADER;
+        String fragName = reflectionMode ? "reflection_composite.frag" : "ssao_composite.frag";
+        ByteBuffer fragSpirv = compiler.compileFragment(fragSrc, fragName);
         if (vertSpirv == null || fragSpirv == null) {
             LOGGER.error("Failed to compile SSAO compositor shaders");
             if (vertSpirv != null) memFree(vertSpirv);
@@ -407,20 +444,36 @@ public class SSAOCompositor {
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO)
                     .rasterizationSamples(VK_SAMPLE_COUNT_1_BIT);
 
-            // Color blend: MULTIPLICATIVE blending
-            // result.rgb = src.rgb * dst.rgb  (AO value darkens scene)
-            // result.a   = dst.a              (preserve original alpha)
+            // Color blend: choose MULTIPLICATIVE (shadow) or ALPHA_OVER (reflection)
             VkPipelineColorBlendAttachmentState.Buffer blendAttachment = VkPipelineColorBlendAttachmentState.calloc(1, stack);
-            blendAttachment.get(0)
-                    .blendEnable(true)
-                    .srcColorBlendFactor(VK_BLEND_FACTOR_DST_COLOR)
-                    .dstColorBlendFactor(VK_BLEND_FACTOR_ZERO)
-                    .colorBlendOp(VK_BLEND_OP_ADD)
-                    .srcAlphaBlendFactor(VK_BLEND_FACTOR_ZERO)
-                    .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
-                    .alphaBlendOp(VK_BLEND_OP_ADD)
-                    .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                            | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+            if (reflectionMode) {
+                // Fresnel-weighted alpha blend:
+                // result.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
+                blendAttachment.get(0)
+                        .blendEnable(true)
+                        .srcColorBlendFactor(VK_BLEND_FACTOR_SRC_ALPHA)
+                        .dstColorBlendFactor(VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
+                        .colorBlendOp(VK_BLEND_OP_ADD)
+                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
+                        .dstAlphaBlendFactor(VK_BLEND_FACTOR_ZERO)
+                        .alphaBlendOp(VK_BLEND_OP_ADD)
+                        .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+            } else {
+                // MULTIPLICATIVE blending
+                // result.rgb = src.rgb * dst.rgb  (AO / shadow value darkens scene)
+                // result.a   = dst.a              (preserve original alpha)
+                blendAttachment.get(0)
+                        .blendEnable(true)
+                        .srcColorBlendFactor(VK_BLEND_FACTOR_DST_COLOR)
+                        .dstColorBlendFactor(VK_BLEND_FACTOR_ZERO)
+                        .colorBlendOp(VK_BLEND_OP_ADD)
+                        .srcAlphaBlendFactor(VK_BLEND_FACTOR_ZERO)
+                        .dstAlphaBlendFactor(VK_BLEND_FACTOR_ONE)
+                        .alphaBlendOp(VK_BLEND_OP_ADD)
+                        .colorWriteMask(VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                                | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+            }
 
             VkPipelineColorBlendStateCreateInfo colorBlend = VkPipelineColorBlendStateCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO)
@@ -581,22 +634,57 @@ public class SSAOCompositor {
             layout(set = 0, binding = 0) uniform sampler2D ssaoTexture;
 
             void main() {
-                // Sample SSAO value (R8 texture, bilinear upscale from half-res)
+                // Sample shadow/SSAO value.
+                // For HW RT mode this is the RT shadow mask (R channel = [0.25, 1.0]).
+                // For compute SSAO mode this is the SSAO value (R channel ~ [0, 1]).
                 float ao = texture(ssaoTexture, fragUV).r;
 
-                                // Robustness: if AO sample is invalid, fall back to neutral AO.
-                                // This prevents rare driver/layout glitches from blackening
-                                // the whole frame via multiplicative blending.
-                                if (isnan(ao) || isinf(ao) || ao <= 0.0001) {
-                                        ao = 1.0;
-                                }
+                // Robustness: discard only genuinely invalid (NaN / Inf / negative) samples.
+                // Previously this guarded against zeros, but the RT output image is now
+                // always pre-cleared to 1.0 before dispatch, so near-zero values are real.
+                if (isnan(ao) || isinf(ao) || ao < 0.0) {
+                    ao = 1.0; // fall back to neutral (fully lit)
+                }
 
-                // Safety floor: prevent complete blackout while allowing
-                // clearly visible AO darkening in occluded areas.
+                // Safety floor: never let multiplicative blending produce a completely
+                // black result (the rgen already floors at 0.25, but keep this as defence).
                 float safeAo = clamp(ao, 0.25, 1.0);
 
-                // Output AO as RGB — multiplicative blending applies: scene * ao
+                // Output as RGB — multiplicative pipeline blend applies: scene * safeAo
                 outColor = vec4(safeAo, safeAo, safeAo, 1.0);
+            }
+            """;
+
+    /**
+     * Reflection compositor fragment shader.
+     * Reads RGBA from the reflection image (RGB = reflected colour, A = Fresnel weight)
+     * and outputs it directly. The pipeline blend state is SRC_ALPHA / ONE_MINUS_SRC_ALPHA
+     * so the GPU composites: scene * (1 - Fresnel) + reflection * Fresnel.
+     */
+    private static final String REFLECTION_FRAGMENT_SHADER = """
+            #version 450
+
+            layout(location = 0) in vec2 fragUV;
+            layout(location = 0) out vec4 outColor;
+
+            layout(set = 0, binding = 0) uniform sampler2D reflectionTexture;
+
+            void main() {
+                vec4 refl = texture(reflectionTexture, fragUV);
+
+                // Guard against NaN/Inf in colour channels
+                if (any(isnan(refl.rgb)) || any(isinf(refl.rgb))) {
+                    refl.rgb = vec3(0.0);
+                }
+                if (isnan(refl.a) || isinf(refl.a) || refl.a < 0.0) {
+                    refl.a = 0.0; // no contribution
+                }
+
+                // Clamp Fresnel to [0, 0.95] — preserve at least 5% of scene colour
+                refl.a = clamp(refl.a, 0.0, 0.95);
+
+                // Pass RGBA through — alpha blend in pipeline applies Fresnel weighting
+                outColor = refl;
             }
             """;
 }

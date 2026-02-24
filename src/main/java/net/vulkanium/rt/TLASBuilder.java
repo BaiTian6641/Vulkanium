@@ -179,10 +179,14 @@ public class TLASBuilder {
 
             int base = instanceCount * INSTANCE_SIZE;
 
-            // transform[3x4] row-major: identity + camera-relative translation
-            float tx = -cameraPos.x;
-            float ty = -cameraPos.y;
-            float tz = -cameraPos.z;
+            // transform[3x4] row-major: section-world-origin relative to camera.
+            // BLAS vertices are in section-local space (0..16 per axis). Adding the
+            // section world origin and subtracting camera position gives positions
+            // in in camera-relative world space, matching reconstructWorldPos() - camPos
+            // in the rgen shader.
+            float tx = blas.getSectionOriginX() - cameraPos.x;
+            float ty = blas.getSectionOriginY() - cameraPos.y;
+            float tz = blas.getSectionOriginZ() - cameraPos.z;
 
             instanceBufferMapped.putFloat(base, 1.0f);
             instanceBufferMapped.putFloat(base + 4, 0.0f);

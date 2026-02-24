@@ -50,8 +50,11 @@ import static org.lwjgl.vulkan.KHRSwapchain.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
  */
 public class RayTracingRenderer {
     private static final Logger LOGGER = LoggerFactory.getLogger("Vulkanium/RTRenderer");
-    private static final boolean ENABLE_EXPERIMENTAL_HW_RT_DISPATCH =
-            Boolean.getBoolean("vulkanium.rt.experimental.dispatch");
+    /**
+     * Enable hardware ray tracing dispatch. Previously gated behind a JVM flag;
+     * now always enabled — skips gracefully when RT extensions are absent.
+     */
+    private static final boolean ENABLE_EXPERIMENTAL_HW_RT_DISPATCH = true;
 
     /** Compute workgroup size (16×16 = 256 threads) */
     private static final int WORKGROUP_SIZE = 16;
@@ -93,6 +96,8 @@ public class RayTracingRenderer {
 
     // ── SSAO Compositor (applies AO to swapchain via fullscreen pass) ──
     private SSAOCompositor ssaoCompositor;
+    /** Reflection compositor (alpha-blend, runs after shadow compositor) */
+    private SSAOCompositor reflectionCompositor;
 
     // ── Per-frame push constants ──
     private float cameraX, cameraY, cameraZ;
@@ -183,6 +188,22 @@ public class RayTracingRenderer {
             LOGGER.warn("SSAO compositor initialization failed — AO will not be visible", e);
             ssaoCompositor = null;
         }
+
+        // Initialize reflection compositor (alpha-blend, driven by RT reflection image)
+        if (rtModuleManager != null && rtModuleManager.isRTPipelineReady()) {
+            try {
+                long refView    = rtModuleManager.getReflectionOutputImageView();
+                long refSampler = rtModuleManager.getReflectionOutputSampler();
+                if (refView != 0 && refSampler != 0) {
+                    reflectionCompositor = new SSAOCompositor();
+                    reflectionCompositor.initialize(device, compiler, colorFormat, imageViews,
+                            width, height, refView, refSampler, true /*reflectionMode*/);
+                }
+            } catch (Exception e) {
+                LOGGER.warn("Reflection compositor initialization failed", e);
+                reflectionCompositor = null;
+            }
+        }
     }
 
     /**
@@ -217,31 +238,122 @@ public class RayTracingRenderer {
 
         this.frameIndex = frameIdx;
 
-        // 1. Hardware RT pass (if available)
+        // 1. Hardware RT shadow pass (if enabled and pipeline is ready)
         boolean hwRTDispatched = false;
         if (ENABLE_EXPERIMENTAL_HW_RT_DISPATCH
             && rtModuleManager != null && rtModuleManager.isEnabled() && rtModuleManager.isRTPipelineReady()) {
             try {
+                // Transition depth: DEPTH_STENCIL_ATTACHMENT → DEPTH_STENCIL_READ_ONLY
+                // so the rgen shadow shader can sample the vanilla depth buffer via binding 3.
+                VulkaniumCommand.transitionImageLayout(commandBuffer, depthImage,
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        VK_ACCESS_SHADER_READ_BIT,
+                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_IMAGE_ASPECT_DEPTH_BIT);
+
+                // Bind the depth view into RT descriptor set binding 3
+                rtModuleManager.setDepthImageView(depthImageView);
+
+                // Execute RT shadow pass (shadow rays only via TLAS)
                 rtModuleManager.executeFrame(commandBuffer, frameIdx);
-                // Blit RT output (RGBA16F with PBR lighting + RT shadows) over the swapchain.
-                // RT shadows/lighting replace vanilla baked AO + static lightmap.
-                // SSAO still runs on top as a fast broad-scale ambient occlusion pass.
+
+                // If RT actually dispatched (TLAS non-empty), composite shadow mask over vanilla
                 if (rtModuleManager.wasRTDispatchedThisFrame()
                         && rtModuleManager.getRTOutputImage() != 0
-                        && rtModuleManager.getRTWidth() > 0) {
-                    blitRTOutputToSwapchain(commandBuffer, swapchainImageIndex);
-                    hwRTDispatched = true;
+                        && ssaoCompositor != null && ssaoCompositor.isInitialized()) {
+
+                    long rtImage     = rtModuleManager.getRTOutputImage();
+                    long rtImageView = rtModuleManager.getRTOutputImageView();
+                    long rtSampler   = rtModuleManager.getRTOutputSampler();
+
+                    if (rtImageView != 0 && rtSampler != 0) {
+                        // Transition RT output: GENERAL → SHADER_READ_ONLY_OPTIMAL for the compositor
+                        VulkaniumCommand.transitionImageLayout(commandBuffer, rtImage,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+
+                        // Bind the RT shadow mask image to the compositor.
+                        // The image was just transitioned to SHADER_READ_ONLY_OPTIMAL,
+                        // so we must tell the descriptor the correct layout.
+                        ssaoCompositor.updateSSAOBinding(rtImageView, rtSampler,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                        ssaoCompositor.composite(commandBuffer, swapchainImageIndex);
+
+                        // Transition RT output back: SHADER_READ_ONLY → GENERAL for next RT write
+                        VulkaniumCommand.transitionImageLayout(commandBuffer, rtImage,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ACCESS_SHADER_READ_BIT,
+                                VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+
+                        // ── Reflection compositor ──
+                        // Composite reflected sky / terrain over the shadow-darkened scene.
+                        // The Fresnel weight stored in the alpha channel drives alpha blending.
+                        long reflImage   = rtModuleManager.getReflectionOutputImage();
+                        long reflView    = rtModuleManager.getReflectionOutputImageView();
+                        long reflSampler = rtModuleManager.getReflectionOutputSampler();
+                        if (reflectionCompositor != null && reflectionCompositor.isInitialized()
+                                && reflImage != 0 && reflView != 0 && reflSampler != 0) {
+
+                            // Transition reflection image: GENERAL → SHADER_READ_ONLY for sampling
+                            VulkaniumCommand.transitionImageLayout(commandBuffer, reflImage,
+                                    VK_IMAGE_LAYOUT_GENERAL,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    VK_ACCESS_SHADER_WRITE_BIT,
+                                    VK_ACCESS_SHADER_READ_BIT,
+                                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT);
+
+                            reflectionCompositor.updateSSAOBinding(reflView, reflSampler,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                            reflectionCompositor.composite(commandBuffer, swapchainImageIndex);
+
+                            // Transition reflection image back: SHADER_READ_ONLY → GENERAL
+                            VulkaniumCommand.transitionImageLayout(commandBuffer, reflImage,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_GENERAL,
+                                    VK_ACCESS_SHADER_READ_BIT,
+                                    VK_ACCESS_SHADER_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                                    VK_IMAGE_ASPECT_COLOR_BIT);
+                        }
+
+                        hwRTDispatched = true;
+                    }
                 }
+
+                // Restore depth: DEPTH_STENCIL_READ_ONLY → DEPTH_STENCIL_ATTACHMENT
+                // (required before the next frame's raster pass can write depth)
+                VulkaniumCommand.transitionImageLayout(commandBuffer, depthImage,
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        VK_ACCESS_SHADER_READ_BIT,
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                        VK_IMAGE_ASPECT_DEPTH_BIT);
+
             } catch (Exception e) {
                 if (totalSSAODispatches < 5) {
-                    LOGGER.warn("Hardware RT dispatch failed: {}", e.getMessage());
+                    LOGGER.warn("Hardware RT shadow pass failed: {}", e.getMessage());
                 }
             }
-        } else if (!ENABLE_EXPERIMENTAL_HW_RT_DISPATCH && totalSSAODispatches < 3) {
-            LOGGER.info("[RT] Experimental HW RT dispatch disabled (set -Dvulkanium.rt.experimental.dispatch=true to enable); running SSAO-only path");
         }
 
-        // 2. Compute SSAO pass (skip if hardware RT already did full path tracing)
+        // 2. Compute SSAO pass (fallback when HW RT either is unavailable or TLAS is empty)
         if (ssaoEnabled && !hwRTDispatched) {
             dispatchSSAO(commandBuffer, depthImage, depthImageView);
 
@@ -256,6 +368,18 @@ public class RayTracingRenderer {
             if (ssaoCompositor != null && ssaoCompositor.isInitialized()) {
                 ssaoCompositor.composite(commandBuffer, swapchainImageIndex);
             }
+
+            // 4. Restore depth: DEPTH_STENCIL_READ_ONLY → DEPTH_STENCIL_ATTACHMENT
+            // dispatchSSAO transitions depth to READ_ONLY for compute sampling and never
+            // restores it. The next frame's raster pass needs DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
+            VulkaniumCommand.transitionImageLayout(commandBuffer, depthImage,
+                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT,
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
         }
     }
 
@@ -820,6 +944,10 @@ public class RayTracingRenderer {
         if (ssaoCompositor != null) {
             ssaoCompositor.destroy();
             ssaoCompositor = null;
+        }
+        if (reflectionCompositor != null) {
+            reflectionCompositor.destroy();
+            reflectionCompositor = null;
         }
 
         if (computePipeline != VK_NULL_HANDLE) {

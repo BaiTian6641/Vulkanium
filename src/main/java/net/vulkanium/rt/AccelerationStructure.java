@@ -88,6 +88,15 @@ public class AccelerationStructure {
     /** Instance SBT hit-group offset. */
     private int instanceSbtOffset = 0;
 
+    /**
+     * World-space origin of the section this BLAS represents.
+     * Set to sectionX*16, sectionY*16, sectionZ*16.
+     * Used as the TLAS instance translation relative to camera.
+     */
+    private float sectionOriginX = 0.0f;
+    private float sectionOriginY = 0.0f;
+    private float sectionOriginZ = 0.0f;
+
     public AccelerationStructure(Type type, BuildQuality quality) {
         this.type = type;
         this.quality = quality;
@@ -106,6 +115,9 @@ public class AccelerationStructure {
     public int getPrimitiveCount() { return primitiveCount; }
     public int getInstanceCustomIndex() { return instanceCustomIndex; }
     public int getInstanceSbtOffset() { return instanceSbtOffset; }
+    public float getSectionOriginX() { return sectionOriginX; }
+    public float getSectionOriginY() { return sectionOriginY; }
+    public float getSectionOriginZ() { return sectionOriginZ; }
 
     // ── State management ──
 
@@ -118,6 +130,11 @@ public class AccelerationStructure {
     public void setSize(long size) { this.size = size; }
     public void markDirty() { this.dirty = true; }
     public void markClean() { this.dirty = false; }
+    public void setSectionOrigin(float ox, float oy, float oz) {
+        this.sectionOriginX = ox;
+        this.sectionOriginY = oy;
+        this.sectionOriginZ = oz;
+    }
     public void setPrimitiveCount(int count) { this.primitiveCount = count; }
     public void setInstanceCustomIndex(int index) { this.instanceCustomIndex = index & 0x00FFFFFF; }
     public void setInstanceSbtOffset(int offset) { this.instanceSbtOffset = offset & 0x00FFFFFF; }

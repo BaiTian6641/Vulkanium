@@ -1,62 +1,287 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 
-// Ray generation shader — primary camera rays
-// Dispatched at screen resolution, one thread per pixel
+// Ray generation shader -- HYBRID SHADOW + REFLECTION MODE
+//
+// Coordinate convention
+// ─────────────────────
+// BLAS vertices are in section-local space (0..16 per axis).
+// The TLAS instance transform adds (sectionOrigin - cameraPos), putting geometry
+// in CAMERA-RELATIVE world space.
+//
+// Therefore every ray origin derived from the depth buffer must ALSO be made
+// camera-relative: camRelPos = reconstructWorldPos(uv,depth) - camera.cameraPosition
+//
+// Pass 1 – Shadow:
+//   Traces a jittered shadow ray toward the sun.
+//   outImage: shadow factor in [0.25, 1.0].
+//
+// Pass 2 – Reflection:
+//   Detects horizontal (water/ice) and vertical (glass) surfaces.
+//   Adds time-based wave normals on horizontal water.
+//   Traces reflected view-ray → outReflectionImage RGBA16F.
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
-layout(set = 0, binding = 1, rgba16f) uniform image2D outImage;
+layout(set = 0, binding = 1, rgba16f) uniform image2D outImage;            // shadow mask
 
 layout(set = 0, binding = 2, std140) uniform CameraData {
-    mat4 viewInverse;
-    mat4 projInverse;
-    vec3 cameraPosition;
+    mat4  viewInverse;
+    mat4  projInverse;
+    vec3  cameraPosition;
     float time;
-    uint frameIndex;
-    uint maxBounces;
+    uint  frameIndex;
+    uint  maxBounces;
     float sunAngle;
     float padding;
 } camera;
 
-layout(location = 0) rayPayloadEXT struct RayPayload {
-    vec3 color;
+// Depth buffer from the finished vanilla raster pass
+layout(set = 0, binding = 3) uniform sampler2D depthSampler;
+
+// Reflection output image (RGB = reflected colour, A = Fresnel weight)
+layout(set = 0, binding = 4, rgba16f) uniform image2D outReflectionImage;
+
+// Shadow ray payload at location 1 (shadow.rmiss sets .visibility = 1.0)
+layout(location = 1) rayPayloadEXT struct ShadowPayload {
+    float visibility;
+} shadowPayload;
+
+// Reflection ray payload at location 0 (sky.rmiss + world_solid.rchit write colour)
+layout(location = 0) rayPayloadEXT struct ReflectionPayload {
+    vec3  color;
     float distance;
-    vec3 normal;
-    uint bounceCount;
-} payload;
+    vec3  normal;
+    uint  bounceCount;
+} reflPayload;
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+float hash13(vec3 p) {
+    p  = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+// ── Wave normal for water surfaces ─────────────────────────────────────────
+// Two-layer scrolling sine waves evaluated in world-space XZ.
+// Returns a perturbed UP normal suitable for horizontal water reflection.
+vec3 waterWaveNormal(vec3 worldPos) {
+    float t  = camera.time * 0.8;
+    float px = worldPos.x;
+    float pz = worldPos.z;
+    float dhdx = cos(px * 0.8 + t * 1.2) * 0.8 * cos(pz * 0.6 + t * 0.9) * 0.18
+               + cos(px * 1.5 - t * 0.7 + pz * 1.1) * 1.5 * 0.10;
+    float dhdz = sin(px * 0.8 + t * 1.2) * (-sin(pz * 0.6 + t * 0.9)) * 0.6 * 0.18
+               + cos(px * 1.5 - t * 0.7 + pz * 1.1) * 1.1 * 0.10;
+    vec3 tangentX = vec3(1.0, dhdx, 0.0);
+    vec3 tangentZ = vec3(0.0, dhdz, 1.0);
+    return normalize(cross(tangentZ, tangentX));
+}
+
+// Sun direction in world space: sunAngle is normalised [0,1] already
+vec3 getSunDirection() {
+    float angle = camera.sunAngle * 6.28318530718;
+    return normalize(vec3(cos(angle), sin(angle), 0.3));
+}
+
+// Reconstruct world-space position from screen UV and nonlinear depth [0,1]
+vec3 reconstructWorldPos(vec2 uv, float depth) {
+    vec2 ndc    = uv * 2.0 - 1.0;
+    ndc.y       = -ndc.y;                        // Vulkan top-left → Y-up NDC
+    float clipZ = depth * 2.0 - 1.0;            // [0,1] → [-1,1]
+    vec4 clipPos  = vec4(ndc.x, ndc.y, clipZ, 1.0);
+    vec4 viewPos  = camera.projInverse * clipPos;
+    viewPos      /= viewPos.w;
+    return (camera.viewInverse * viewPos).xyz;
+}
+
+// Reconstruct world-space surface normal from depth finite differences.
+// Returns vec3(0) if any neighbour is sky/background (depth ≥ 0.9999).
+vec3 reconstructNormal(vec2 uv, vec2 texelSize, vec3 centerPos) {
+    float dL = textureLod(depthSampler, uv + vec2(-texelSize.x,  0.0),        0.0).r;
+    float dR = textureLod(depthSampler, uv + vec2( texelSize.x,  0.0),        0.0).r;
+    float dD = textureLod(depthSampler, uv + vec2( 0.0, -texelSize.y),        0.0).r;
+    float dU = textureLod(depthSampler, uv + vec2( 0.0,  texelSize.y),        0.0).r;
+    if (dL >= 0.9999 || dR >= 0.9999 || dD >= 0.9999 || dU >= 0.9999) return vec3(0.0);
+
+    vec3 posL = reconstructWorldPos(uv + vec2(-texelSize.x,  0.0), dL);
+    vec3 posR = reconstructWorldPos(uv + vec2( texelSize.x,  0.0), dR);
+    vec3 posD = reconstructWorldPos(uv + vec2( 0.0, -texelSize.y), dD);
+    vec3 posU = reconstructWorldPos(uv + vec2( 0.0,  texelSize.y), dU);
+
+    vec3 dX = posR - posL;
+    vec3 dY = posU - posD;
+    vec3 n  = normalize(cross(dX, dY));
+    // Ensure normal faces toward the camera
+    if (dot(n, camera.cameraPosition - centerPos) < 0.0) n = -n;
+    return n;
+}
+
+// Schlick Fresnel — F0 = 0.04 (water / polished surface)
+float fresnelSchlick(float cosTheta) {
+    const float F0 = 0.04;
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────
 
 void main() {
-    vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
-    vec2 uv = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
-    vec2 ndc = uv * 2.0 - 1.0;
-    ndc.y = -ndc.y; // Vulkan pixel(0,0) is top-left; flip Y so NDC matches MC's Y-up projection
+    ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+    vec2  res        = vec2(gl_LaunchSizeEXT.xy);
+    vec2  uv         = (vec2(pixelCoord) + 0.5) / res;
+    vec2  texelSize  = 1.0 / res;
 
-    // Compute ray origin and direction from inverse camera matrices
-    vec4 origin = camera.viewInverse * vec4(0.0, 0.0, 0.0, 1.0);
-    vec4 target = camera.projInverse * vec4(ndc.x, ndc.y, 1.0, 1.0);
-    target /= target.w;
-    vec4 direction = camera.viewInverse * vec4(normalize(target.xyz), 0.0);
+    // Sample depth at this pixel
+    float depth = textureLod(depthSampler, uv, 0.0).r;
 
-    payload.color = vec3(0.0);
-    payload.distance = -1.0;
-    payload.normal = vec3(0.0);
-    payload.bounceCount = 0;
+    // ════════════════════════════════════════════════════════════
+    //  SHADOW PASS
+    // ════════════════════════════════════════════════════════════
 
+    // Sky / far background: always fully lit, no reflection
+    if (depth >= 0.9999) {
+        imageStore(outImage,           pixelCoord, vec4(1.0));
+        imageStore(outReflectionImage, pixelCoord, vec4(0.0));
+        return;
+    }
+
+    // ── Reconstruct surface position ────────────────────────────────────
+    // worldPos: absolute world-space (for normal reconstruction, wave eval, Fresnel)
+    // camRelPos: camera-relative space matching TLAS coordinate system
+    vec3 worldPos  = reconstructWorldPos(uv, depth);
+    vec3 camRelPos = worldPos - camera.cameraPosition;
+
+    // Sun direction
+    vec3 sunDir = getSunDirection();
+
+    float shadowFactor;
+
+    // Night / sun well below horizon: ambient-only, skip shadow trace
+    if (sunDir.y < -0.1) {
+        shadowFactor = 0.28;
+    } else {
+        // Twilight damping near horizon (sunDir.y in [−0.1, 0.15])
+        float twilight = clamp((sunDir.y + 0.1) / 0.25, 0.0, 1.0);
+
+        // Soft shadow: jitter sun direction for penumbra
+        const float SUN_RADIUS = 0.025; // ~1.4° half-angle
+        float seed        = float(pixelCoord.x + pixelCoord.y * 1361 + int(camera.frameIndex) * 65537);
+        float jitterAngle = 6.28318530718 * hash13(vec3(seed, camera.time, 1.7));
+        float jitterR     = SUN_RADIUS * sqrt(hash13(vec3(camera.time + 2.3, seed + 7.0, 0.0)));
+        vec3  upRef       = abs(sunDir.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        vec3  tangent     = normalize(cross(sunDir, upRef));
+        vec3  bitangent   = normalize(cross(sunDir, tangent));
+        vec3  jitteredDir = normalize(
+            sunDir + tangent * (cos(jitterAngle) * jitterR) + bitangent * (sin(jitterAngle) * jitterR));
+
+        // Bias origin along Y to reduce self-intersection on flat terrain.
+        // Ray origin is in camera-relative space — matches TLAS geometry space.
+        float selfBias  = 0.05 + depth * 0.15;
+        vec3  rayOrigin = camRelPos + vec3(0.0, selfBias, 0.0);
+
+        // Trace shadow ray
+        //   gl_RayFlagsTerminateOnFirstHitEXT   : stop at the very first obstruction
+        //   gl_RayFlagsSkipClosestHitShaderEXT  : skip world_solid.rchit (unnecessary cost)
+        //   shadow.rmiss (miss index 1) sets visibility = 1.0 if nothing blocks the ray.
+        shadowPayload.visibility = 0.0;
+        traceRayEXT(
+            topLevelAS,
+            gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+            0xFF,          // cull mask — all instances
+            0,             // SBT hit-group offset
+            0,             // SBT hit-group stride
+            1,             // miss shader index 1 → shadow.rmiss
+            rayOrigin,
+            0.01,          // tMin
+            jitteredDir,
+            1500.0,        // tMax (beyond any block overhangs)
+            1              // payload location
+        );
+
+        float lit          = shadowPayload.visibility;           // 0 = shadow, 1 = lit
+        float ambientFloor = 0.25 + twilight * 0.10;            // 0.25 ‒ 0.35
+        shadowFactor = mix(ambientFloor, 1.0, lit);
+    }
+
+    imageStore(outImage, pixelCoord, vec4(shadowFactor, shadowFactor, shadowFactor, 1.0));
+
+    // ════════════════════════════════════════════════════════════
+    //  REFLECTION PASS
+    // ════════════════════════════════════════════════════════════
+
+    // Reconstruct surface geometry normal from depth finite differences
+    vec3 geoNormal      = reconstructNormal(uv, texelSize, worldPos);
+    bool validGeoNormal = (length(geoNormal) > 0.5);
+
+    // Reflective surface filter:
+    //   isHorizontal — water / ice / wet ground: normal points mostly up
+    //   isVertical   — glass panes / windows: normal is mostly horizontal
+    bool isHorizontal = validGeoNormal && (geoNormal.y > 0.55);
+    bool isVertical   = validGeoNormal && (abs(geoNormal.y) < 0.30);
+    if (!isHorizontal && !isVertical) {
+        imageStore(outReflectionImage, pixelCoord, vec4(0.0));
+        return;
+    }
+
+    // View direction (absolute world space)
+    vec3 viewDir = normalize(worldPos - camera.cameraPosition);
+
+    // Choose reflection normal: wave-perturbed for water, geometry normal for glass
+    vec3 reflNormal;
+    if (isHorizontal) {
+        reflNormal = waterWaveNormal(worldPos);
+        if (reflNormal.y < 0.05) reflNormal.y = 0.05;
+        reflNormal = normalize(reflNormal);
+    } else {
+        reflNormal = geoNormal;
+    }
+
+    // Fresnel: Schlick with water/glass F0 = 0.04
+    float cosTheta = max(dot(-viewDir, reflNormal), 0.0);
+    float fresnel  = fresnelSchlick(cosTheta);
+
+    // Perceptual boost on horizontal water so mid-angle sky is clearly visible
+    if (isHorizontal) {
+        fresnel = clamp(fresnel * 3.0 + 0.05, 0.05, 0.95);
+    }
+
+    // Skip trivially dark reflections
+    if (fresnel < 0.005) {
+        imageStore(outReflectionImage, pixelCoord, vec4(0.0));
+        return;
+    }
+
+    // Reflection direction
+    vec3 reflectDir = reflect(viewDir, reflNormal);
+    // Clamp below-horizon to avoid tracing into ground geometry
+    if (reflectDir.y < 0.0) {
+        reflectDir.y = 0.02;
+        reflectDir = normalize(reflectDir);
+    }
+
+    // Ray origin in camera-relative space (matches TLAS), bias along normal
+    vec3 reflectOrigin = camRelPos + reflNormal * 0.1;
+
+    // Trace reflection ray
+    //   miss index 0 → sky.rmiss  → procedural sky colour (main visible result)
+    //   hit         → world_solid.rchit → ambient terrain colour (reflected blocks)
+    reflPayload.color       = vec3(0.4);
+    reflPayload.distance    = -1.0;
+    reflPayload.bounceCount = 0u;
     traceRayEXT(
         topLevelAS,
-        gl_RayFlagsNoneEXT,
-        0xFF,              // cull mask
-        0,                 // SBT record offset
-        0,                 // SBT record stride
-        0,                 // miss shader index
-        origin.xyz,
-        0.001,             // tMin
-        direction.xyz,
-        10000.0,           // tMax
-        0                  // payload location
+        0,             // no special flags — allow rchit and rmiss to both fire
+        0xFF,          // cull mask
+        0,             // SBT hit-group offset
+        0,             // SBT hit-group stride
+        0,             // miss shader index 0 → sky.rmiss
+        reflectOrigin,
+        0.05,          // tMin
+        reflectDir,
+        10000.0,       // tMax
+        0              // payload location 0
     );
 
-    // payload.color is already gamma-corrected or perceptual (rchit applies sRGB,
-    // sky.rmiss uses perceptual sky colors). Store directly.
-    imageStore(outImage, ivec2(gl_LaunchIDEXT.xy), vec4(payload.color, 1.0));
+    // Write RGBA: reflected colour + Fresnel weight in alpha
+    imageStore(outReflectionImage, pixelCoord, vec4(reflPayload.color, fresnel));
 }

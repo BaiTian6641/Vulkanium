@@ -1592,13 +1592,18 @@ public class Vulkanium implements ClientModInitializer {
         // ─── END DIAGNOSTIC ───
 
         // Build fog params for shader UBO
+        // fogParams[6] = RT sky-flatten flag: tells BLOCK_VERT to maximise sky light so that
+        // the vanilla baked sky-shadow is removed and RT provides actual per-pixel shadows.
+        float rtSkyFlatten = (getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
+                && config != null && config.rayTracingEnabled) ? 1.0f : 0.0f;
         float[] fogParams = {
                 net.vulkanium.compat.VRenderSystem.getFogColorR(),
                 net.vulkanium.compat.VRenderSystem.getFogColorG(),
                 net.vulkanium.compat.VRenderSystem.getFogColorB(),
                 net.vulkanium.compat.VRenderSystem.getFogColorA(),
                 net.vulkanium.compat.VRenderSystem.getFogStart(),
-                net.vulkanium.compat.VRenderSystem.getFogEnd()
+                net.vulkanium.compat.VRenderSystem.getFogEnd(),
+                rtSkyFlatten
         };
 
         // Get texture matrix for glint/scroll UV animation
@@ -1847,10 +1852,14 @@ public class Vulkanium implements ClientModInitializer {
         diagFrameDrawCount++;
 
         // Build fog params for shader UBO
+        // fogParams[6] = RT sky-flatten flag (see recordDrawPersistent for explanation)
+        float rtSkyFlattenD = (getRenderMode() == net.vulkanium.render.RenderMode.VANILLA_RT
+                && config != null && config.rayTracingEnabled) ? 1.0f : 0.0f;
         float[] fogParams = {
                 VRenderSystem.getFogColorR(), VRenderSystem.getFogColorG(),
                 VRenderSystem.getFogColorB(), VRenderSystem.getFogColorA(),
-                VRenderSystem.getFogStart(), VRenderSystem.getFogEnd()
+                VRenderSystem.getFogStart(), VRenderSystem.getFogEnd(),
+                rtSkyFlattenD
         };
 
         // Get texture matrix for glint/scroll UV animation

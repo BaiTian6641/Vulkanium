@@ -86,6 +86,16 @@ public class RTModuleManager {
     private long rtOutputImage = 0;
     private VulkaniumMemory.ImageAllocation rtOutputImageAlloc = null;
     private long rtOutputImageView = 0;
+    /** Sampler for the RT output image (used by SSAOCompositor when compositing shadow mask) */
+    private long rtOutputSampler = 0;
+    /** Reflection output image (RGBA16F): RGB=reflected colour, A=Fresnel weight) */
+    private long reflectionOutputImage = 0;
+    private VulkaniumMemory.ImageAllocation reflectionOutputImageAlloc = null;
+    private long reflectionOutputImageView = 0;
+    private long reflectionOutputSampler = 0;
+    private boolean reflectionOutputReady = false;
+    /** Sampler for reading the vanilla depth buffer in the shadow rgen shader */
+    private long depthSampler = 0;
     /** Camera uniform buffer */
     private long cameraUBO = 0;
     private long cameraUBOAllocation = 0;
@@ -103,6 +113,11 @@ public class RTModuleManager {
     private boolean rtPipelineReady = false;
     /** Whether RT was actually dispatched this frame (has geometry + pipeline ready) */
     private boolean rtDispatchedThisFrame = false;
+    /**
+     * Whether the RT output image has been transitioned from UNDEFINED→GENERAL at least once.
+     * Also used to pick the correct srcLayout for the per-frame clear barrier.
+     */
+    private boolean rtOutputReady = false;
 
     public RTModuleManager(VulkaniumDevice device, VulkaniumMemory memory,
                             VulkaniumQueues queues, RTCapabilities capabilities) {
@@ -203,10 +218,12 @@ public class RTModuleManager {
 
         // 2. Descriptor set layout:
         //   binding 0 = TLAS (acceleration structure)
-        //   binding 1 = output image (storage image, RGBA16F)
+        //   binding 1 = shadow output image (storage image, RGBA16F)
         //   binding 2 = camera UBO
+        //   binding 3 = depth sampler (read vanilla depth buffer in rgen to reconstruct world pos)
+        //   binding 4 = reflection output image (storage image, RGBA16F) — RGB=reflected colour, A=Fresnel
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            var bindings = VkDescriptorSetLayoutBinding.calloc(3, stack);
+            var bindings = VkDescriptorSetLayoutBinding.calloc(5, stack);
             // TLAS
             bindings.get(0)
                     .binding(0)
@@ -226,6 +243,18 @@ public class RTModuleManager {
                     .descriptorCount(1)
                     .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
                             | VK_SHADER_STAGE_MISS_BIT_KHR);
+            // Depth sampler (binding 3 — rgen samples vanilla depth buffer)
+            bindings.get(3)
+                    .binding(3)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+            // Reflection output image (binding 4)
+            bindings.get(4)
+                    .binding(4)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
 
             var layoutCI = VkDescriptorSetLayoutCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
@@ -275,10 +304,11 @@ public class RTModuleManager {
 
         // 7. Descriptor pool and set
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            var poolSizes = VkDescriptorPoolSize.calloc(3, stack);
+            var poolSizes = VkDescriptorPoolSize.calloc(4, stack);
             poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(1);
-            poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(1);
+            poolSizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2); // shadow + reflection images
             poolSizes.get(2).type(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER).descriptorCount(1);
+            poolSizes.get(3).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1); // depth sampler
             var poolCI = VkDescriptorPoolCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO)
                     .maxSets(1)
@@ -315,7 +345,22 @@ public class RTModuleManager {
 
         rtPipelineReady = true;
 
-        // Create initial RT output image at current render resolution
+        // Create depth sampler (for rgen to read vanilla depth buffer)
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSamplerCreateInfo samplerCI = VkSamplerCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+                    .magFilter(VK_FILTER_NEAREST)
+                    .minFilter(VK_FILTER_NEAREST)
+                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .minLod(0.0f)
+                    .maxLod(0.0f);
+            LongBuffer pSampler = stack.mallocLong(1);
+            checkVk(vkCreateSampler(device, samplerCI, null, pSampler));
+            depthSampler = pSampler.get(0);
+        }
         try {
             var swapchain = Vulkanium.getVulkanSwapchain();
             if (swapchain != null && swapchain.getWidth() > 0 && swapchain.getHeight() > 0) {
@@ -366,6 +411,9 @@ public class RTModuleManager {
             rtOutputImageAlloc = null;
             rtOutputImage = 0;
         }
+        // Reset layout tracking so the next ensureRTOutputReadyAndClear() re-initialises it
+        rtOutputReady = false;
+        reflectionOutputReady = false;
 
         // VK_FORMAT_R16G16B16A16_SFLOAT = 97
         int format = 97;
@@ -410,7 +458,94 @@ public class RTModuleManager {
         rtWidth = width;
         rtHeight = height;
         rtPipeline.resize(width, height);
-        LOGGER.info("RT output image created: {}x{} RGBA16F", width, height);
+
+        // Create (or recreate) sampler for RT shadow output image — used by SSAOCompositor
+        if (rtOutputSampler != 0) {
+            vkDestroySampler(device, rtOutputSampler, null);
+            rtOutputSampler = 0;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSamplerCreateInfo samplerCI = VkSamplerCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+                    .magFilter(VK_FILTER_LINEAR)
+                    .minFilter(VK_FILTER_LINEAR)
+                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .minLod(0.0f)
+                    .maxLod(0.0f);
+            LongBuffer pSampler = stack.mallocLong(1);
+            checkVk(vkCreateSampler(device, samplerCI, null, pSampler));
+            rtOutputSampler = pSampler.get(0);
+        }
+
+        // ── Create reflection output image (RGBA16F, same resolution) ──
+        if (reflectionOutputImageView != 0) {
+            vkDestroyImageView(device, reflectionOutputImageView, null);
+            reflectionOutputImageView = 0;
+        }
+        if (reflectionOutputImageAlloc != null) {
+            memory.freeImageImmediate(reflectionOutputImageAlloc);
+            reflectionOutputImageAlloc = null;
+            reflectionOutputImage = 0;
+        }
+        reflectionOutputImageAlloc = memory.createImage(width, height, 1, format,
+                VK_IMAGE_TILING_OPTIMAL, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        reflectionOutputImage = reflectionOutputImageAlloc.image();
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var viewCI = VkImageViewCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO)
+                    .image(reflectionOutputImage)
+                    .viewType(VK_IMAGE_VIEW_TYPE_2D)
+                    .format(format);
+            viewCI.subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            LongBuffer pView = stack.mallocLong(1);
+            checkVk(vkCreateImageView(device, viewCI, null, pView));
+            reflectionOutputImageView = pView.get(0);
+        }
+
+        // Update descriptor binding 4 (reflection storage image)
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var imgInfo = VkDescriptorImageInfo.calloc(1, stack)
+                    .imageView(reflectionOutputImageView)
+                    .imageLayout(VK_IMAGE_LAYOUT_GENERAL);
+            var write = VkWriteDescriptorSet.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+                    .dstSet(descriptorSet)
+                    .dstBinding(4)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1)
+                    .pImageInfo(imgInfo);
+            vkUpdateDescriptorSets(device, write, null);
+        }
+
+        // Create (or recreate) sampler for RT reflection output image
+        if (reflectionOutputSampler != 0) {
+            vkDestroySampler(device, reflectionOutputSampler, null);
+            reflectionOutputSampler = 0;
+        }
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkSamplerCreateInfo samplerCI = VkSamplerCreateInfo.calloc(stack)
+                    .sType(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO)
+                    .magFilter(VK_FILTER_LINEAR)
+                    .minFilter(VK_FILTER_LINEAR)
+                    .mipmapMode(VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                    .addressModeU(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeV(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .addressModeW(VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+                    .minLod(0.0f)
+                    .maxLod(0.0f);
+            LongBuffer pSampler = stack.mallocLong(1);
+            checkVk(vkCreateSampler(device, samplerCI, null, pSampler));
+            reflectionOutputSampler = pSampler.get(0);
+        }
+
+        LOGGER.info("RT output images created: {}x{} RGBA16F (shadow + reflection)", width, height);
     }
 
     /**
@@ -517,6 +652,23 @@ public class RTModuleManager {
         int blasBuilds = blasManager.buildDirtyBLASes(commandBuffer);
         blasBuildsThisFrame = blasBuilds;
 
+        // 1b. If any BLASes were built this frame, insert a memory barrier so the TLAS build
+        //     (step 2) sees the fully written BLAS data.  Without this, the GPU may start
+        //     building the TLAS before the BLAS AS writes are visible.
+        if (blasBuilds > 0) {
+            try (org.lwjgl.system.MemoryStack _s = org.lwjgl.system.MemoryStack.stackPush()) {
+                var blasTlasBarrier = VkMemoryBarrier.calloc(1, _s)
+                        .sType(VK_STRUCTURE_TYPE_MEMORY_BARRIER)
+                        .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
+                        .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+                vkCmdPipelineBarrier(
+                        commandBuffer,
+                        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                        0, blasTlasBarrier, null, null);
+            }
+        }
+
         // 2. Rebuild TLAS — use actual camera position for camera-relative instance transforms
         double camX = 0, camY = 0, camZ = 0;
         try {
@@ -531,6 +683,13 @@ public class RTModuleManager {
 
         // 3. Barrier: AS build → ray trace
         insertASBarrier(commandBuffer);
+
+        // 3b. Ensure RT output images are in GENERAL layout and pre-cleared:
+        //   - shadow image → (1,1,1,1) = fully lit / neutral
+        //   - reflection image → (0,0,0,0) = no reflection contribution
+        //     Must happen BEFORE the dispatch gate so even empty-TLAS frames give safe values.
+        ensureRTOutputReadyAndClear(commandBuffer);
+        ensureReflectionOutputReadyAndClear(commandBuffer);
 
         // 4. Update descriptors and dispatch rays (only when TLAS has geometry)
         if (rtPipelineReady && sbt.isReady() && tlasBuilder.getInstanceCount() > 0) {
@@ -549,6 +708,81 @@ public class RTModuleManager {
         }
 
         lastTraceTimeNs = System.nanoTime() - startNs;
+    }
+
+    /**
+     * Ensures the RT output image is in VK_IMAGE_LAYOUT_GENERAL and pre-cleared to
+     * {1,1,1,1} (fully lit / neutral shadow mask) before each frame's ray dispatch.
+     *
+     * <p>On the very first call the image is transitioned out of UNDEFINED layout.
+     * On every subsequent call the image is already in GENERAL (from the previous
+     * frame's write) and only the clear + barrier are emitted.</p>
+     *
+     * <p>Why clear each frame? When the TLAS is empty (e.g. first few frames while
+     * BLASes are being built) no rays are fired and no pixels are written.  Without
+     * the clear the compositor would sample stale / garbage values.</p>
+     */
+    private void ensureRTOutputReadyAndClear(VkCommandBuffer commandBuffer) {
+        if (rtOutputImage == 0) return;
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            // ── Step 1: transition to GENERAL (only strictly needed the first time) ──
+            // We always re-emit the barrier so that any concurrent RT write from the
+            // previous frame is made visible before the TRANSFER clear.
+            int oldLayout    = rtOutputReady ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            int srcAccess    = rtOutputReady ? VK_ACCESS_SHADER_WRITE_BIT : 0;
+            int srcStageMask = rtOutputReady
+                    ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                    : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+
+            var toTransferBarrier = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .srcAccessMask(srcAccess)
+                    .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .oldLayout(oldLayout)
+                    .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(rtOutputImage);
+            toTransferBarrier.get(0).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            vkCmdPipelineBarrier(commandBuffer,
+                    srcStageMask,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, null, null, toTransferBarrier);
+            rtOutputReady = true;
+
+            // ── Step 2: clear to {1, 1, 1, 1} — fully lit / neutral ──
+            var clearColor = VkClearColorValue.calloc(stack)
+                    .float32(0, 1.0f).float32(1, 1.0f).float32(2, 1.0f).float32(3, 1.0f);
+            var clearRange = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            vkCmdClearColorImage(commandBuffer, rtOutputImage,
+                    VK_IMAGE_LAYOUT_GENERAL, clearColor, clearRange);
+
+            // ── Step 3: make the cleared value visible to the RT shader (imageStore) ──
+            var toRTBarrier = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT)
+                    .oldLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(rtOutputImage);
+            toRTBarrier.get(0).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            vkCmdPipelineBarrier(commandBuffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0, null, null, toRTBarrier);
+        }
     }
 
     private void dispatchRays(VkCommandBuffer commandBuffer) {
@@ -575,6 +809,67 @@ public class RTModuleManager {
 
         // Trace rays — full screen dispatch
         sbt.cmdTraceRays(commandBuffer, rtWidth, rtHeight);
+    }
+
+    /**
+     * Ensures the reflection output image is in VK_IMAGE_LAYOUT_GENERAL and cleared to
+     * transparent black {0,0,0,0} (no reflection contribution) before each frame's dispatch.
+     */
+    private void ensureReflectionOutputReadyAndClear(VkCommandBuffer commandBuffer) {
+        if (reflectionOutputImage == 0) return;
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            int oldLayout    = reflectionOutputReady ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            int srcAccess    = reflectionOutputReady ? VK_ACCESS_SHADER_WRITE_BIT : 0;
+            int srcStageMask = reflectionOutputReady
+                    ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                    : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+
+            var toTransfer = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .srcAccessMask(srcAccess)
+                    .dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .oldLayout(oldLayout)
+                    .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(reflectionOutputImage);
+            toTransfer.get(0).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            vkCmdPipelineBarrier(commandBuffer, srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, null, null, toTransfer);
+            reflectionOutputReady = true;
+
+            // Clear to transparent black — no reflection contribution when TLAS empty
+            var clearColor = VkClearColorValue.calloc(stack)
+                    .float32(0, 0.0f).float32(1, 0.0f).float32(2, 0.0f).float32(3, 0.0f);
+            var clearRange = VkImageSubresourceRange.calloc(1, stack)
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            vkCmdClearColorImage(commandBuffer, reflectionOutputImage,
+                    VK_IMAGE_LAYOUT_GENERAL, clearColor, clearRange);
+
+            var toRT = VkImageMemoryBarrier.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                    .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT)
+                    .oldLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                    .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                    .image(reflectionOutputImage);
+            toRT.get(0).subresourceRange()
+                    .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1)
+                    .baseArrayLayer(0).layerCount(1);
+            vkCmdPipelineBarrier(commandBuffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                    0, null, null, toRT);
+        }
     }
 
     private void insertASBarrier(VkCommandBuffer commandBuffer) {
@@ -641,6 +936,11 @@ public class RTModuleManager {
             indexCount > 65535);
         blasManager.setInstanceMaterialId(sectionKey, 0); // default terrain material
         blasManager.setInstanceSbtOffset(sectionKey, translucent ? 1 : 0);
+        // Record section world-space origin so TLASBuilder can form correct camera-relative
+        // instance transforms: the BLAS vertices are in section-local space (0..16),
+        // so the TLAS transform must add the section origin and subtract camera position.
+        blasManager.setInstanceWorldOrigin(sectionKey,
+                sectionX * 16.0f, sectionY * 16.0f, sectionZ * 16.0f);
         blasManager.markDirty(sectionKey);
     }
 
@@ -705,6 +1005,11 @@ public class RTModuleManager {
         // Clean up RT pipeline resources
         if (rtOutputImageView != 0) { vkDestroyImageView(device, rtOutputImageView, null); rtOutputImageView = 0; }
         if (rtOutputImageAlloc != null) { memory.freeImageImmediate(rtOutputImageAlloc); rtOutputImageAlloc = null; rtOutputImage = 0; }
+        if (rtOutputSampler != 0) { vkDestroySampler(device, rtOutputSampler, null); rtOutputSampler = 0; }
+        if (reflectionOutputImageView != 0) { vkDestroyImageView(device, reflectionOutputImageView, null); reflectionOutputImageView = 0; }
+        if (reflectionOutputImageAlloc != null) { memory.freeImageImmediate(reflectionOutputImageAlloc); reflectionOutputImageAlloc = null; reflectionOutputImage = 0; }
+        if (reflectionOutputSampler != 0) { vkDestroySampler(device, reflectionOutputSampler, null); reflectionOutputSampler = 0; }
+        if (depthSampler != 0) { vkDestroySampler(device, depthSampler, null); depthSampler = 0; }
         if (cameraUBOMapped != null) { memory.unmapBuffer(cameraUBOAllocation); cameraUBOMapped = null; }
         if (cameraUBO != 0) { memory.freeBuffer(cameraUBO, cameraUBOAllocation); cameraUBO = 0; }
         if (descriptorPool != 0) { vkDestroyDescriptorPool(device, descriptorPool, null); descriptorPool = 0; }
@@ -738,10 +1043,42 @@ public class RTModuleManager {
     public boolean wasRTDispatchedThisFrame() { return rtDispatchedThisFrame; }
     public long getRTOutputImage() { return rtOutputImage; }
     public long getRTOutputImageView() { return rtOutputImageView; }
+    /** Sampler for compositing the RT shadow mask over vanilla via SSAOCompositor. */
+    public long getRTOutputSampler() { return rtOutputSampler; }
+    public long getReflectionOutputImage() { return reflectionOutputImage; }
+    public long getReflectionOutputImageView() { return reflectionOutputImageView; }
+    public long getReflectionOutputSampler() { return reflectionOutputSampler; }
     public int getRTWidth() { return rtWidth; }
     public int getRTHeight() { return rtHeight; }
     public RTCapabilities getCapabilities() { return capabilities; }
     public RTCapabilities.Tier getActiveTier() { return activeTier; }
     public int getBLASBuildsThisFrame() { return blasBuildsThisFrame; }
     public long getLastTraceTimeNs() { return lastTraceTimeNs; }
+
+    /**
+     * Updates the depth-sampler descriptor (binding 3) with the current frame's
+     * vanilla depth image view.  Must be called before {@link #executeFrame} each
+     * frame so the rgen shadow shader can read the correct depth buffer.
+     *
+     * @param depthImageView VkImageView of the vanilla depth buffer in
+     *                       VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+     */
+    public void setDepthImageView(long depthImageView) {
+        if (descriptorSet == 0 || depthSampler == 0 || depthImageView == 0) return;
+        VkDevice device = vulkaniumDevice.getLogicalDevice();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var imgInfo = VkDescriptorImageInfo.calloc(1, stack)
+                    .sampler(depthSampler)
+                    .imageView(depthImageView)
+                    .imageLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            var write = VkWriteDescriptorSet.calloc(1, stack)
+                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
+                    .dstSet(descriptorSet)
+                    .dstBinding(3)
+                    .descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .pImageInfo(imgInfo);
+            vkUpdateDescriptorSets(device, write, null);
+        }
+    }
 }

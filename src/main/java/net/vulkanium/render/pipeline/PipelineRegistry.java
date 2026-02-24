@@ -372,7 +372,11 @@ public class PipelineRegistry {
                 fragColorMod = ubo.ColorModulator;
                 vertexDistance = length((ubo.MVP * vec4(Position, 1.0)).xyz);
                 // Lightmap brightness from UV2 (block/sky light encoded as shorts 0-240)
-                fragLightBrightness = clamp(float(max(UV2.x, UV2.y)) / 240.0, 0.03, 1.0);
+                // ubo.FogRange.z = 1.0 when RT shadows are active: sky light is maximised so
+                // that vanilla baked sky-shadow is removed. RT will provide the actual shadow.
+                // Block light (UV2.x) is always used as-is so torches etc. remain correct.
+                float skyLight = (ubo.FogRange.z > 0.5) ? 240.0 : float(UV2.y);
+                fragLightBrightness = clamp(max(float(UV2.x), skyLight) / 240.0, 0.03, 1.0);
                 // Pass normal to fragment shader for directional lighting
                 fragNormal = Normal.xyz;
             }

@@ -1,9 +1,22 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
 
+// Any-hit shader for shadow rays.
+// Because BLASes use VK_GEOMETRY_OPAQUE_BIT_KHR, this shader is currently
+// NOT invoked (opaque flag forces all intersections to be accepted without
+// calling any-hit).  The shader is kept as a future hook for selective
+// transparency (foliage alpha-test, stained glass partial shadow), which
+// requires removing VK_GEOMETRY_OPAQUE_BIT_KHR from the relevant BLASes.
+
 layout(location = 1) rayPayloadInEXT struct ShadowPayload {
     float visibility;
 } payload;
+
+void main() {
+    // Default: opaque intersection — shadow ray is terminated, visibility stays 0.
+    // Remove the comment below and add ignoreIntersectionEXT to let light through.
+}
+
 
 struct Material {
     float roughness;

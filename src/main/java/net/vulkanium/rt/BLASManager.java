@@ -201,6 +201,22 @@ public class BLASManager {
     }
 
     /**
+     * Records the section world-space origin for this BLAS.
+     * Must be set so TLASBuilder can compute proper camera-relative instance transforms.
+     *
+     * @param sectionKey packed section key
+     * @param ox         sectionX * 16 (world block coordinate of section origin X)
+     * @param oy         sectionY * 16
+     * @param oz         sectionZ * 16
+     */
+    public void setInstanceWorldOrigin(long sectionKey, float ox, float oy, float oz) {
+        AccelerationStructure blas = blasMap.get(sectionKey);
+        if (blas != null) {
+            blas.setSectionOrigin(ox, oy, oz);
+        }
+    }
+
+    /**
      * Builds dirty BLASes up to the per-frame budget.
      * Records vkCmdBuildAccelerationStructuresKHR for each into the given command buffer.
      *

@@ -467,7 +467,9 @@ public class DrawBatcher {
         long fogRangePtr = ptr + 96;
         MemoryUtil.memPutFloat(fogRangePtr, fogParams.length > 4 ? fogParams[4] : 0.0f);
         MemoryUtil.memPutFloat(fogRangePtr + 4, fogParams.length > 5 ? fogParams[5] : 1000.0f);
-        MemoryUtil.memPutFloat(fogRangePtr + 8, 0.0f);
+        // fogParams[6]: RT sky-flatten flag (1.0 = VANILLA_RT active, 0.0 = vanilla lighting).
+        // Written into FogRange.z which the BLOCK_VERT shader reads to skip baked sky shadow.
+        MemoryUtil.memPutFloat(fogRangePtr + 8, fogParams.length > 6 ? fogParams[6] : 0.0f);
         MemoryUtil.memPutFloat(fogRangePtr + 12, 0.0f);
 
         long texMatPtr = ptr + 112;
